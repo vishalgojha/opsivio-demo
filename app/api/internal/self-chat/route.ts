@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { askAgent } from "@/lib/agent";
 
 function authorized(request: NextRequest) {
-  const configured = process.env.CHARIOT_WHATSAPP_INTERNAL_TOKEN || "";
+  const configured = process.env.WHATSAPP_INTERNAL_TOKEN || "";
   const provided = request.headers.get("x-chariot-internal-token") || "";
   return Boolean(configured && provided && configured === provided);
 }

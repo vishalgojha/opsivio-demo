@@ -33,9 +33,9 @@ export async function GET(request: NextRequest) {
   const { url, key } = supabaseConfig();
   if (!url || !key) return NextResponse.json({ error: "Supabase is not configured" }, { status: 503 });
 
-  const brokerId = process.env.CHARIOT_WHATSAPP_BROKER_ID || "";
+  const brokerId = process.env.WHATSAPP_BROKER_ID || "";
   if (!brokerId) {
-    return NextResponse.json({ error: "CHARIOT_WHATSAPP_BROKER_ID is not configured" }, { status: 503 });
+    return NextResponse.json({ error: "WHATSAPP_BROKER_ID is not configured" }, { status: 503 });
   }
 
   const { searchParams } = request.nextUrl;
@@ -53,7 +53,7 @@ export async function GET(request: NextRequest) {
   list.set("offset", String(offset));
   // Group traffic dwarfs direct chats, so the admin needs a way to narrow the
   // capture down to the owner's own messages instead of paging through them.
-  const ownerPhone = (process.env.CHARIOT_WHATSAPP_SELF_JID || "").split("@")[0]?.split(":")[0] || "919773757759";
+  const ownerPhone = (process.env.WHATSAPP_SELF_JID || "").split("@")[0]?.split(":")[0] || "919773757759";
   if (scope === "owner" || scope === "owner_direct") {
     list.set("sender_phone", `ilike.*${ownerPhone}*`);
   }

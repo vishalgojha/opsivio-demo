@@ -1,0 +1,42 @@
+name: white-label-property-platform
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    environment:
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      WHATSAPP_INGESTOR_URL: ${WHATSAPP_INGESTOR_URL:-http://whatsapp:3001}
+    depends_on:
+      whatsapp:
+        condition: service_healthy
+
+  # The API is intentionally served by the same Next.js runtime as `app`.
+  # Next route handlers under app/api are the API surface; keeping one runtime
+  # avoids duplicated auth, branding, and deployment configuration.
+  whatsapp:
+    build:
+      context: .
+      dockerfile: services/whatsmeow-ingestor/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL for WhatsMeow persistence}
+      OPSIVIO_INTERNAL_TOKEN: ${OPSIVIO_INTERNAL_TOKEN:?Set OPSIVIO_INTERNAL_TOKEN}
+      WHATSAPP_INTERNAL_TOKEN: ${OPSIVIO_INTERNAL_TOKEN:?Set OPSIVIO_INTERNAL_TOKEN}
+      WHATSAPP_BROKER_ID: ${WHATSAPP_BROKER_ID:-default-broker}
+      WHATSAPP_SELF_JID: ${WHATSAPP_SELF_JID:-}
+      OPSIVIO_API_URL: ${OPSIVIO_API_URL:-http://app:3000}
+      OPSIVIO_WEBHOOK_URL: ${OPSIVIO_WEBHOOK_URL:-http://app:3000/api/internal/whatsapp/webhook}
+      OPSIVIO_SEND_PORT: "3001"
+      OPSIVIO_INSTANCE_NAME: ${OPSIVIO_INSTANCE_NAME:-white-label-whatsapp}
+    volumes:
+      - whatsapp-data:/data
+
+volumes:
+  whatsapp-data:

@@ -4,10 +4,10 @@ type GatewayStatus = { connected?: boolean; connection_state?: string; phone_num
 
 function config() {
   return {
-    baseUrl: (process.env.CHARIOT_WHATSAPP_INGESTOR_URL || "").replace(/\/$/, ""),
-    token: process.env.CHARIOT_WHATSAPP_INTERNAL_TOKEN || "",
-    brokerId: process.env.CHARIOT_WHATSAPP_BROKER_ID || "chariot-realty",
-    selfJid: process.env.CHARIOT_WHATSAPP_SELF_JID || "",
+    baseUrl: (process.env.WHATSAPP_INGESTOR_URL || "").replace(/\/$/, ""),
+    token: process.env.WHATSAPP_INTERNAL_TOKEN || "",
+    brokerId: process.env.WHATSAPP_BROKER_ID || process.env.NEXT_PUBLIC_SITE_SHORT_NAME || "default-broker",
+    selfJid: process.env.WHATSAPP_SELF_JID || "",
   };
 }
 
@@ -44,7 +44,7 @@ export async function disconnectWhatsapp() {
 export async function startWhatsappPairing() {
   const { selfJid } = config();
   const phone = selfJid.split("@")[0]?.split(":")[0] || "";
-  if (!phone) throw new Error("CHARIOT_WHATSAPP_SELF_JID is not configured");
+  if (!phone) throw new Error("WHATSAPP_SELF_JID is not configured");
   const response = await gateway("/pair-code/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ phone }) });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || `WhatsMeow pairing returned ${response.status}`);
@@ -70,7 +70,7 @@ export async function publishOwnProperty(propertyId: string, confirm: boolean) {
   if (!property) throw new Error("Only Chariot-owned properties can be published");
   if (!property.image) throw new Error("This property does not have a publishable image");
   const { selfJid, brokerId } = config();
-  if (!selfJid) throw new Error("CHARIOT_WHATSAPP_SELF_JID is not configured");
+  if (!selfJid) throw new Error("WHATSAPP_SELF_JID is not configured");
 
   const caption = `${property.name}\n${property.location}\n${property.price}\n${property.configuration ? `${property.configuration} · ` : ""}${property.carpetAreaSqft.toLocaleString("en-IN")} sqft\n\nChariot Realty · Mumbai`;
   if (!confirm) return { dryRun: true, property: { id: property.id, name: property.name, image: property.image }, target: "configured self-chat", caption };

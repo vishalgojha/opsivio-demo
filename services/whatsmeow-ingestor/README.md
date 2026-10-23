@@ -1,4 +1,23 @@
-# whatsmeow
+# WhatsApp service
+
+This directory contains the runnable white-label WhatsMeow service used by the
+platform. It exposes health, pairing, session, message, media, and capability
+endpoints on port `3001`.
+
+Build it from the repository root with:
+
+```bash
+docker build -f services/whatsmeow-ingestor/Dockerfile .
+```
+
+Required runtime configuration is `DATABASE_URL` and `OPSIVIO_INTERNAL_TOKEN`.
+Use `OPSIVIO_API_URL`, `OPSIVIO_WEBHOOK_URL`, and `OPSIVIO_INSTANCE_NAME` to
+connect it to a client's API and brand. The service stores WhatsApp device and
+Signal session data in PostgreSQL; it should not be run without persistent DB
+storage.
+
+The remaining sections document the upstream WhatsMeow library that powers the
+service.
 [![Go Reference](https://pkg.go.dev/badge/go.mau.fi/whatsmeow.svg)](https://pkg.go.dev/go.mau.fi/whatsmeow)
 
 whatsmeow is a Go library for the WhatsApp web multidevice API.

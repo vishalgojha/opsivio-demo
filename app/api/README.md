@@ -39,7 +39,7 @@ Lead storage uses the `public.chariot_leads` table in the configured Supabase pr
 
 Composio automation is enabled only when `COMPOSIO_API_KEY`, `COMPOSIO_AUTOMATION_ENABLED=true`, and `CHARIOT_OWNER_EMAIL` are configured. A new lead then sends an owner notification through `GMAIL_SEND_EMAIL`. Connect Gmail with `composio link gmail` before enabling the workflow.
 
-WhatsMeow publishing requires `CHARIOT_WHATSAPP_INGESTOR_URL`, `CHARIOT_WHATSAPP_INTERNAL_TOKEN`, `CHARIOT_WHATSAPP_BROKER_ID`, and `CHARIOT_WHATSAPP_SELF_JID`. The route never accepts an arbitrary recipient or arbitrary image URL: it only publishes the seeded Chariot Realty inventory to the configured self-chat.
+WhatsMeow publishing requires `WHATSAPP_INGESTOR_URL`, `WHATSAPP_INTERNAL_TOKEN`, `WHATSAPP_BROKER_ID`, and `WHATSAPP_SELF_JID`. The route never accepts an arbitrary recipient or arbitrary image URL: it only publishes the seeded Chariot Realty inventory to the configured self-chat.
 
 The broker agent requires `SARVAM_API_KEY` on the Chariot API. These credentials stay server-side; the browser only receives the agent response. Chariot's private data and public inventory remain separate. Chariot-specific publish actions are treated as drafts until Kapil explicitly confirms them in the Inventory workflow.
 

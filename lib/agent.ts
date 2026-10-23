@@ -313,7 +313,7 @@ function config() {
     apiKey: process.env.SARVAM_API_KEY || "",
     supabaseUrl: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "",
     serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
-    whatsappBrokerId: process.env.CHARIOT_WHATSAPP_BROKER_ID || "",
+    whatsappBrokerId: process.env.WHATSAPP_BROKER_ID || "",
   };
 }
 
