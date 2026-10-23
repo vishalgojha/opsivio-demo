@@ -1,0 +1,46 @@
+# Chariot Realty Mumbai API
+
+The API is available under `/api` on the deployed Next.js service.
+
+## Endpoints
+
+- `GET /api/health` — deployment health check.
+- `GET /api/properties?locality=BKC&category=commercial` — filtered Mumbai inventory. Supported filters: `locality`, `category`, `configuration`, `minCarpet`, `maxCarpet`. This is the only public read of listings: it returns structured columns plus allowlisted `custom_fields`, and the stored source description is replaced with generated copy.
+- `GET /api/inventory` — admin-only Chariot CMS inventory, including each listing's source and the message it was parsed from. Requires an admin session; there is no public variant.
+- `POST /api/inventory` and `PATCH /api/inventory/:id` — create, edit, approve, publish, or archive inventory.
+- `POST /api/inventory/images` — upload inventory images to the Chariot Supabase Storage bucket.
+- `GET /api/markets` — supported Mumbai micro-market metadata.
+- `POST /api/leads` — validates and accepts a Mumbai buyer, renter, seller, or investor enquiry.
+- `GET /api/automation/status` — reports whether Composio lead automation is configured.
+- `POST /api/automation/lead` — admin-only manual automation replay for an existing lead.
+- `POST /api/auth/login` — Supabase email/password login for the private owner desk.
+- `POST /api/auth/reset` — self-service password reset email and secure password update.
+- `GET /api/whatsapp/status` — admin-only WhatsMeow connection status.
+- `POST /api/whatsapp/connect` — admin-only start/reconnect for the Chariot WhatsApp device.
+- `POST /api/whatsapp/pair` — admin-only WhatsMeow phone-number pairing flow.
+- `POST /api/whatsapp/reset` — admin-only destructive unlink/reset before pairing a new WhatsApp device.
+- `POST /api/whatsapp/publish` — preview or publish one allowlisted Chariot-owned listing to the configured self-chat, including its image.
+- `POST /api/agent/chat` — authenticated Kapil-only broker agent proxy to Sarvam and Chariot's private data tools.
+
+Example lead body:
+
+```json
+{
+  "name": "Aarav Mehta",
+  "phone": "+91 9773757759",
+  "intent": "rent",
+  "locality": "BKC",
+  "propertyId": "ten-bkc",
+  "source": "website"
+}
+```
+
+Lead storage uses the `public.chariot_leads` table in the configured Supabase project. The server requires `SUPABASE_URL` (or `NEXT_PUBLIC_SUPABASE_URL`) and `SUPABASE_SERVICE_ROLE_KEY`; the service key is never sent to the browser.
+
+Composio automation is enabled only when `COMPOSIO_API_KEY`, `COMPOSIO_AUTOMATION_ENABLED=true`, and `CHARIOT_OWNER_EMAIL` are configured. A new lead then sends an owner notification through `GMAIL_SEND_EMAIL`. Connect Gmail with `composio link gmail` before enabling the workflow.
+
+WhatsMeow publishing requires `CHARIOT_WHATSAPP_INGESTOR_URL`, `CHARIOT_WHATSAPP_INTERNAL_TOKEN`, `CHARIOT_WHATSAPP_BROKER_ID`, and `CHARIOT_WHATSAPP_SELF_JID`. The route never accepts an arbitrary recipient or arbitrary image URL: it only publishes the seeded Chariot Realty inventory to the configured self-chat.
+
+The broker agent requires `SARVAM_API_KEY` on the Chariot API. These credentials stay server-side; the browser only receives the agent response. Chariot's private data and public inventory remain separate. Chariot-specific publish actions are treated as drafts until Kapil explicitly confirms them in the Inventory workflow.
+
+The owner desk uses Supabase Auth and allows the account configured in `SUPABASE_ADMIN_EMAIL`. Sarvam AI variables are reserved as `SARVAM_API_KEY`, `SARVAM_API_URL`, and `SARVAM_MODEL`; add the API key in Coolify when ready.

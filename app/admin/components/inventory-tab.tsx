@@ -1,0 +1,700 @@
+"use client";
+
+import { FormEvent, ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
+import { readJson } from "../lib/api";
+import { readStoredSession } from "../lib/session";
+import type { CmsField, CmsProperty, CmsFieldType, TypedDraft } from "../lib/types";
+import { CATEGORY_LABELS, FIELD_TYPE_OPTIONS, sourceLabel } from "../lib/types";
+import type { AdminApi } from "../hooks/use-admin-auth";
+import { Icon, Note, Panel, PanelHead, Pill } from "./ui";
+import type { Notify } from "./whatsapp-tab";
+
+const MARKETS = ["Bandra West", "Bandra East", "BKC", "Khar", "Santacruz", "Juhu"];
+
+const WORKFLOW = [
+  { value: "draft", label: "Draft", hint: "Edit & save anytime" },
+  { value: "approved", label: "Approve", hint: "Mark as ready to publish" },
+  { value: "published", label: "Publish", hint: "Live on the website" },
+] as const;
+
+const EMPTY_FORM = {
+  id: "",
+  slug: "",
+  name: "",
+  category: "residential",
+  locality: "Bandra West",
+  location: "",
+  price: "",
+  price_unit: "total_price" as "monthly_rent" | "per_sqft" | "total_price",
+  configuration: "",
+  carpet_area_sqft: "",
+  image_url: "",
+  media_type: "image" as "image" | "video",
+  images: [] as Array<{ storage_path: string; public_url: string; media_type: "image" | "video" }>,
+  status: "draft" as "draft" | "approved" | "published",
+};
+
+const EMPTY_DRAFT = { label: "", field_type: "text" as CmsFieldType, required: false };
+
+// The box the description generator works from. Anything typed here is notes for
+// the model, never published text, so it is deliberately generous with length.
+const NOTES_PLACEHOLDER =
+  "Paste the WhatsApp forward, or just type what you know — 3 BHK, 1150 sqft, 4th floor, Pali Hill, rent 2.8L, two covered parking spaces, possession December, gym and pool in the building.";
+
+export function InventoryTab({ api, notify }: { api: AdminApi; notify: Notify }) {
+  const [properties, setProperties] = useState<CmsProperty[]>([]);
+  const [fields, setFields] = useState<CmsField[]>([]);
+  const [draft, setDraft] = useState(EMPTY_DRAFT);
+  const [fieldBusy, setFieldBusy] = useState(false);
+  const [customValues, setCustomValues] = useState<Record<string, string | number | boolean | string[]>>({});
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [typedDrafts, setTypedDrafts] = useState<TypedDraft[]>([]);
+  const [notes, setNotes] = useState("");
+  const [writing, setWriting] = useState(false);
+  const [description, setDescription] = useState("");
+  const locationInputRef = useRef<HTMLInputElement | null>(null);
+  const [mapsReady, setMapsReady] = useState(false);
+
+  const loadAll = useCallback(async () => {
+    try {
+      const [inventoryResponse, fieldsResponse, draftsResponse] = await Promise.all([
+        api.get("/api/inventory?admin=1"),
+        api.get("/api/inventory/fields"),
+        api.get("/api/inventory/drafts"),
+      ]);
+      const payload = await readJson(inventoryResponse) as { data?: unknown; error?: string };
+      const fieldsPayload = await readJson(fieldsResponse) as { data?: unknown };
+      const draftsPayload = await readJson(draftsResponse) as { data?: unknown };
+      if (!inventoryResponse.ok) setError(payload.error || "Could not load CMS inventory");
+      setProperties(Array.isArray(payload.data) ? payload.data as CmsProperty[] : []);
+      setFields(Array.isArray(fieldsPayload.data) ? fieldsPayload.data as CmsField[] : []);
+      const groups = Array.isArray(draftsPayload.data) ? draftsPayload.data as Array<{ table: string; drafts?: TypedDraft[] }> : [];
+      setTypedDrafts(groups.flatMap((group) => Array.isArray(group.drafts) ? group.drafts : []));
+    } catch (error) {
+      setProperties([]);
+      setFields([]);
+      setTypedDrafts([]);
+      setError(error instanceof Error ? error.message : "Could not load CMS inventory");
+    } finally {
+      setLoaded(true);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
+
+  useEffect(() => {
+    const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+    if (!key || mapsReady || typeof window === "undefined") return;
+    if ((window as any).google?.maps?.places?.Autocomplete) {
+      setMapsReady(true);
+      return;
+    }
+    if (document.querySelector('script[data-chariot-google-maps="true"]')) return;
+    const script = document.createElement("script");
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places&loading=async`;
+    script.async = true;
+    script.dataset.chariotGoogleMaps = "true";
+    script.onload = () => {
+      if ((window as any).google?.maps?.places?.Autocomplete) setMapsReady(true);
+    };
+    document.head.appendChild(script);
+    return () => { /* keep script for session */ };
+  }, [mapsReady]);
+
+  useEffect(() => {
+    if (!mapsReady || !locationInputRef.current) return;
+    const input = locationInputRef.current;
+    const Autocomplete = (window as any).google?.maps?.places?.Autocomplete;
+    if (!Autocomplete) {
+      setMapsReady(false);
+      return;
+    }
+    const autocomplete = new Autocomplete(input, {
+      componentRestrictions: { country: "in" },
+      fields: ["formatted_address", "address_components"],
+      types: ["geocode"],
+    });
+    autocomplete.addListener("place_changed", () => {
+      const place = autocomplete.getPlace();
+      if (!place.address_components) return;
+      const get = (types: string[]) => {
+        const comp = (place.address_components as any[]).find((c: any) => c.types?.some((t: string) => types.includes(t)));
+        return comp?.long_name;
+      };
+      const locality = get(["locality", "sublocality", "sublocality_level_1"]);
+      const area = get(["administrative_area_level_2"]);
+      const line = place.formatted_address || form.location;
+      patch({ location: line });
+      if (locality && MARKETS.includes(locality as any)) {
+        patch({ locality });
+      } else if (area && MARKETS.includes(area as any)) {
+        patch({ locality: area as any });
+      }
+      if (place.place_id) {
+        setCustomValues((v) => ({ ...v, google_place_id: place.place_id }));
+      }
+    });
+    return () => {
+      try { (window as any).google.maps.event.clearInstanceListeners(autocomplete); } catch {}
+    };
+  }, [mapsReady]);
+
+  async function addField() {
+    if (!draft.label.trim()) return;
+    setFieldBusy(true);
+    setError("");
+    try {
+      const response = await api.post("/api/inventory/fields", draft);
+      const payload = await readJson(response);
+      if (!response.ok) throw new Error(payload.error || "Could not add field");
+      setFields((items) => [...items, payload.data]);
+      setDraft(EMPTY_DRAFT);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not add field");
+    } finally {
+      setFieldBusy(false);
+    }
+  }
+
+  async function createProperty(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      // A new form starts with id: "", and sending that to a uuid column made
+      // every Save draft fail. The server also drops unset uuid columns, but
+      // the request should not claim to be creating a row with an id.
+      const body = {
+        ...form,
+        ...(editing && form.id ? { id: form.id } : {}),
+        // The CMS uses locality as the selected micro-market when no separate
+        // micro-market field is shown in the form.
+        micro_market: form.locality,
+        // The generated description rides along with the other custom fields, so
+        // it is stored under the one key the public site is allowed to read.
+        custom_fields: { ...customValues, ...(description.trim() ? { public_description: description.trim() } : {}) },
+        carpet_area_sqft: form.carpet_area_sqft ? Number(form.carpet_area_sqft) : null,
+      };
+      const response = editing ? await api.patch(`/api/inventory/${form.id}`, body) : await api.post("/api/inventory", body);
+      const payload = await readJson(response);
+      if (!response.ok) throw new Error(payload.error || "Could not save property");
+      setProperties((items) =>
+        editing ? items.map((item) => (item.id === payload.data.id ? payload.data : item)) : [payload.data, ...items],
+      );
+      setCustomValues({});
+      setForm(EMPTY_FORM);
+      setEditing(false);
+      setNotes("");
+      setDescription("");
+      notify(editing ? "Draft updated" : form.status === "published" ? "Published to the website" : `Saved as ${form.status}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save property");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+   // The generator works from facts, so the form is handed to it as one when no
+   // notes have been typed. Numbers are coerced here because the form holds them
+   // as strings.
+   function listingFacts() {
+     const values = customValues;
+     const parking = Number(values.parking);
+     const parts = [form.location, form.locality].map((p) => p?.trim()).filter(Boolean);
+     const seen = new Set<string>();
+     const area = parts.filter((p) => {
+       const low = p.toLowerCase();
+       if (seen.has(low)) return false;
+       seen.add(low);
+       return true;
+     }).join(", ");
+     return {
+       name: form.name || undefined,
+       category: form.category,
+       transaction: /\/\s*mo|\bmonth|\brent\b/i.test(form.price) ? "rent" : "sale",
+       area,
+       configuration: form.configuration || undefined,
+       carpetAreaSqft: form.carpet_area_sqft ? Number(form.carpet_area_sqft) : undefined,
+       price: form.price || undefined,
+       parking: Number.isFinite(parking) && parking > 0 ? parking : undefined,
+       possession: typeof values.possession === "string" ? values.possession : undefined,
+       reraApproved: values.rera_approved === true || values.rera_approved === "true",
+       amenities: Array.isArray(values.amenities) ? values.amenities : undefined,
+       highlights: [
+         values.balcony === 1 || values.balcony === true || values.balcony === "true" ? "Balcony: yes" : "",
+         values.servant_room_washroom === true || values.servant_room_washroom === "true" ? "Servant room with washroom: yes" : "",
+         typeof values.furnishing === "string" && values.furnishing ? `Furnishing: ${values.furnishing}` : "",
+       ].filter(Boolean),
+     };
+   }
+
+  // The model reads the notes when there are any, and the fields above when there
+  // are not, so an existing listing with no source message can still be written.
+  // Nothing is saved until the form is submitted.
+  async function writeDescription(regenerate = false) {
+    setWriting(true);
+    setError("");
+    try {
+      const response = await api.post("/api/inventory/description", { notes, listing: listingFacts() });
+      const payload = await readJson(response);
+      if (!response.ok) throw new Error(payload.error || "Could not write a description");
+      setDescription(String(payload.data?.description || ""));
+      notify(regenerate ? "New description written — save to publish it" : "Description written — save to publish it");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not write a description");
+    } finally {
+      setWriting(false);
+    }
+  }
+
+  function startEdit(property: CmsProperty) {
+    setEditing(true);
+    setCustomValues(property.custom_fields || {});
+    setDescription(String((property.custom_fields as Record<string, unknown> | undefined)?.public_description || ""));
+    // The stored description is the message the listing was parsed from, which is
+    // exactly the raw material the generator wants. It is internal, never published.
+    setNotes(property.description || "");
+    setError("");
+    setForm({
+      id: property.id,
+      slug: property.slug,
+      name: property.name,
+      category: property.category,
+      locality: property.locality,
+      location: property.location,
+      price: property.price,
+      price_unit: property.price_unit || "total_price",
+      configuration: property.configuration || "",
+      carpet_area_sqft: property.carpet_area_sqft ? String(property.carpet_area_sqft) : "",
+      image_url: property.image_url || "",
+      media_type: property.media_type || "image",
+      images: property.images || (property.image_url ? [{ storage_path: "", public_url: property.image_url, media_type: property.media_type || "image" }] : []),
+      status: property.status as "draft" | "approved" | "published",
+    });
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setCustomValues({});
+    setForm(EMPTY_FORM);
+    setNotes("");
+    setDescription("");
+    setError("");
+  }
+
+  async function removeProperty(id: string, name: string) {
+    if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return;
+    const response = await api.delete(`/api/inventory/${id}`);
+    if (!response.ok) {
+      const payload = await readJson(response);
+      return setError(String(payload.error || "Could not delete property"));
+    }
+    setProperties((items) => items.filter((item) => item.id !== id));
+    if (editing && form.id === id) cancelEdit();
+    notify("Deleted");
+  }
+
+  async function uploadImage(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+    const remaining = 10 - form.images.length;
+    if (files.length > remaining) {
+      setError(`You can add up to 10 photos or videos per listing. ${remaining} slot${remaining === 1 ? "" : "s"} remaining.`);
+      event.target.value = "";
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const uploaded = await Promise.all(files.map(async (file) => {
+        const data = new FormData();
+        data.append("file", file);
+        const response = await fetch(`/api/inventory/images`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${readStoredSession()?.access_token || ""}` },
+          body: data,
+        });
+        const payload = await readJson(response);
+        if (!response.ok) throw new Error(payload.error || "Could not upload image");
+        return { storage_path: payload.path, public_url: payload.public_url, media_type: payload.media_type || "image" } as const;
+      }));
+      patch({ images: [...form.images, ...uploaded], image_url: form.images[0]?.public_url || uploaded[0]?.public_url || "", media_type: form.images[0]?.media_type || uploaded[0]?.media_type || "image" });
+      notify(`${uploaded.length} ${uploaded.length === 1 ? "media item" : "media items"} uploaded`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not upload image");
+    } finally {
+      setBusy(false);
+      event.target.value = "";
+    }
+  }
+
+  async function setStatus(id: string, status: string) {
+    try {
+      const response = await api.patch(`/api/inventory/${id}`, { status });
+      const payload = await readJson(response);
+      if (!response.ok) return setError(payload.error || "Could not update property");
+      setProperties((items) => items.map((item) => (item.id === id ? { ...item, status } : item)));
+      notify(status === "published" ? "Published to the website" : "Property unpublished");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not update property");
+    }
+  }
+
+  // A dictated or WhatsApp draft lives in the typed listing tables, not in
+  // the CMS table this tab edits, so publishing it copies it across first.
+  async function publishTypedDraft(draftItem: TypedDraft) {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await api.post("/api/inventory/drafts/publish", { table: draftItem.table, id: draftItem.id, publish: true });
+      const payload = await readJson(response);
+      if (!response.ok) throw new Error(payload.error || "Could not publish the draft");
+      setTypedDrafts((items) =>
+        items.map((item) =>
+          item.table === draftItem.table && item.id === draftItem.id
+            ? { ...item, published_status: "published", published_slug: payload.data?.slug || "" }
+            : item,
+        ),
+      );
+      notify("Published to the website");
+      await loadAll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not publish the draft");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setCustomValue(key: string, type: CmsFieldType, raw: string) {
+    if (type === "number") setCustomValues((values) => ({ ...values, [key]: raw === "" ? "" : Number(raw) }));
+    else if (type === "boolean") setCustomValues((values) => ({ ...values, [key]: raw === "true" }));
+    else setCustomValues((values) => ({ ...values, [key]: raw }));
+  }
+
+  const patch = (next: Partial<typeof form>) => setForm((current) => ({ ...current, ...next }));
+
+  const unpublishedDrafts = typedDrafts.filter((item) => item.published_status !== "published");
+  const editingProperty = editing ? properties.find((item) => item.id === form.id) : undefined;
+  const renderProperty = (property: CmsProperty) => (
+    <div className="row-item" key={property.id}>
+      {property.image_url && (property.media_type === "video" ? <video src={property.image_url} muted playsInline /> : <img src={property.image_url} alt="" />)}
+      <div className="row-main">
+        <strong>{property.name}</strong>
+        <small>{CATEGORY_LABELS[property.category] || property.category} · {property.location}{property.price ? ` · ${property.price}` : ""}{property.source ? ` · via ${sourceLabel(property.source)}` : ""}</small>
+      </div>
+      <Pill tone={property.status === "published" ? "live" : "draft"}>{property.status}</Pill>
+      <button type="button" className="btn btn-light btn-sm" onClick={() => startEdit(property)}>Edit</button>
+      <button type="button" className="btn btn-light btn-sm" onClick={() => removeProperty(property.id, property.name)}>Delete</button>
+      {property.status !== "published" ? (
+        <button type="button" className="btn btn-light btn-sm" onClick={() => setStatus(property.id, "published")}>Publish</button>
+      ) : (
+        <button type="button" className="btn btn-light btn-sm" onClick={() => setStatus(property.id, "draft")}>Unpublish</button>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="tab-stack">
+      <Panel>
+        <PanelHead
+          eyebrow="From the Assistant"
+          title="Drafts to review"
+          subtitle="Property dictated in the Assistant or picked up from WhatsApp. Publishing copies it into your inventory, where you can still edit it before it goes live."
+        />
+        {!unpublishedDrafts.length ? (
+          <p className="empty-state">Nothing waiting. Anything you dictate in the Assistant appears here to review.</p>
+        ) : (
+          <div className="row-list">
+            {unpublishedDrafts.map((item) => (
+              <div className="row-item" key={`${item.table}-${item.id}`}>
+                <div className="row-main">
+                  <strong>{item.name || `Draft ${item.id}`}</strong>
+                  <small>{[item.configuration, item.locality, item.price].filter(Boolean).join(" · ") || "No detail yet"}</small>
+                </div>
+                {item.published_status ? <span className="pill pill-draft">{item.published_status}</span> : null}
+                <button className="btn btn-dark btn-sm" disabled={busy} onClick={() => publishTypedDraft(item)}>
+                  Publish
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+      <Panel>
+        <PanelHead
+          eyebrow="Chariot CMS"
+          title="Kapil’s inventory"
+          subtitle="Add or edit a property, then move it through the workflow: Draft → Approve → Publish. You can also dictate a property to the Assistant and it will save the draft here."
+        />
+        <div className="field-builder">
+          <div>
+            <strong>Custom fields</strong>
+            <small>Add fields such as RERA number, furnishing, floor, brokerage or possession.</small>
+          </div>
+          <div className="field-controls">
+            <input
+              className="input"
+              aria-label="New field label"
+              placeholder="Field name (e.g. Furnishing)"
+              value={draft.label}
+              onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+            />
+            <select
+              className="select"
+              aria-label="New field type"
+              value={draft.field_type}
+              onChange={(e) => setDraft({ ...draft, field_type: e.target.value as CmsFieldType })}
+            >
+              {FIELD_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <label className="check">
+              <input type="checkbox" checked={draft.required} onChange={(e) => setDraft({ ...draft, required: e.target.checked })} /> Required
+            </label>
+            <button type="button" className="btn btn-light" onClick={addField} disabled={fieldBusy || !draft.label.trim()}>
+              {fieldBusy ? "Adding…" : "Add field"}
+            </button>
+          </div>
+          {fields.length > 0 && (
+            <div className="field-chips">
+              {fields.map((field) => (
+                <span key={field.id}>
+                  {field.label}
+                  <small>{field.field_type}</small>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <form className="form-grid" onSubmit={createProperty}>
+          <div className="workflow">
+            <span className="workflow-label">Where should this end up?</span>
+            <div className="workflow-steps">
+              {WORKFLOW.map((step) => (
+                <button
+                  type="button"
+                  key={step.value}
+                  className={`workflow-step${form.status === step.value ? " active" : ""}`}
+                  onClick={() => patch({ status: step.value })}
+                >
+                  <span className="workflow-dot">{WORKFLOW.indexOf(step) + 1}</span>
+                  <span>
+                    <strong>{step.label}</strong>
+                    <small>{step.hint}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="field">
+            <span>Property name</span>
+            <input className="input" placeholder="e.g. Ten BKC" value={form.name} onChange={(e) => patch({ name: e.target.value })} required />
+          </label>
+          <label className="field">
+              <span>URL slug (automatic)</span>
+              <input className="input" placeholder="Generated from name and locality" value={form.slug} readOnly />
+          </label>
+          <label className="field">
+            <span>Category</span>
+            <select className="select" value={form.category} onChange={(e) => patch({ category: e.target.value })}>
+              <option value="residential">Residential</option>
+              <option value="commercial">Commercial</option>
+              <option value="under-construction">Under construction</option>
+            </select>
+          </label>
+          <div className="field">
+            <span>Price</span>
+            <div className="price-input-row">
+              <input className="input" placeholder={form.price_unit === "monthly_rent" ? "e.g. 2.80 L" : "e.g. 4.25 Cr"} value={form.price} onChange={(e) => patch({ price: e.target.value })} required />
+              <select className="select price-unit" aria-label="Price type" value={form.price_unit} onChange={(e) => patch({ price_unit: e.target.value as typeof form.price_unit })}>
+                <option value="total_price">Sale price</option>
+                <option value="monthly_rent">Monthly rent</option>
+                <option value="per_sqft">Per sqft</option>
+              </select>
+            </div>
+            <small className="field-hint">The website adds “/ mo” automatically for monthly rent.</small>
+          </div>
+          <label className="field">
+            <span>Configuration</span>
+            <input className="input" placeholder="e.g. 3 BHK" value={form.configuration} onChange={(e) => patch({ configuration: e.target.value })} />
+          </label>
+          <label className="field">
+            <span>Carpet area (sqft)</span>
+            <input className="input" type="number" placeholder="e.g. 1100" value={form.carpet_area_sqft} onChange={(e) => patch({ carpet_area_sqft: e.target.value })} />
+          </label>
+          <label className="field">
+            <span>Locality</span>
+            <select className="select" value={form.locality} onChange={(e) => patch({ locality: e.target.value })}>
+              {MARKETS.map((market) => <option key={market} value={market}>{market}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Location</span>
+            <input ref={locationInputRef} className="input" placeholder="e.g. Kalanagar, Bandra East" value={form.location} onChange={(e) => patch({ location: e.target.value })} required />
+            <small className="field-hint">Start typing, select from Google Places suggestions</small>
+          </label>
+          <label className="field">
+            <span>Photos ({form.images.length}/10)</span>
+            <input className="input" type="url" placeholder="Paste cover media URL, or upload below" value={form.image_url} onChange={(e) => patch({ image_url: e.target.value })} />
+            <small className="field-hint">
+              <label className="btn btn-light btn-sm" role="button">
+                Upload photos
+                <input type="file" accept="image/*,video/*" multiple className="file-input" onChange={uploadImage} disabled={busy || form.images.length >= 10} />
+              </label>
+              {busy && <em> Uploading…</em>}
+            </small>
+            {form.images.length ? (
+              <div className="field-controls" style={{ marginTop: 8, flexWrap: "wrap" }}>
+                {form.images.map((media, index) => (
+                  <div key={`${media.public_url}-${index}`} style={{ position: "relative" }}>
+                    {media.media_type === "video" ? <video src={media.public_url} muted playsInline style={{ width: 72, height: 54, objectFit: "cover" }} /> : <img src={media.public_url} alt={`Photo ${index + 1}`} style={{ width: 72, height: 54, objectFit: "cover" }} />}
+                    <button type="button" className="btn btn-light btn-sm" aria-label={`Remove photo ${index + 1}`} onClick={() => {
+                      const images = form.images.filter((_, itemIndex) => itemIndex !== index);
+                      patch({ images, image_url: images[0]?.public_url || "", media_type: images[0]?.media_type || "image" });
+                    }}>×</button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </label>
+          <div className="field description-builder" style={{ gridColumn: "1 / -1" }}>
+            <span>Public description — shown on the website</span>
+            <textarea
+              className="textarea"
+              rows={4}
+              placeholder="Generate one from the notes below, or write your own."
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+            <div className="field-controls" style={{ marginTop: 8 }}>
+              <button type="button" className="btn btn-dark btn-sm" onClick={() => writeDescription(false)} disabled={writing}>
+                <Icon name="spark" size={14} />
+                {writing ? "Writing…" : "Generate"}
+              </button>
+              <button type="button" className="btn btn-light btn-sm" onClick={() => writeDescription(true)} disabled={writing}>
+                {writing ? "Writing…" : "Regenerate"}
+              </button>
+              <small className="field-hint">Reads the notes below, or the fields above when the notes are empty. Names and numbers are stripped automatically.</small>
+            </div>
+          </div>
+          <label className="field">
+            <span>Instagram video / Reel URL</span>
+            <input
+              className="input"
+              type="url"
+              placeholder="https://www.instagram.com/reel/..."
+              value={String(customValues.for_video ?? customValues.for_video_url ?? customValues.instagram_reel_url ?? "")}
+              onChange={(e) => setCustomValues((values) => ({ ...values, for_video: e.target.value }))}
+            />
+            <small className="field-hint">Shown publicly as “Watch video” on this listing.</small>
+          </label>
+          <div className="field description-builder">
+            <span>Notes for the generator — not published</span>
+            <textarea
+              className="textarea"
+              rows={3}
+              placeholder={NOTES_PLACEHOLDER}
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+            />
+          </div>
+          {fields.filter((field) => !["for_video", "for_video_url", "instagram_reel_url", "instagram_url"].includes(field.field_key)).map((field) => (
+            <label className="field" key={field.id}>
+              <span>{field.label}</span>
+              {field.field_type === "textarea" ? (
+                <textarea
+                  className="textarea"
+                  rows={2}
+                  required={field.required}
+                  value={String(customValues[field.field_key] ?? "")}
+                  onChange={(e) => setCustomValue(field.field_key, field.field_type, e.target.value)}
+                />
+              ) : field.field_type === "boolean" ? (
+                <select
+                  className="select"
+                  value={String(customValues[field.field_key] ?? "")}
+                  onChange={(e) => setCustomValue(field.field_key, field.field_type, e.target.value)}
+                >
+                  <option value="">—</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              ) : (
+                <input
+                  className="input"
+                  type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : field.field_type === "url" ? "url" : "text"}
+                  required={field.required}
+                  value={String(customValues[field.field_key] ?? "")}
+                  onChange={(e) => setCustomValue(field.field_key, field.field_type, e.target.value)}
+                />
+              )}
+            </label>
+          ))}
+          <div className="form-submit">
+            {editing && (
+              <button type="button" className="btn btn-light" onClick={cancelEdit}>Cancel edit</button>
+            )}
+            <button type="submit" className="btn btn-dark" disabled={busy}>
+              {busy ? "Saving…" : editing ? "Save changes" : form.status === "published" ? "Save & publish" : form.status === "approved" ? "Save & approve" : "Save draft"}
+            </button>
+          </div>
+        </form>
+
+        {editing && <Note tone="success">Editing this draft. Changes are saved on “Save changes” — the website only changes when it is published.</Note>}
+
+        {/* Who the listing came from. A parsed listing still holds the message it
+            was extracted from, so it is shown here and kept off the website. */}
+        {editingProperty && (
+          <label className="field">
+            <span>Listing source — internal only, never published</span>
+            <textarea
+              className="textarea"
+              rows={3}
+              readOnly
+              value={[
+                `Supplied via ${sourceLabel(editingProperty.source)}${editingProperty.source_reference ? ` · ${editingProperty.source_reference}` : ""}`,
+                editingProperty.description?.trim() || "",
+              ]
+                .filter(Boolean)
+                .join("\n\n")}
+            />
+          </label>
+        )}
+
+        {error && <Note tone="error">{error}</Note>}
+      </Panel>
+
+      <Panel>
+        <PanelHead eyebrow="Inventory list" title="Drafts & published" />
+        {loaded && !properties.length ? (
+          <p className="empty-state">No inventory yet. Create a draft above — or just ask the Assistant to save one — then approve and publish it: that is what shows on the website.</p>
+        ) : (
+          <div className="inventory-groups">
+            {properties.some((property) => property.category !== "under-construction") ? (
+              <section className="inventory-group">
+                <h3>Residential &amp; commercial</h3>
+                <div className="row-list">{properties.filter((property) => property.category !== "under-construction").map(renderProperty)}</div>
+              </section>
+            ) : null}
+            <section className="inventory-group">
+              <h3>Under construction</h3>
+              {properties.some((property) => property.category === "under-construction") ? (
+                <div className="row-list">{properties.filter((property) => property.category === "under-construction").map(renderProperty)}</div>
+              ) : (
+                <p className="empty-state">No under-construction projects yet. Select “Under construction” in the category field above to add one.</p>
+              )}
+            </section>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
