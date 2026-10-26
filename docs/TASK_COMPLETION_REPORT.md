@@ -3967,3 +3967,11 @@ Deployment update: Commit `13ce8f60` is pushed. The correct Coolify resource `pr
 - Verification: Both Coolify applications report healthy and finished deployments. Public deployment `guup6nd3y7zyz51meds367cp` runs commit `ae89be4`; admin deployment completed on commit `e44024a`. The public service has its Supabase runtime variables. Browser-level confirmation still requires DNS records for `app.opsivio.in` and `admin.opsivio.in` to resolve from the user's network.
 - Deployment/push: Coolify routing and redeployments completed. Cache-busting commit `ae89be4` is pushed to `vishalgojha/opsivio-demo:main`.
 - Known limitations/next action: Add DNS records for both subdomains, then hard-refresh `https://app.opsivio.in/` and use `https://admin.opsivio.in/admin/white-label` for broker provisioning.
+
+## 2026-10-26 — Correct persisted public FQDN ownership
+
+- Requested outcome: Ensure `app.opsivio.in` actually serves the Opsivio public product rather than the old “Your Realty” shell.
+- Files/services changed: Corrected the persisted Coolify FQDN on `opsivio-public` from `opsivio.in` to `https://app.opsivio.in`; kept `admin.opsivio.in` on the authenticated dashboard and did not modify `www.opsivio.in` or the separate root product.
+- Verification: Coolify confirms `opsivio-public` is healthy with FQDN `https://app.opsivio.in` after deployment `qb7btmk82iagyc9ff8dtwpl0`. `propai-lab:main-app` is healthy with FQDN `https://admin.opsivio.in`. The previous screenshot was explained by the persisted public FQDN still pointing to the old route.
+- Deployment/push: Coolify redeployment completed successfully; the report update will be pushed with the next report commit.
+- Known limitations/next action: Hard-refresh the browser once to discard the old public shell, then use `https://admin.opsivio.in/admin/white-label` for provisioning.
