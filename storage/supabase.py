@@ -77,7 +77,7 @@ def set_tenant_id(tid: Optional[str]):
 from lab.storage.base import (
     Storage, RawMessage, ParsedObservation, Listing,
     ResolverDecision, Evaluation, SyncJob, SyncCheckpoint,
-    AISuggestion, LLMProvider, WorkspaceAISettings,
+    AISuggestion, LLMProvider, WorkspaceAISettings, LocationExtractionRule,
     AgentBrowserSession, AgentBrowserStep, AgentAuditLog,
     dict_to_dataclass,
 )
@@ -12030,6 +12030,86 @@ class SupabaseStorage(Storage):
         if not res.data:
             raise RuntimeError(f"workspace_ai_settings upsert returned no row for tenant {tid}")
         return int(res.data[0]["id"])
+
+    # ── Tenant location extraction rules ────────────────────────────────
+
+    def list_location_extraction_rules(
+        self, tenant_id: str | None = None, active_only: bool = False
+    ) -> list[dict]:
+        tid = tenant_id or self._tenant_id
+        if not tid:
+            return []
+        query = (
+            self.client.table("location_extraction_rules")
+            .select("*")
+            .eq("tenant_id", tid)
+            .order("priority", desc=True)
+            .order("id", desc=False)
+        )
+        if active_only:
+            query = query.eq("is_active", True)
+        res = query.execute()
+        return [dict(row) for row in (res.data or [])]
+
+    def create_location_extraction_rule(
+        self, rule: LocationExtractionRule, tenant_id: str | None = None
+    ) -> dict:
+        tid = tenant_id or self._tenant_id
+        if not tid:
+            raise ValueError("tenant_id is required to create a location extraction rule")
+        data = {
+            "tenant_id": tid,
+            "name": rule.name.strip(),
+            "pattern": rule.pattern.strip(),
+            "canonical_location": rule.canonical_location.strip(),
+            "is_active": bool(rule.is_active),
+            "priority": int(rule.priority),
+        }
+        res = self.client.table("location_extraction_rules").insert(data).execute()
+        if not res.data:
+            raise RuntimeError("location extraction rule was not created")
+        return dict(res.data[0])
+
+    def update_location_extraction_rule(
+        self, rule_id: int, values: dict, tenant_id: str | None = None
+    ) -> dict | None:
+        tid = tenant_id or self._tenant_id
+        if not tid:
+            return None
+        allowed = {"name", "pattern", "canonical_location", "is_active", "priority"}
+        data = {key: value for key, value in values.items() if key in allowed and value is not None}
+        if not data:
+            return None
+        if "name" in data:
+            data["name"] = str(data["name"]).strip()
+        if "pattern" in data:
+            data["pattern"] = str(data["pattern"]).strip()
+        if "canonical_location" in data:
+            data["canonical_location"] = str(data["canonical_location"]).strip()
+        if "priority" in data:
+            data["priority"] = int(data["priority"])
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        query = (
+            self.client.table("location_extraction_rules")
+            .update(data)
+            .eq("id", int(rule_id))
+            .eq("tenant_id", tid)
+        )
+        res = query.execute()
+        return dict(res.data[0]) if res.data else None
+
+    def delete_location_extraction_rule(self, rule_id: int, tenant_id: str | None = None) -> bool:
+        tid = tenant_id or self._tenant_id
+        if not tid:
+            return False
+        res = (
+            self.client.table("location_extraction_rules")
+            .delete()
+            .eq("id", int(rule_id))
+            .eq("tenant_id", tid)
+            .execute()
+        )
+        return bool(res.data)
 
     def get_workspace_market_preferences(self, tenant_id: str | None = None) -> dict | None:
         tid = tenant_id or self._tenant_id

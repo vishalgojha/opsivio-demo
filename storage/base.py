@@ -449,6 +449,19 @@ class WorkspaceAISettings:
 
 
 @dataclass
+class LocationExtractionRule:
+    id: int = 0
+    tenant_id: Optional[str] = None
+    name: str = ""
+    pattern: str = ""
+    canonical_location: str = ""
+    is_active: bool = True
+    priority: int = 100
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
 class AgentBrowserSession:
     id: str = ""
     tenant_id: Optional[str] = None
@@ -826,6 +839,18 @@ class Storage(ABC):
 
     @abstractmethod
     def save_workspace_ai_settings(self, settings: WorkspaceAISettings, tenant_id: str | None = None) -> int: ...
+
+    @abstractmethod
+    def list_location_extraction_rules(self, tenant_id: str | None = None, active_only: bool = False) -> list[dict]: ...
+
+    @abstractmethod
+    def create_location_extraction_rule(self, rule: LocationExtractionRule, tenant_id: str | None = None) -> dict: ...
+
+    @abstractmethod
+    def update_location_extraction_rule(self, rule_id: int, values: dict, tenant_id: str | None = None) -> dict | None: ...
+
+    @abstractmethod
+    def delete_location_extraction_rule(self, rule_id: int, tenant_id: str | None = None) -> bool: ...
 
     @abstractmethod
     def create_agent_browser_session(self, session: AgentBrowserSession, tenant_id: str | None = None) -> dict | None: ...

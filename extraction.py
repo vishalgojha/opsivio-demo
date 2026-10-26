@@ -91,6 +91,69 @@ _LIST_ITEM_ENUM_PREFIX_RE = re.compile(
 _BUILDING_IDENTITY_KEYS = frozenset({"building_name", "project_name"})
 
 
+def apply_tenant_location_rules(
+    parsed: dict, source_text: str, rules: list[dict] | None
+) -> dict:
+    """Apply the first matching tenant regex to a source-grounded parse.
+
+    A rule may provide a named ``location`` group (or any first capture group)
+    to preserve the exact source mention. The canonical value is configured by
+    the realtor. No rule can create a parsed item or modify the raw message.
+    """
+    if not parsed or not source_text or not rules:
+        return parsed
+    for rule in rules:
+        if not isinstance(rule, dict) or not bool(rule.get("is_active", True)):
+            continue
+        pattern_text = str(rule.get("pattern") or "").strip()
+        canonical = re.sub(r"\s+", " ", str(rule.get("canonical_location") or "").strip())
+        if not pattern_text or not canonical:
+            continue
+        try:
+            pattern = re.compile(pattern_text, re.IGNORECASE)
+        except re.error:
+            _logger.warning("Ignoring invalid tenant location regex rule id=%s", rule.get("id"))
+            continue
+        match = pattern.search(source_text)
+        if not match:
+            continue
+        matched = ""
+        groups = match.groupdict()
+        if groups.get("location"):
+            matched = groups["location"]
+        elif match.lastindex:
+            matched = next((value for value in match.groups() if value), "")
+        matched = re.sub(r"\s+", " ", (matched or match.group(0))).strip(" \t\r\n:,-")
+        if not matched:
+            continue
+        parsed["location_raw"] = matched
+        parsed["micro_market"] = canonical
+        existing_location = parsed.get("location") if isinstance(parsed.get("location"), dict) else {}
+        parsed["location"] = {
+            **existing_location,
+            "raw": matched,
+            "micro_market": canonical,
+            "source": "tenant_regex_rule",
+            "rule_id": rule.get("id"),
+        }
+        payload = parsed.get("raw_payload")
+        if not isinstance(payload, dict):
+            payload = {}
+            parsed["raw_payload"] = payload
+        payload["tenant_location_rule"] = {
+            "rule_id": rule.get("id"),
+            "rule_name": rule.get("name") or "",
+            "matched_text": matched,
+            "canonical_location": canonical,
+            "pattern": pattern_text,
+        }
+        flags = list(parsed.get("validation_flags") or [])
+        flags.append("tenant_location_rule_match")
+        parsed["validation_flags"] = list(dict.fromkeys(flags))
+        return parsed
+    return parsed
+
+
 def _clean_extraction_value(value: object, *, key: str = "") -> object:
     """Convert provider absence markers to real nulls before persistence."""
     if isinstance(value, dict):
@@ -4337,6 +4400,15 @@ def process_raw_message(raw_id: int, ctx: dict, storage=None):
     # classify_conversation removed (dead code) — skip privacy filtering
     org_id = ctx.get("tenant_id") or storage._tenant_id or "00000000-0000-0000-0000-000000000010"
     org = storage.get_organization(org_id)
+    location_rules: list[dict] = []
+    try:
+        list_rules = getattr(storage, "list_location_extraction_rules", None)
+        if callable(list_rules):
+            location_rules = list_rules(org_id, True) or []
+    except Exception:
+        # A missing migration or unavailable optional rules table must not
+        # stop source-grounded extraction for the workspace.
+        _logger.warning("raw_id=%d tenant location rules unavailable", raw_id, exc_info=True)
     if org:
         org_privacy = {
             "privacy_mode": org.get("privacy_mode", "private"),
@@ -4362,6 +4434,7 @@ def process_raw_message(raw_id: int, ctx: dict, storage=None):
         else []
     )
     ai_extractions_raw: list[dict | None] = []
+    slice_texts: list[str] = []
     extraction_source: str | None = None
     ai_result: dict | None = None
     message_hash = (ctx.get("message_hash") or "").strip() or _message_hash(msg_text)
@@ -4846,6 +4919,15 @@ def process_raw_message(raw_id: int, ctx: dict, storage=None):
             "storage_status": "skipped",
             "extraction_source": "no_anchor",
         }
+
+    # Tenant rules are deterministic annotations over the original WhatsApp
+    # evidence. Apply them to every parse path, including reviewed reparses,
+    # while keeping raw text and source-grounding unchanged.
+    for idx, parsed_item in enumerate(parsed_listings):
+        source_slice = msg_text
+        if idx < len(slice_texts) and slice_texts[idx]:
+            source_slice = slice_texts[idx]
+        apply_tenant_location_rules(parsed_item, source_slice, location_rules)
 
     # ── Listing validation (price / locality / general) ────────────
     # Runs AFTER AI extraction + _ai_extraction_to_parsed() and BEFORE

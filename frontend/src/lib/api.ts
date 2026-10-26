@@ -2283,6 +2283,46 @@ export function getCurrentOrg() {
   return fetchJSON<{ id: string; name?: string; slug?: string }>(`/orgs/current`);
 }
 
+export type LocationExtractionRule = {
+  id: number;
+  tenant_id?: string | null;
+  name: string;
+  pattern: string;
+  canonical_location: string;
+  is_active: boolean;
+  priority: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type LocationExtractionRuleInput = Omit<LocationExtractionRule, "id" | "tenant_id" | "created_at" | "updated_at">;
+
+export function getLocationExtractionRules() {
+  return fetchJSON<{ rules: LocationExtractionRule[] }>("/workspace/location-rules");
+}
+
+export function createLocationExtractionRule(body: LocationExtractionRuleInput) {
+  return fetchJSON<{ rule: LocationExtractionRule }>("/workspace/location-rules", {
+    method: "POST", body: JSON.stringify(body),
+  });
+}
+
+export function updateLocationExtractionRule(id: number, body: LocationExtractionRuleInput) {
+  return fetchJSON<{ rule: LocationExtractionRule }>(`/workspace/location-rules/${id}`, {
+    method: "PUT", body: JSON.stringify(body),
+  });
+}
+
+export function deleteLocationExtractionRule(id: number) {
+  return fetchJSON<{ deleted: boolean }>(`/workspace/location-rules/${id}`, { method: "DELETE" });
+}
+
+export function testLocationExtractionRule(pattern: string, sample_text: string) {
+  return fetchJSON<{ matched: boolean; matched_text: string | null; start: number | null; end: number | null }>("/workspace/location-rules/test", {
+    method: "POST", body: JSON.stringify({ pattern, sample_text }),
+  });
+}
+
 // Private CRM inventory is tenant-scoped and intentionally never enters market feeds.
 export interface CrmInventoryItem {
   id: number;

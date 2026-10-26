@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -26,6 +27,7 @@ from routers.common import (
 from routers.protection import bounded_page
 from storage import (
     LLMProvider,
+    LocationExtractionRule,
     WorkspaceAISettings,
     AgentBrowserSession,
     AgentBrowserStep,
@@ -785,6 +787,37 @@ class MarketPreferencesBody(BaseModel):
     asset_types: list[str] = Field(default_factory=lambda: ["residential", "commercial"], max_length=2)
 
 
+class LocationExtractionRuleBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    pattern: str = Field(min_length=1, max_length=500)
+    canonical_location: str = Field(min_length=1, max_length=160)
+    is_active: bool = True
+    priority: int = Field(default=100, ge=0, le=10000)
+
+
+class LocationExtractionRuleTestBody(BaseModel):
+    pattern: str = Field(min_length=1, max_length=500)
+    sample_text: str = Field(min_length=1, max_length=10000)
+
+
+def _compile_location_rule_pattern(pattern: str) -> re.Pattern[str]:
+    """Compile a tenant pattern with bounded, case-insensitive matching.
+
+    Patterns are deliberately capped and reject the most common nested
+    quantifier shape that can monopolise a worker on hostile input. Matching is
+    still performed only against the tenant's own raw source text.
+    """
+    value = str(pattern or "").strip()
+    if len(value) > 500:
+        raise HTTPException(422, "Regex pattern must be 500 characters or fewer")
+    if re.search(r"\([^)]*[+*][^)]*\)[+*]", value):
+        raise HTTPException(422, "Regex contains an unsafe nested quantifier")
+    try:
+        return re.compile(value, re.IGNORECASE)
+    except re.error as exc:
+        raise HTTPException(422, f"Invalid regex pattern: {exc}") from exc
+
+
 @router.get("/api/workspace/market-preferences")
 async def get_market_preferences(user: dict = Depends(require_user), tenant_id: str | None = Depends(get_tenant_context)):
     tenant_id = await asyncio.to_thread(_resolve_active_organization_id, user, tenant_id)
@@ -801,6 +834,95 @@ async def save_market_preferences(body: MarketPreferencesBody, user: dict = Depe
     data["primary_localities"] = primary
     data["nearby_localities"] = [str(value).strip() for value in body.nearby_localities if str(value).strip()]
     return await asyncio.to_thread(storage.save_workspace_market_preferences, data, tenant_id)
+
+
+@router.get("/api/workspace/location-rules")
+async def list_location_extraction_rules(
+    user: dict = Depends(require_user),
+    tenant_id: str | None = Depends(get_tenant_context),
+):
+    org_id = _resolve_active_organization_id(user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    rules = await asyncio.to_thread(storage.list_location_extraction_rules, org_id, False)
+    return {"rules": rules}
+
+
+@router.post("/api/workspace/location-rules")
+async def create_location_extraction_rule(
+    body: LocationExtractionRuleBody,
+    user: dict = Depends(require_user),
+    tenant_id: str | None = Depends(get_tenant_context),
+):
+    org_id = _resolve_active_organization_id(user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    _compile_location_rule_pattern(body.pattern)
+    rule = LocationExtractionRule(
+        tenant_id=org_id,
+        name=body.name.strip(),
+        pattern=body.pattern.strip(),
+        canonical_location=body.canonical_location.strip(),
+        is_active=body.is_active,
+        priority=body.priority,
+    )
+    try:
+        created = await asyncio.to_thread(storage.create_location_extraction_rule, rule, org_id)
+    except Exception as exc:
+        logging.exception("location extraction rule create failed for tenant %s", org_id)
+        raise HTTPException(409, "Could not create location rule; name may already exist") from exc
+    return {"rule": created}
+
+
+@router.put("/api/workspace/location-rules/{rule_id}")
+async def update_location_extraction_rule(
+    rule_id: int,
+    body: LocationExtractionRuleBody,
+    user: dict = Depends(require_user),
+    tenant_id: str | None = Depends(get_tenant_context),
+):
+    org_id = _resolve_active_organization_id(user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    _compile_location_rule_pattern(body.pattern)
+    updated = await asyncio.to_thread(
+        storage.update_location_extraction_rule,
+        rule_id,
+        body.model_dump(),
+        org_id,
+    )
+    if not updated:
+        raise HTTPException(404, "Location rule not found")
+    return {"rule": updated}
+
+
+@router.delete("/api/workspace/location-rules/{rule_id}")
+async def delete_location_extraction_rule(
+    rule_id: int,
+    user: dict = Depends(require_user),
+    tenant_id: str | None = Depends(get_tenant_context),
+):
+    org_id = _resolve_active_organization_id(user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    deleted = await asyncio.to_thread(storage.delete_location_extraction_rule, rule_id, org_id)
+    if not deleted:
+        raise HTTPException(404, "Location rule not found")
+    return {"deleted": True}
+
+
+@router.post("/api/workspace/location-rules/test")
+async def test_location_extraction_rule(
+    body: LocationExtractionRuleTestBody,
+    user: dict = Depends(require_user),
+    tenant_id: str | None = Depends(get_tenant_context),
+):
+    org_id = _resolve_active_organization_id(user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    pattern = _compile_location_rule_pattern(body.pattern)
+    match = pattern.search(body.sample_text)
+    return {
+        "matched": bool(match),
+        "matched_text": match.group(0) if match else None,
+        "start": match.start() if match else None,
+        "end": match.end() if match else None,
+    }
 
 
 @router.get("/api/agent/browser-sessions")

@@ -7,6 +7,18 @@ file is the hand-maintained layer and must change with architectural changes.
 
 ## Public locality inventory invariant
 
+## Tenant location extraction rules
+
+Each organization may define ordered, tenant-scoped regular-expression rules
+for location keywords found in its own raw WhatsApp messages. A rule maps a
+source match to a realtor-configured canonical `micro_market`; it may annotate
+an already source-grounded parse with `location_raw`, `location`, and auditable
+rule evidence, but it can never create a listing, rewrite raw message text, or
+cross a tenant boundary. Rules are evaluated by priority and only active rules
+are used. Invalid or unsafe patterns are rejected at the workspace API, and
+the same deterministic matcher is used for every extraction path so reviewed
+reparses receive identical treatment.
+
 The public locality directory and detail pages use the same complete 30-day
 listing-record scope. `needs_review` is diagnostic metadata and does not hide
 source-backed listings. Counts are records, not inferred unique homes; same

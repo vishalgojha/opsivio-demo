@@ -102,6 +102,7 @@ const baseNavSections = [
       { href: "/account?tab=profile", label: "Account", icon: UserCheck },
       { href: "/reports?tab=usage", label: "Reports", icon: BarChart3 },
       { href: "/workspace/brokers", label: "Hidden Brokers", icon: EyeOff },
+      { href: "/workspace/location-rules", label: "Location Rules", icon: MapPin },
     ],
   },
 ];
