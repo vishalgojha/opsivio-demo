@@ -3984,6 +3984,14 @@ Deployment update: Commit `13ce8f60` is pushed. The correct Coolify resource `pr
 - Deployment/push: Commit `85204a1` is pushed to `vishalgojha/opsivio-demo:main`; dashboard deployment completed successfully.
 - Known limitations/next action: A broker's external website is not hosted by Opsivio. If needed later, provide a documented API/embed contract for the broker's own site. Hard-refresh `app.opsivio.in`; unauthenticated users will be sent to the workspace sign-in instead of a public property portal.
 
+## 2026-10-26 — Convert white-labeling to isolated broker deployments
+
+- Requested outcome: Avoid building another shared PropAI-style multi-tenant product. Opsivio should provide infrastructure and a repeatable single-broker deployment template.
+- Files/services changed: Reworked the admin White-label Studio into single-instance `Instance Branding`, using the current deployment organization through `/workspace/branding`; removed broker tenant selection and custom-domain provisioning from the UI; updated the architecture contract to require one repository, database, WhatsApp connection, and workspace per broker installation; and kept broker public websites outside Opsivio.
+- Verification: Frontend Webpack production build passed and generated 79 routes; `git diff --check` passed. Repository-local task-verifier second pass: **PARTIAL** — the source and deployment model now match the isolated-instance requirement, but the historical schema still contains compatibility tenant tables and the separate provisioning automation for cloning repositories/Coolify/Supabase per broker is not yet implemented.
+- Deployment/push: Commit `f5dcbe4` is pushed to `vishalgojha/opsivio-demo:main`; dashboard deployment `pgetfr1c7zaqbi8aderxefz9` finished successfully.
+- Known limitations/next action: The demo is now the reference single-instance installation. The next product step is a provisioning command/workflow that clones the template, creates a broker-specific Supabase/Coolify environment, injects secrets, and records the broker handoff; no broker-facing website is hosted by Opsivio.
+
 ## 2026-10-26 — Retire obsolete public portal container
 
 - Requested outcome: Remove the remaining old public portal response that was producing the “Your Realty”/404 pages after the infrastructure-only routing change.
