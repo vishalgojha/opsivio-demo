@@ -112,7 +112,7 @@ const adminNavSection = {
   items: [
     { href: "/brokers", label: "Broker Profiles", icon: Users },
     { href: "/admin", label: "Super Admin", icon: ShieldCheck },
-    { href: "/admin/white-label", label: "White-label Studio", icon: SlidersHorizontal },
+    { href: "/admin/white-label", label: "Instance Branding", icon: SlidersHorizontal },
     { href: "/admin/pipeline-health?tab=providers", label: "Pipeline Health", icon: Sparkles },
     { href: "/architecture", label: "Architecture", icon: BookOpen },
   ],

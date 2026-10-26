@@ -2307,6 +2307,14 @@ export type TenantBrandProfile = {
 
 export type TenantDomain = { id: number; tenant_id: string; domain: string; is_primary: boolean; is_verified: boolean; is_active: boolean };
 
+export function getWorkspaceBranding() {
+  return fetchJSON<{ branding: TenantBrandProfile | null }>("/workspace/branding");
+}
+
+export function saveWorkspaceBranding(body: TenantBrandProfile) {
+  return fetchJSON<{ branding: TenantBrandProfile }>("/workspace/branding", { method: "PUT", body: JSON.stringify(body) });
+}
+
 export function getAdminTenantBranding(tenantId: string) {
   return fetchJSON<{ branding: TenantBrandProfile | null; domains: TenantDomain[] }>(`/admin/tenants/${tenantId}/branding`);
 }
