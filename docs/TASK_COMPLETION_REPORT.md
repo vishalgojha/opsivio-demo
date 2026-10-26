@@ -3984,6 +3984,14 @@ Deployment update: Commit `13ce8f60` is pushed. The correct Coolify resource `pr
 - Deployment/push: Commit `85204a1` is pushed to `vishalgojha/opsivio-demo:main`; dashboard deployment completed successfully.
 - Known limitations/next action: A broker's external website is not hosted by Opsivio. If needed later, provide a documented API/embed contract for the broker's own site. Hard-refresh `app.opsivio.in`; unauthenticated users will be sent to the workspace sign-in instead of a public property portal.
 
+## 2026-10-26 — Retire obsolete public portal container
+
+- Requested outcome: Remove the remaining old public portal response that was producing the “Your Realty”/404 pages after the infrastructure-only routing change.
+- Files/services changed: Stopped Coolify application `opsivio-public` (`m12wljnlv8alh9cfkey361bh`), which has no FQDN. The dashboard application remains the sole owner of `app.opsivio.in` and `admin.opsivio.in`.
+- Verification: Coolify reports `opsivio-public` has no FQDN and is not running; `propai-lab:main-app` is healthy with both product hostnames and its latest deployment finished successfully.
+- Deployment/push: Operational change completed; this report update will be pushed with the next report commit.
+- Known limitations/next action: Open the hostname root after the old tab is discarded: `https://app.opsivio.in/` for workspace sign-in or `https://admin.opsivio.in/` for control-plane sign-in.
+
 ## 2026-10-26 — Allow workspace sign-in to exit
 
 - Requested outcome: Let users leave the dedicated workspace sign-in screen instead of trapping them behind a non-functional close button.
