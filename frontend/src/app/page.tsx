@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
 import BrokerLandingClient from "./BrokerLandingClient";
 
 export const metadata: Metadata = {
@@ -15,6 +17,13 @@ export const metadata: Metadata = {
   robots: { index: true, follow: true },
 };
 
-export default function BrokerLandingPage() {
+export default async function BrokerLandingPage() {
+  const requestHeaders = await headers();
+  const host = (requestHeaders.get("x-forwarded-host") || requestHeaders.get("host") || "")
+    .toLowerCase()
+    .split(":", 1)[0]
+    .replace(/\.$/, "");
+  if (host === "app.opsivio.in") redirect("/inbox");
+  if (host === "admin.opsivio.in") redirect("/admin");
   return <BrokerLandingClient />;
 }
