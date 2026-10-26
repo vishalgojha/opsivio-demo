@@ -70,15 +70,15 @@ export default function AdminPage() {
   };
 
   return (
-    <div className="mx-auto max-w-5xl p-6 lg:p-8">
+    <div className="opsivio-admin-page mx-auto max-w-6xl p-6 lg:p-10">
       <div className="flex items-center gap-4 mb-6">
         <Link href="/" className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
           <ArrowLeft className="w-5 h-5" />
         </Link>
         <div>
-          <p className="propai-kicker text-[10px] font-semibold">Platform operations</p>
-          <h1 className="mt-1 text-2xl font-semibold leading-tight tracking-[-0.03em] text-[var(--text-primary)] sm:text-3xl sm:tracking-[-0.035em]">Admin</h1>
-          <p className="text-sm text-[var(--text-secondary)]">Super admin management &amp; developer tools</p>
+          <p className="propai-kicker text-[10px] font-semibold">Opsivio / platform workspace</p>
+          <h1 className="mt-1 text-2xl font-semibold leading-tight tracking-[-0.03em] text-[var(--text-primary)] sm:text-4xl sm:tracking-[-0.045em]">Control center</h1>
+          <p className="text-sm text-[var(--text-secondary)]">Manage access, WhatsApp ingestion, and the systems behind every broker workspace.</p>
         </div>
       </div>
 
@@ -165,7 +165,7 @@ export default function AdminPage() {
       </section>
 
       {/* Developer Tools */}
-      <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <section className="opsivio-admin-tools rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
         <h2 className="mb-4 flex items-center gap-2 text-lg font-bold text-[var(--text-primary)]">
           <Wrench className="h-5 w-5 text-[var(--taxi-amber)]" />
           Developer Tools

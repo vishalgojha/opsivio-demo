@@ -3911,3 +3911,19 @@ Deployment update: Commit `13ce8f60` is pushed. The correct Coolify resource `pr
 - Verification: Independent second-pass review: **PASS** for service creation. Coolify overview reports all 11 named applications with the Opsivio repository and `main` branch; all 11 have no FQDN. Coolify version is 4.1.2.
 - Deployment/push: Service records were created without an intentional deployment. No code files changed; this report was committed and pushed.
 - Known limitations/next action: The new services currently report `exited:unhealthy` because Supabase, WhatsApp, API, model-provider, and other runtime variables have not been configured. Add environment variables and final domains, then deploy in dependency order: API → ingestor/workers → dashboard/public site.
+
+## 2026-10-26 — Route app.opsivio.in to the Opsivio dashboard
+
+- Requested outcome: Replace the old white-label property UI currently visible at `app.opsivio.in` with the new Opsivio dashboard while keeping the same domain.
+- Files/services changed: Coolify routing only. Removed `app.opsivio.in` from the legacy `opsivio-demo:main` application (`a4tzcxdi1o4yajapi8oey7pm`) and assigned it to `propai-lab:main-app` (`y18kprfw29mu6wclzgpgfrvv`), which uses `vishalgojha/propai-lab`, `main`, and `frontend/Dockerfile`.
+- Verification: Independent second-pass review: **PARTIAL**. Coolify confirms the new FQDN, source repository, finished deployment `vm2ub4jjnfa4re0kimy068jo`, Next.js 16.2.9 startup, and healthy application state. The local shell could not resolve `app.opsivio.in` for an HTML/browser-level marker check, so the rendered screen still needs confirmation from the user's browser after refresh.
+- Deployment/push: No repository code changed. Coolify deployment completed successfully; no Git push was required for the routing-only fix.
+- Known limitations/next action: Hard-refresh `https://app.opsivio.in` and open `/admin`. If the old page remains, close the old tab/service worker and reload once; the old application no longer owns the domain.
+
+## 2026-10-26 — Apply Opsivio workspace visual direction and cache migration
+
+- Requested outcome: Make the app and admin feel like the supplied Opsivio reference: warm light canvas, navy workspace chrome, editorial typography, white cards, and a clear platform-control hierarchy.
+- Files/services changed: Updated `frontend/src/styles/unified-tokens.css`, `frontend/src/app/globals.css`, and `frontend/src/app/admin/page.tsx` for the shared light/navy visual system and admin control-center treatment. Updated `frontend/src/components/layout/ServiceWorkerRegister.tsx` and `frontend/public/sw.js` to version the worker URL/cache so existing browsers retire the previous Chariot app shell.
+- Verification: Independent repository-local task-verifier second pass: **PARTIAL**. Impeccable frontend review was applied to the shared shell/admin surfaces and `git diff --check` passed. The frontend build could not run because this checkout has no `frontend/node_modules` (`next: not found`); no browser render was available for an independent visual pass.
+- Deployment/push: Not yet committed or pushed because the workspace Git index is read-only (`.git/index.lock: Read-only file system`). Coolify has not been redeployed for these code changes.
+- Known limitations/next action: Install frontend dependencies, run the frontend build and browser visual check, then commit/push and redeploy `propai-lab:main-app`. Until that happens, the new visual system is present in the working tree but not production.
