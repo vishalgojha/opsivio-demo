@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import type { TenantBranding } from "@/lib/tenant-branding";
 
 const NAV_LINKS = [
   { href: "/map", label: "Map" },
@@ -25,9 +26,10 @@ function Wordmark() {
 export type SiteHeaderProps = {
   backHref?: string;
   backLabel?: string;
+  branding?: TenantBranding;
 };
 
-export default function SiteHeader({ backHref, backLabel }: SiteHeaderProps) {
+export default function SiteHeader({ backHref, backLabel, branding }: SiteHeaderProps) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -35,7 +37,7 @@ export default function SiteHeader({ backHref, backLabel }: SiteHeaderProps) {
       <div className="site-header-inner">
         <div className="site-header-brand">
           <Link href="/" aria-label="Opsivio demo home" className="site-wordmark" onClick={() => setOpen(false)}>
-            <Wordmark />
+            {branding ? <span className="flex items-center gap-2.5"><img src={branding.logo_url || "/propai-logo.svg?v=3"} alt="" aria-hidden="true" className="h-10 w-10 object-contain" /><span className="text-2xl font-bold tracking-tight text-[var(--asphalt)]">{branding.display_name || "Opsivio"}</span></span> : <Wordmark />}
           </Link>
           {backHref && (
             <Link

@@ -4,6 +4,7 @@ import './public-theme.css';
 import { getSiteUrl } from '@/lib/site';
 import { JsonLd, buildOrganization, buildWebSite } from '@/lib/seo';
 import ServiceWorkerRegister from '@/components/ServiceWorkerRegister';
+import { getRequestTenantBranding } from '@/lib/tenant-branding';
 
 export const metadata: Metadata = {
   metadataBase: new URL(getSiteUrl()),
@@ -45,14 +46,15 @@ export const viewport: Viewport = {
   themeColor: '#12211A',
 };
 
-export default function WWWLayout({
+export default async function WWWLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const branding = await getRequestTenantBranding();
   return (
     <html lang="en" className="antialiased" data-theme="light">
-      <body className="min-h-screen bg-[var(--bg-base)] text-[var(--text-primary)]">
+      <body className="min-h-screen bg-[var(--bg-base)] text-[var(--text-primary)]" style={{ "--brand-primary": branding.primary_color, "--brand-secondary": branding.secondary_color, "--brand-surface": branding.surface_color, "--brand-text": branding.text_color } as React.CSSProperties}>
         <ServiceWorkerRegister />
         {children}
         <JsonLd data={buildOrganization({ url: getSiteUrl() })} />

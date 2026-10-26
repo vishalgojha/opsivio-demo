@@ -6,10 +6,10 @@
 .www-shell {
   /* Mumbai Editorial Utility: a city-agnostic public marketplace system. */
   --color-paper: #f8f8f5;
-  --color-ink: #18232b;
-  --color-card: #fffefa;
-  --color-signal: #2f6e4f;
-  --color-mint: #e6f1ea;
+  --color-ink: var(--brand-text, #18232b);
+  --color-card: var(--brand-surface, #fffefa);
+  --color-signal: var(--brand-primary, #2f6e4f);
+  --color-mint: var(--brand-secondary, #e6f1ea);
   --color-muted: #68726f;
   --color-border: #d9dfd8;
   --color-input: #ccd5cd;

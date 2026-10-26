@@ -5,6 +5,19 @@ that are easy to rediscover incorrectly from code alone. Generated diagrams
 live in [`docs/architecture/generated/`](docs/architecture/generated/); this
 file is the hand-maintained layer and must change with architectural changes.
 
+## Shared white-label tenancy
+
+Opsivio is deployed as one shared application and control plane. A broker's
+identity is stored in `tenant_brand_profiles`, while `tenant_domains` maps an
+active hostname to that tenant. Public rendering resolves only a verified,
+published brand for the request hostname; the default Opsivio demo branding is
+used for Opsivio-owned hosts and unknown hosts. Brand writes and domain
+management are tenant-scoped, with super-admin provisioning for broker setup.
+This keeps code, migrations, and deployment shared across brokers while
+ensuring branding, domains, and future public content cannot cross tenant
+boundaries. A custom domain is not considered live until DNS/edge verification
+has been completed; adding a domain record alone must never publish it.
+
 ## Public locality inventory invariant
 
 ## Tenant location extraction rules

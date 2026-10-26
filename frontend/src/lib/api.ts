@@ -2283,6 +2283,46 @@ export function getCurrentOrg() {
   return fetchJSON<{ id: string; name?: string; slug?: string }>(`/orgs/current`);
 }
 
+export type TenantBrandProfile = {
+  tenant_id?: string;
+  display_name: string;
+  logo_url: string;
+  favicon_url: string;
+  primary_color: string;
+  secondary_color: string;
+  surface_color: string;
+  text_color: string;
+  font_body: string;
+  font_display: string;
+  hero_image_url: string;
+  tagline: string;
+  description: string;
+  whatsapp_number: string;
+  support_email: string;
+  city_label: string;
+  seo_title: string;
+  seo_description: string;
+  is_published: boolean;
+};
+
+export type TenantDomain = { id: number; tenant_id: string; domain: string; is_primary: boolean; is_verified: boolean; is_active: boolean };
+
+export function getAdminTenantBranding(tenantId: string) {
+  return fetchJSON<{ branding: TenantBrandProfile | null; domains: TenantDomain[] }>(`/admin/tenants/${tenantId}/branding`);
+}
+
+export function saveAdminTenantBranding(tenantId: string, body: TenantBrandProfile) {
+  return fetchJSON<{ branding: TenantBrandProfile }>(`/admin/tenants/${tenantId}/branding`, { method: "PUT", body: JSON.stringify(body) });
+}
+
+export function addAdminTenantDomain(tenantId: string, domain: string, is_primary = true) {
+  return fetchJSON<{ domain: TenantDomain }>(`/admin/tenants/${tenantId}/domains`, { method: "POST", body: JSON.stringify({ domain, is_primary }) });
+}
+
+export function deleteAdminTenantDomain(tenantId: string, domainId: number) {
+  return fetchJSON<{ deleted: boolean }>(`/admin/tenants/${tenantId}/domains/${domainId}`, { method: "DELETE" });
+}
+
 export type LocationExtractionRule = {
   id: number;
   tenant_id?: string | null;

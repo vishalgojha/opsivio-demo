@@ -32,6 +32,7 @@ from storage import (
     AgentBrowserSession,
     AgentBrowserStep,
     AgentAuditLog,
+    TenantBrandProfile,
 )
 
 router = APIRouter(tags=["workspace"])
@@ -800,6 +801,27 @@ class LocationExtractionRuleTestBody(BaseModel):
     sample_text: str = Field(min_length=1, max_length=10000)
 
 
+class TenantBrandProfileBody(BaseModel):
+    display_name: str = Field(default="", max_length=160)
+    logo_url: str = Field(default="", max_length=1000)
+    favicon_url: str = Field(default="", max_length=1000)
+    primary_color: str = Field(default="#2f6e4f", pattern=r"^#[0-9A-Fa-f]{6}$")
+    secondary_color: str = Field(default="#e6f1ea", pattern=r"^#[0-9A-Fa-f]{6}$")
+    surface_color: str = Field(default="#fffefa", pattern=r"^#[0-9A-Fa-f]{6}$")
+    text_color: str = Field(default="#18232b", pattern=r"^#[0-9A-Fa-f]{6}$")
+    font_body: str = Field(default="DM Sans", max_length=80)
+    font_display: str = Field(default="Newsreader", max_length=80)
+    hero_image_url: str = Field(default="", max_length=1000)
+    tagline: str = Field(default="", max_length=240)
+    description: str = Field(default="", max_length=1000)
+    whatsapp_number: str = Field(default="", max_length=40)
+    support_email: str = Field(default="", max_length=240)
+    city_label: str = Field(default="", max_length=120)
+    seo_title: str = Field(default="", max_length=180)
+    seo_description: str = Field(default="", max_length=320)
+    is_published: bool = False
+
+
 def _compile_location_rule_pattern(pattern: str) -> re.Pattern[str]:
     """Compile a tenant pattern with bounded, case-insensitive matching.
 
@@ -834,6 +856,21 @@ async def save_market_preferences(body: MarketPreferencesBody, user: dict = Depe
     data["primary_localities"] = primary
     data["nearby_localities"] = [str(value).strip() for value in body.nearby_localities if str(value).strip()]
     return await asyncio.to_thread(storage.save_workspace_market_preferences, data, tenant_id)
+
+
+@router.get("/api/workspace/branding")
+async def get_workspace_branding(user: dict = Depends(require_user), tenant_id: str | None = Depends(get_tenant_context)):
+    org_id = await asyncio.to_thread(_resolve_active_organization_id, user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    return {"branding": await asyncio.to_thread(storage.get_tenant_brand_profile, org_id)}
+
+
+@router.put("/api/workspace/branding")
+async def save_workspace_branding(body: TenantBrandProfileBody, user: dict = Depends(require_user), tenant_id: str | None = Depends(get_tenant_context)):
+    org_id = await asyncio.to_thread(_resolve_active_organization_id, user, tenant_id)
+    await _require_org_permission(user, org_id, "manage_market")
+    profile = TenantBrandProfile(tenant_id=org_id, **body.model_dump())
+    return {"branding": await asyncio.to_thread(storage.save_tenant_brand_profile, profile, org_id)}
 
 
 @router.get("/api/workspace/location-rules")

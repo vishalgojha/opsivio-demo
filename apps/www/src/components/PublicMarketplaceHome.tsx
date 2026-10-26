@@ -14,6 +14,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import type { PublicDataOverview } from "@/lib/public-data";
 import type { BuildingSummary } from "@/lib/localities";
 import { cleanPublicText, cleanStoredListingTitle, toListingCardViewModel } from "@/lib/listing-card";
+import type { TenantBranding } from "@/lib/tenant-branding";
 
 function text(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
 
@@ -23,7 +24,7 @@ const processSteps: Array<{ number: string; Icon: LucideIcon; title: string; bod
   { number: "03", Icon: MessageSquare, title: "Continue on WhatsApp", body: "Ask for current photos, OC details, carpet area, Jodi options, or the next viewing directly." },
 ];
 
-export default function PublicMarketplaceHome({ overview, heroImageUrl, buildings }: { overview: PublicDataOverview; heroImageUrl: string | null; buildings: BuildingSummary[] }) {
+export default function PublicMarketplaceHome({ overview, heroImageUrl, buildings, branding }: { overview: PublicDataOverview; heroImageUrl: string | null; buildings: BuildingSummary[]; branding?: TenantBranding }) {
   // Keep enough server-fetched rows for the public grid's incremental loader;
   // the pulse still narrows this same snapshot to three rows below.
   const listings = overview.recentListings.slice(0, 60);
@@ -45,7 +46,7 @@ export default function PublicMarketplaceHome({ overview, heroImageUrl, building
   ] as const;
 
   return <div className="www-shell min-h-screen">
-    <SiteHeader />
+    <SiteHeader branding={branding} />
     <NoPhotosFaqJsonLd />
     <main id="main-content">
       <ShortlistProvider>
@@ -119,6 +120,6 @@ export default function PublicMarketplaceHome({ overview, heroImageUrl, building
         <ShortlistBar />
       </ShortlistProvider>
     </main>
-    <SiteFooter />
+    <SiteFooter branding={branding} />
   </div>;
 }

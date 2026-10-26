@@ -4,6 +4,7 @@ export const dynamic = "force-dynamic";
 import PublicMarketplaceHome from "@/components/PublicMarketplaceHome";
 import { getPublicDataOverview, getPublicListingPhotos, type PublicDataOverview } from "@/lib/public-data";
 import { getAllBuildings, getAllLocalities, type BuildingSummary, type LocalitySummary } from "@/lib/localities";
+import { getRequestTenantBranding } from "@/lib/tenant-branding";
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs = 30000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -18,6 +19,7 @@ const emptyOverview: PublicDataOverview = {
 };
 
 export default async function WWWPage() {
+  const branding = await getRequestTenantBranding();
   let overview = emptyOverview;
   let buildings: BuildingSummary[] = [];
   let localities: LocalitySummary[] = [];
@@ -57,5 +59,5 @@ export default async function WWWPage() {
   } else {
     console.error("Homepage building lookup failed:", buildingsResult.reason);
   }
-  return <PublicMarketplaceHome overview={overview} heroImageUrl={heroImageUrl} buildings={buildings} />;
+  return <PublicMarketplaceHome overview={overview} heroImageUrl={heroImageUrl} buildings={buildings} branding={branding} />;
 }

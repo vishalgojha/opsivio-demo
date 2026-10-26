@@ -462,6 +462,29 @@ class LocationExtractionRule:
 
 
 @dataclass
+class TenantBrandProfile:
+    tenant_id: Optional[str] = None
+    display_name: str = ""
+    logo_url: str = ""
+    favicon_url: str = ""
+    primary_color: str = "#2f6e4f"
+    secondary_color: str = "#e6f1ea"
+    surface_color: str = "#fffefa"
+    text_color: str = "#18232b"
+    font_body: str = "DM Sans"
+    font_display: str = "Newsreader"
+    hero_image_url: str = ""
+    tagline: str = ""
+    description: str = ""
+    whatsapp_number: str = ""
+    support_email: str = ""
+    city_label: str = ""
+    seo_title: str = ""
+    seo_description: str = ""
+    is_published: bool = False
+
+
+@dataclass
 class AgentBrowserSession:
     id: str = ""
     tenant_id: Optional[str] = None

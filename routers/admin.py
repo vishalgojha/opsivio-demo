@@ -11,7 +11,7 @@ import httpx
 import re
 
 from routers.common import storage, require_user
-from storage import ProviderOutageEvent
+from storage import ProviderOutageEvent, TenantBrandProfile
 
 router = APIRouter(tags=["admin"])
 
@@ -198,6 +198,57 @@ async def admin_stats(user: dict = Depends(require_user)):
         "total_active": sum(1 for o in orgs if o.get("is_active")),
         "organizations": orgs,
     }
+
+
+def _require_super_admin(user: dict) -> None:
+    if not storage.is_super_admin(user["id"]):
+        raise HTTPException(403, "Super admin access required")
+
+
+@router.get("/api/admin/tenants/{tenant_id}/branding")
+async def admin_get_tenant_branding(tenant_id: str, user: dict = Depends(require_user)):
+    _require_super_admin(user)
+    return {
+        "branding": await asyncio.to_thread(storage.get_tenant_brand_profile, tenant_id),
+        "domains": await asyncio.to_thread(storage.list_tenant_domains, tenant_id),
+    }
+
+
+@router.put("/api/admin/tenants/{tenant_id}/branding")
+async def admin_save_tenant_branding(tenant_id: str, body: dict, user: dict = Depends(require_user)):
+    _require_super_admin(user)
+    allowed = set(TenantBrandProfile.__dataclass_fields__) - {"tenant_id"}
+    values = {key: body[key] for key in allowed if key in body}
+    for key in ("primary_color", "secondary_color", "surface_color", "text_color"):
+        if key in values and not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(values[key])):
+            raise HTTPException(422, f"{key} must be a six-digit hex color")
+    profile = TenantBrandProfile(tenant_id=tenant_id, **values)
+    saved = await asyncio.to_thread(storage.save_tenant_brand_profile, profile, tenant_id)
+    return {"branding": saved}
+
+
+@router.post("/api/admin/tenants/{tenant_id}/domains")
+async def admin_add_tenant_domain(tenant_id: str, body: dict, user: dict = Depends(require_user)):
+    _require_super_admin(user)
+    domain = str(body.get("domain") or "").strip()
+    if not domain:
+        raise HTTPException(422, "domain is required")
+    try:
+        created = await asyncio.to_thread(storage.create_tenant_domain, tenant_id, domain, bool(body.get("is_primary")))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, "Domain may already be assigned") from exc
+    return {"domain": created}
+
+
+@router.delete("/api/admin/tenants/{tenant_id}/domains/{domain_id}")
+async def admin_delete_tenant_domain(tenant_id: str, domain_id: int, user: dict = Depends(require_user)):
+    _require_super_admin(user)
+    deleted = await asyncio.to_thread(storage.delete_tenant_domain, domain_id, tenant_id)
+    if not deleted:
+        raise HTTPException(404, "Domain not found")
+    return {"deleted": True}
 
 
 @router.get("/api/admin/super-admins")

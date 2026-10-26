@@ -77,7 +77,7 @@ def set_tenant_id(tid: Optional[str]):
 from lab.storage.base import (
     Storage, RawMessage, ParsedObservation, Listing,
     ResolverDecision, Evaluation, SyncJob, SyncCheckpoint,
-    AISuggestion, LLMProvider, WorkspaceAISettings, LocationExtractionRule,
+    AISuggestion, LLMProvider, WorkspaceAISettings, LocationExtractionRule, TenantBrandProfile,
     AgentBrowserSession, AgentBrowserStep, AgentAuditLog,
     dict_to_dataclass,
 )
@@ -12110,6 +12110,63 @@ class SupabaseStorage(Storage):
             .execute()
         )
         return bool(res.data)
+
+    # ── White-label tenant branding ─────────────────────────────────────
+
+    def get_tenant_brand_profile(self, tenant_id: str, published_only: bool = False) -> dict | None:
+        query = self.client.table("tenant_brand_profiles").select("*").eq("tenant_id", tenant_id).limit(1)
+        if published_only:
+            query = query.eq("is_published", True)
+        res = query.execute()
+        return dict(res.data[0]) if res.data else None
+
+    def save_tenant_brand_profile(self, profile: TenantBrandProfile, tenant_id: str | None = None) -> dict:
+        tid = tenant_id or profile.tenant_id or self._tenant_id
+        if not tid:
+            raise ValueError("tenant_id is required to save tenant branding")
+        data = {
+            key: value for key, value in vars(profile).items()
+            if key != "tenant_id"
+        }
+        data["tenant_id"] = tid
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        res = self.client.table("tenant_brand_profiles").upsert(data, on_conflict="tenant_id").execute()
+        if not res.data:
+            raise RuntimeError("tenant branding was not saved")
+        return dict(res.data[0])
+
+    def list_tenant_domains(self, tenant_id: str | None = None) -> list[dict]:
+        tid = tenant_id or self._tenant_id
+        if not tid:
+            return []
+        res = self.client.table("tenant_domains").select("*").eq("tenant_id", tid).order("is_primary", desc=True).order("domain").execute()
+        return [dict(row) for row in (res.data or [])]
+
+    def create_tenant_domain(self, tenant_id: str, domain: str, is_primary: bool = False) -> dict:
+        normalized = str(domain or "").strip().lower().removeprefix("https://").removeprefix("http://").strip("/")
+        if not normalized or "://" in normalized or "/" in normalized:
+            raise ValueError("domain must be a hostname without protocol or path")
+        if is_primary:
+            self.client.table("tenant_domains").update({"is_primary": False}).eq("tenant_id", tenant_id).execute()
+        res = self.client.table("tenant_domains").insert({"tenant_id": tenant_id, "domain": normalized, "is_primary": is_primary}).execute()
+        if not res.data:
+            raise RuntimeError("tenant domain was not created")
+        return dict(res.data[0])
+
+    def delete_tenant_domain(self, domain_id: int, tenant_id: str) -> bool:
+        res = self.client.table("tenant_domains").delete().eq("id", int(domain_id)).eq("tenant_id", tenant_id).execute()
+        return bool(res.data)
+
+    def resolve_public_tenant_branding(self, hostname: str) -> dict | None:
+        domain = str(hostname or "").strip().lower().split(":", 1)[0].rstrip(".")
+        if not domain:
+            return None
+        res = self.client.table("tenant_domains").select("tenant_id,tenant_brand_profiles(*)").eq("domain", domain).eq("is_active", True).limit(1).execute()
+        row = dict(res.data[0]) if res.data else None
+        profile = row.get("tenant_brand_profiles") if row else None
+        if isinstance(profile, list):
+            profile = profile[0] if profile else None
+        return dict(profile) if isinstance(profile, dict) and profile.get("is_published") else None
 
     def get_workspace_market_preferences(self, tenant_id: str | None = None) -> dict | None:
         tid = tenant_id or self._tenant_id

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { TenantBranding } from "@/lib/tenant-branding";
 
 const FOOTER_LINKS = {
   browse: [
@@ -19,7 +20,8 @@ const FOOTER_LINKS = {
   ],
 };
 
-export default function SiteFooter() {
+export default function SiteFooter({ branding }: { branding?: TenantBranding }) {
+  const name = branding?.display_name || "Opsivio demo";
   return (
     <footer className="site-footer">
       <div className="site-footer-inner">
@@ -27,10 +29,10 @@ export default function SiteFooter() {
           <div className="site-footer-brand">
             <Link href="/" className="site-footer-wordmark" aria-label="Opsivio demo home">
               <img src="/propai-logo.svg?v=3" alt="" aria-hidden="true" />
-              <span>Opsivio<span> demo</span></span>
+              <span>{name}</span>
             </Link>
             <p>
-              Opsivio reads WhatsApp broker groups so you get real, fresh
+              {name} reads WhatsApp broker groups so you get real, fresh
               live listings — and a direct line to the broker.
             </p>
           </div>
