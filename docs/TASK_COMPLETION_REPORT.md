@@ -3983,3 +3983,11 @@ Deployment update: Commit `13ce8f60` is pushed. The correct Coolify resource `pr
 - Verification: Frontend production build passed previously with 79 routes; the final source change is limited to host-aware redirects and was pushed as `85204a1`. Coolify deployment `v126zb59yrf1mzozy1sa8mup` finished successfully. Coolify confirms `opsivio-public` has no FQDN and the dashboard owns `https://app.opsivio.in,https://admin.opsivio.in`.
 - Deployment/push: Commit `85204a1` is pushed to `vishalgojha/opsivio-demo:main`; dashboard deployment completed successfully.
 - Known limitations/next action: A broker's external website is not hosted by Opsivio. If needed later, provide a documented API/embed contract for the broker's own site. Hard-refresh `app.opsivio.in`; unauthenticated users will be sent to the workspace sign-in instead of a public property portal.
+
+## 2026-10-26 — Allow workspace sign-in to exit
+
+- Requested outcome: Let users leave the dedicated workspace sign-in screen instead of trapping them behind a non-functional close button.
+- Files/services changed: `frontend/src/app/auth/login/AdminLoginClient.tsx` now returns to browser history when the sign-in panel is closed.
+- Verification: The focused source change passed `git diff --check`; the surrounding frontend build had already passed 79-route production compilation before this one-line interaction fix.
+- Deployment/push: Commit `3b342ad` is pushed to `vishalgojha/opsivio-demo:main`; dashboard deployment `k6wmf8n3y8doil4e6jrg8yti` finished successfully.
+- Known limitations/next action: The user must be authenticated with an Opsivio workspace account before accessing workspace pages; closing the login screen returns to the previous browser location.
