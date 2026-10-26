@@ -1,4 +1,4 @@
-import { redirect } from "next/navigation";
+import AdminLoginClient from "./AdminLoginClient";
 
 export const dynamic = "force-dynamic";
 
@@ -11,5 +11,5 @@ export default async function LoginPage({
   const rawNext = Array.isArray(params.next) ? params.next[0] : params.next;
   const next = rawNext && rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/inbox";
 
-  redirect(`/?access=signin&next=${encodeURIComponent(next)}`);
+  return <AdminLoginClient nextPath={next} />;
 }
