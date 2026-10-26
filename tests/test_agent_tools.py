@@ -1,0 +1,467 @@
+import agent_tools
+
+
+class FakeQuery:
+    def __init__(self, client, table):
+        self.client = client
+        self.table_name = table
+        self.filters = {}
+        self.insert_payload = None
+
+    def select(self, _columns):
+        return self
+
+    def order(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, column, value):
+        self.filters[column] = value
+        return self
+
+    def or_(self, _value):
+        return self
+
+    def neq(self, column, value):
+        self.filters[column] = ("neq", value)
+        return self
+
+    def in_(self, column, value):
+        self.filters[column] = ("in", value)
+        return self
+
+    def is_(self, column, value):
+        self.filters[column] = ("is", value)
+        return self
+
+    def limit(self, _value):
+        return self
+
+    def insert(self, payload):
+        self.insert_payload = payload
+        return self
+
+    def execute(self):
+        if self.insert_payload is not None:
+            self.client.inserts.append((self.table_name, self.insert_payload))
+            return type("Response", (), {"data": [{"id": 1, **self.insert_payload}]})()
+        if self.table_name == "residential_rent_listings":
+            if self.filters.get("id") == 101 and self.filters.get("tenant_id") == "tenant-1":
+                return type("Response", (), {"data": [{"id": 101, "tenant_id": "tenant-1"}]})()
+        if self.table_name == "clients" and self.filters.get("id") == "7":
+            return type("Response", (), {"data": [{"id": 7, "name": "Client 7", "phone": "9999999999"}]})()
+        return type("Response", (), {"data": []})()
+
+
+class FakeClient:
+    def __init__(self):
+        self.inserts = []
+
+    def table(self, name):
+        return FakeQuery(self, name)
+
+
+def test_agent_tool_schemas_cover_requested_tools(monkeypatch):
+    names = {tool["function"]["name"] for tool in agent_tools.TOOL_DEFINITIONS}
+    assert names == {
+        "search_listings",
+        "search_requirements",
+        "find_opportunities",
+        "search_group_messages",
+        "query_extract_raw_messages",
+        "list_whatsapp_chats",
+        "lookup_building",
+        "get_client_requirements",
+        "match_client_to_listings",
+        "create_client_property_candidate",
+        "get_broker_profile",
+        "create_lead",
+        "log_internal_note",
+        "save_private_inventory",
+        "save_my_deal",
+    }
+    assert agent_tools.READ_TOOL_NAMES.isdisjoint(agent_tools.WRITE_TOOL_NAMES)
+    monkeypatch.setenv("PROPAI_AGENT_CONFIRMATION_SECRET", "test-secret")
+
+
+def test_building_lookup_is_a_read_tool(monkeypatch):
+    monkeypatch.setenv("PROPAI_AGENT_CONFIRMATION_SECRET", "test-secret")
+    client = FakeClient()
+    result = agent_tools.execute_tool(
+        "lookup_building",
+        {"query": "Rustomjee Paramount"},
+        client,
+        "tenant-1",
+    )
+    assert result["status"] == "ok"
+    assert result["tool"] == "lookup_building"
+    assert agent_tools.READ_TOOL_NAMES.isdisjoint(agent_tools.WRITE_TOOL_NAMES)
+
+
+def test_requirement_search_returns_tenant_scoped_broker_demand():
+    class RequirementQuery(FakeQuery):
+        def execute(self):
+            assert self.table_name == "requirements_unified"
+            assert self.filters["tenant_id"] == "tenant-1"
+            return type("Response", (), {"data": [{
+                "id": 12,
+                "raw_message_id": 91,
+                "req_type": "residential_rent",
+                "micro_market": "Bandra East",
+                "building_name": "",
+                "bhk_options": ["3"],
+                "broker_name": "A Broker",
+                "broker_phone": "919876543210",
+                "status": "active",
+            }]})()
+
+    class RequirementClient(FakeClient):
+        def table(self, name):
+            return RequirementQuery(self, name)
+
+    result = agent_tools.execute_tool(
+        "search_requirements",
+        {
+            "localities": ["Bandra East", "BKC"],
+            "bhk": 3,
+            "listing_type": "rent",
+            "property_type": "residential",
+        },
+        RequirementClient(),
+        "tenant-1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["results"][0]["broker_name"] == "A Broker"
+    assert result["results"][0]["broker_phone"] == "919876543210"
+
+
+def test_listing_search_supports_pages_past_the_old_100_row_cap():
+    class ListingQuery:
+        def __init__(self, client, table):
+            self.client = client
+            self.table_name = table
+
+        def select(self, _columns): return self
+        def order(self, *_args, **_kwargs): return self
+        def limit(self, value):
+            self.client.requested_limit = value
+            return self
+        def execute(self):
+            if self.table_name == "brokers":
+                return type("Response", (), {"data": []})()
+            rows = [{
+                "id": index,
+                "broker_id": "broker-1",
+                "created_at": f"2026-10-09T00:00:{(self.client.requested_limit - index):04d}Z",
+                "monthly_rent": 50000,
+            } for index in range(self.client.requested_limit)]
+            return type("Response", (), {"data": rows})()
+
+    class ListingClient:
+        requested_limit = 0
+        def table(self, name): return ListingQuery(self, name)
+
+    client = ListingClient()
+    rows = agent_tools._listing_query(
+        client,
+        {"listing_type": "rent", "property_type": "residential", "limit": 10, "offset": 150},
+        "tenant-1",
+    )
+
+    assert client.requested_limit == 160
+    assert len(rows) == 10
+    assert [row["id"] for row in rows] == list(range(150, 160))
+
+
+def test_group_message_search_is_tenant_scoped_and_returns_source_evidence():
+    class RawQuery:
+        def __init__(self, client):
+            self.client = client
+            self.filters = {}
+
+        def select(self, _columns):
+            return self
+
+        def eq(self, column, value):
+            self.filters[column] = value
+            return self
+
+        def gte(self, column, value):
+            self.filters[column] = value
+            return self
+
+        def or_(self, _value):
+            return self
+
+        def ilike(self, column, value):
+            self.filters[column] = value
+            return self
+
+        def order(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def execute(self):
+            self.client.seen_filters = self.filters
+            return type("Response", (), {"data": [{
+                "id": 91,
+                "tenant_id": "tenant-1",
+                "group_name": "Bandra Brokers",
+                "sender": "A Broker",
+                "sender_phone": "919876543210",
+                "message": "3 BHK in Bandra West for rent",
+                "timestamp": "2026-09-10T08:00:00Z",
+                "message_type": "text",
+                "is_group": True,
+            }]})()
+
+    class RawClient:
+        def table(self, name):
+            assert name == "raw_messages"
+            return RawQuery(self)
+
+    client = RawClient()
+    result = agent_tools.execute_tool(
+        "search_group_messages",
+        {"query": "what was posted about Bandra West", "limit": 5},
+        client,
+        "tenant-1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["results"][0]["message_id"] == 91
+    assert result["results"][0]["source_text"] == "3 BHK in Bandra West for rent"
+    assert client.seen_filters["tenant_id"] == "tenant-1"
+
+
+def test_query_time_extraction_is_bounded_and_versioned(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(agent_tools, "_group_message_query", lambda _client, _args, _tenant: [{
+        "message_id": 91,
+        "group_name": "Bandra Brokers",
+        "sender": "A Broker",
+        "timestamp": "2026-09-10T08:00:00Z",
+        "source_text": "3 BHK in Bandra West for rent",
+    }] * 10)
+
+    class CacheQuery:
+        def select(self, _columns): return self
+        def eq(self, _column, _value): return self
+        def limit(self, _value): return self
+        def execute(self): return type("Response", (), {"data": []})()
+        def upsert(self, payload, **_kwargs):
+            calls.append(payload)
+            return self
+
+    class CacheClient:
+        def table(self, name):
+            assert name == "query_extraction_cache"
+            return CacheQuery()
+
+    class FakeExtraction:
+        def __call__(self, text, ctx=None):
+            assert text == "3 BHK in Bandra West for rent"
+            assert ctx["tenant_id"] == "tenant-1"
+            return {"extractions": [{"source_slice_text": text, "bhk": 3}], "extraction": {"bhk": 3}, "extraction_source": "ai", "provider_used": "test", "provider_model": "test-model", "needs_review": False, "error": None}
+
+    import ai_extraction
+    monkeypatch.setattr(ai_extraction, "ai_extract", FakeExtraction())
+    monkeypatch.setenv("PROPAI_QUERY_EXTRACTOR_VERSION", "test-v1")
+
+    result = agent_tools.execute_tool("query_extract_raw_messages", {"query": "3 BHK Bandra", "limit": 99}, CacheClient(), "tenant-1")
+
+    assert result["status"] == "ok"
+    assert len(result["results"]) == 5
+    assert result["results"][0]["extractor_version"] == "test-v1"
+    assert result["results"][0]["cached"] is False
+    assert len(calls) == 5
+
+
+def test_group_message_search_does_not_wildcard_scan_context_only_follow_up():
+    class ExplodingClient:
+        def table(self, _name):
+            raise AssertionError("context-only follow-up must not query raw_messages")
+
+    result = agent_tools.execute_tool(
+        "search_group_messages",
+        {"query": "posted by?", "limit": 15},
+        ExplodingClient(),
+        "tenant-1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["results"] == []
+
+
+def test_group_message_search_excludes_commercial_posts_for_bhk_queries():
+    class ResidentialQuery:
+        def __init__(self, client):
+            self.client = client
+
+        def select(self, _columns):
+            return self
+
+        def eq(self, _column, _value):
+            return self
+
+        def gte(self, _column, _value):
+            return self
+
+        def or_(self, _value):
+            return self
+
+        def order(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def execute(self):
+            return type("Response", (), {"data": [
+                {
+                    "id": 92,
+                    "group_name": "BKC Brokers",
+                    "sender": "Office Broker",
+                    "message": "4000 sqft commercial office in BKC for rent",
+                    "timestamp": "2026-09-10T09:00:00Z",
+                },
+                {
+                    "id": 93,
+                    "group_name": "Bandra East Brokers",
+                    "sender": "Residential Broker",
+                    "message": "3 BHK flat in Bandra East for rent",
+                    "timestamp": "2026-09-10T08:00:00Z",
+                },
+            ]})()
+
+    class ResidentialClient:
+        def table(self, name):
+            assert name == "raw_messages"
+            return ResidentialQuery(self)
+
+    result = agent_tools.execute_tool(
+        "search_group_messages",
+        {"query": "find a 3 BHK for rent in Bandra East / BKC", "limit": 10},
+        ResidentialClient(),
+        "tenant-1",
+    )
+
+    assert result["status"] == "ok"
+    assert [row["message_id"] for row in result["results"]] == [93]
+    assert result["results"][0]["asset_scope"] == "residential_or_unspecified"
+
+
+def test_whatsapp_chat_list_uses_all_captured_tenant_groups():
+    class GroupQuery(FakeQuery):
+        def ilike(self, column, value):
+            self.filters[column] = value
+            return self
+
+        def not_(self, column, operator, value):
+            self.filters[f"not_{column}"] = (operator, value)
+            return self
+
+        def order(self, *_args, **_kwargs):
+            return self
+
+        def execute(self):
+            assert self.filters["tenant_id"] == "tenant-1"
+            assert self.filters["is_group"] is True
+            return type("Response", (), {"data": [{
+                "group_name": "Bandra Brokers",
+                "timestamp": "2026-09-10T08:00:00Z",
+            }]})()
+
+    class GroupClient:
+        def table(self, name):
+            assert name == "raw_messages"
+            return GroupQuery(self, name)
+
+    result = agent_tools.execute_tool(
+        "list_whatsapp_chats",
+        {"query": "Bandra", "limit": 10},
+        GroupClient(),
+        "tenant-1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["results"][0]["group_name"] == "Bandra Brokers"
+
+
+def test_write_tools_only_queue_confirmation(monkeypatch):
+    monkeypatch.setenv("PROPAI_AGENT_CONFIRMATION_SECRET", "test-secret")
+
+    class ShouldNotQuery:
+        def table(self, _name):
+            raise AssertionError("write tool queried Supabase before confirmation")
+
+    result = agent_tools.execute_tool(
+        "log_internal_note",
+        {"entity_type": "client", "entity_id": "c1", "note": "follow up", "author_id": "u1"},
+        ShouldNotQuery(),
+        "tenant-1",
+        user_id="user-1",
+    )
+
+    assert result["status"] == "pending_confirmation"
+    assert result["tool"] == "log_internal_note"
+    assert result["confirmation_token"]
+
+
+def test_confirmation_token_is_bound_to_workspace_and_user(monkeypatch):
+    monkeypatch.setenv("PROPAI_AGENT_CONFIRMATION_SECRET", "test-secret")
+    token = agent_tools.make_confirmation_token("create_lead", {"client_id": "c1"}, "tenant-1", "user-1")
+
+    class NoWrite:
+        def table(self, _name):
+            raise AssertionError("invalid token should not reach Supabase")
+
+    try:
+        agent_tools.confirm_tool(token, NoWrite(), "tenant-2", "user-1")
+    except ValueError as exc:
+        assert "workspace" in str(exc)
+    else:
+        raise AssertionError("token from another workspace was accepted")
+
+
+def test_create_lead_without_client_match_is_valid(monkeypatch):
+    client = FakeClient()
+    result = agent_tools.execute_tool(
+        "create_lead",
+        {"listing_id": 101, "source": "agent", "notes": "Call back"},
+        client,
+        "tenant-1",
+        confirmed=True,
+    )
+    assert result["status"] == "ok"
+    assert client.inserts[0][1]["client_id"] is None
+    assert client.inserts[0][1]["tenant_id"] == "tenant-1"
+
+
+def test_create_lead_with_resolved_client(monkeypatch):
+    client = FakeClient()
+    result = agent_tools.execute_tool(
+        "create_lead",
+        {"listing_id": 101, "client_id": "7", "source": "agent", "notes": "Matched client"},
+        client,
+        "tenant-1",
+        confirmed=True,
+    )
+    assert result["status"] == "ok"
+    assert client.inserts[0][1]["client_id"] == 7
+    assert client.inserts[0][1]["client_name"] == "Client 7"
+
+
+def test_write_tool_rejects_missing_tenant_context(monkeypatch):
+    result = agent_tools.execute_tool(
+        "create_lead",
+        {"listing_id": 101, "source": "agent", "notes": "No workspace"},
+        FakeClient(),
+        None,
+        confirmed=True,
+    )
+    assert result["status"] == "error"
+    assert "workspace" in result["error"]

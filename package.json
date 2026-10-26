@@ -1,0 +1,46 @@
+{
+  "name": "opsivio-demo",
+  "version": "0.1.0",
+  "description": "Opsivio demo — WhatsApp property intelligence workspace",
+  "license": "UNLICENSED",
+  "bin": {
+    "propai": "./propai"
+  },
+  "files": [
+    "admin",
+    "evidence",
+    "frontend",
+    "ingestion",
+    "lab",
+    "registry",
+    "services",
+    "storage",
+    "app.py",
+    "config.py",
+    "location.py",
+    "propai",
+    "requirements.txt",
+    "scheduler.py",
+    "seed.py",
+    "README.md",
+    "!**/__pycache__",
+    "!**/*.pyc",
+    "!**/.env",
+    "!**/.next",
+    "!**/node_modules",
+    "!*.db",
+    "!*.db-shm",
+    "!*.db-wal"
+  ],
+  "scripts": {
+    "start": "propai start",
+    "dashboard": "propai dashboard",
+    "doctor": "propai doctor"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@tavily/core": "^0.7.6"
+  }
+}

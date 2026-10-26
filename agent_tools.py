@@ -1,0 +1,1464 @@
+"""Supabase-backed tools for the workspace AI agent.
+
+This module deliberately keeps tool schemas separate from the LLM adapter.
+Reads execute immediately; writes always return a signed confirmation token
+until the confirmation endpoint explicitly approves them.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import time
+import uuid
+
+from market.retrieval import normalize_search_text, sort_retrieval_results
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+
+READ_TOOL_NAMES = frozenset({
+    "search_listings",
+    "search_requirements",
+    "find_opportunities",
+    "search_group_messages",
+    "query_extract_raw_messages",
+    "list_whatsapp_chats",
+    "lookup_building",
+    "get_client_requirements",
+    "match_client_to_listings",
+    "get_broker_profile",
+})
+BROWSER_TOOL_NAMES = frozenset({
+    "browser_open",
+    "browser_state",
+    "browser_click",
+    "browser_fill",
+    "browser_type",
+    "browser_select",
+    "browser_scroll",
+    "browser_screenshot",
+    "browser_close",
+})
+WRITE_TOOL_NAMES = frozenset({
+    "create_client_property_candidate",
+    "create_lead",
+    "log_internal_note",
+    "save_private_inventory",
+    "save_my_deal",
+})
+
+
+def _function(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+TOOL_DEFINITIONS = [
+    _function(
+        "search_listings",
+        "Search fresh residential or commercial listings across the PropAI marketplace, including listings posted by other brokers. Search the requested locality first. If exact results are sparse or absent, the LLM may set include_nearby=true to search the persisted adjacent market belt; clearly label nearby results instead of presenting them as exact. Return up to 10 results by default; for a user asking for more, pass offset to continue without repeating the first page.",
+        {
+            "locality": {"type": "string", "description": "Locality or micro-market, such as Bandra East. This is an exact target: only this locality should be returned."},
+            "localities": {"type": "array", "items": {"type": "string"}, "description": "Multiple localities in an explicit OR/belt request"},
+            "include_nearby": {"type": "boolean", "description": "After exact search, expand to the persisted adjacent locality belt"},
+            "building_name": {"type": "string", "description": "Building, society, or project name; omit when not relevant"},
+            "bhk": {"type": "number", "description": "BHK number; omit for any configuration"},
+            "area_min": {"type": "number", "description": "Minimum carpet area in square feet; omit when not constrained"},
+            "area_max": {"type": "number", "description": "Maximum carpet area in square feet; omit when not constrained"},
+            "price_min": {"type": "number", "description": "Minimum absolute price or monthly rent"},
+            "price_max": {"type": "number", "description": "Maximum absolute price or monthly rent"},
+            "listing_type": {"type": "string", "enum": ["rent", "sale", "all"]},
+            "property_type": {"type": "string", "enum": ["residential", "commercial"]},
+            "limit": {"type": "integer", "description": "Results per page, up to 50"},
+            "offset": {"type": "integer", "description": "Zero-based offset for showing the next page"},
+        },
+        ["listing_type", "property_type"],
+    ),
+    _function(
+        "search_requirements",
+        "Search tenant-scoped buyer and rental requirements posted by brokers. Use this when the user asks for requirements, buyers, tenants, demand, brokers looking, or who is looking for a property. Carry forward the prior conversation's BHK, locality, rental/sale, and property-type filters. Return the matching broker name and phone when available. This searches demand, not available inventory.",
+        {
+            "locality": {"type": "string", "description": "One exact locality or micro-market"},
+            "localities": {"type": "array", "items": {"type": "string"}, "description": "Multiple exact localities from an OR request"},
+            "bhk": {"type": "number", "description": "BHK number"},
+            "listing_type": {"type": "string", "enum": ["rent", "sale", "all"]},
+            "property_type": {"type": "string", "enum": ["residential", "commercial"]},
+            "limit": {"type": "integer", "description": "Maximum matches, default 10"},
+            "offset": {"type": "integer", "description": "Zero-based offset for showing the next page"},
+        },
+        ["listing_type", "property_type"],
+    ),
+    _function(
+        "find_opportunities",
+        "Find opportunities for one property request across all available sources in one call: shared parsed listings, broker-posted requirements, and tenant raw WhatsApp evidence. Use this for requests such as find opportunities, match this requirement, who is looking, or show everything available. Preserve BHK, locality, rent/sale, and property-type context. Return each result with its source and exact/nearby/unparsed status; never present raw evidence as verified inventory.",
+        {
+            "query": {"type": "string", "description": "The complete property request in natural language for raw evidence search"},
+            "locality": {"type": "string", "description": "Primary exact locality"},
+            "localities": {"type": "array", "items": {"type": "string"}, "description": "OR/belt localities"},
+            "include_nearby": {"type": "boolean", "description": "Expand to the persisted nearby locality belt"},
+            "bhk": {"type": "number", "description": "BHK number"},
+            "listing_type": {"type": "string", "enum": ["rent", "sale", "all"]},
+            "property_type": {"type": "string", "enum": ["residential", "commercial"]},
+            "limit": {"type": "integer", "description": "Maximum results per source"},
+            "days": {"type": "integer", "description": "Raw WhatsApp history window in days"},
+        },
+        ["query", "listing_type", "property_type"],
+    ),
+    _function(
+        "search_group_messages",
+        "Search the tenant's original WhatsApp group messages for source evidence, broker posts, building mentions, or exact wording. Return useful options across different groups when possible. If evidence is sparse or the user asks for alternatives, also call search_listings for normalized PropAI inventory; label the two sources separately.",
+        {
+            "query": {"type": "string", "description": "Words, building, locality, broker, or phrase to find in captured WhatsApp messages"},
+            "group_name": {"type": "string", "description": "Optional WhatsApp group name or identifier"},
+            "limit": {"type": "integer", "description": "Maximum source messages (default 15, max 25); use 15 for broad multi-group searches"},
+            "days": {"type": "integer", "description": "Captured history window in days; default 30, use up to 3650 when the user asks for all existing history"},
+        },
+        ["query"],
+    ),
+    _function(
+        "query_extract_raw_messages",
+        "Retrieve a small tenant-scoped set of original WhatsApp group messages and extract property candidates only for this query. Use this for ambiguous or long-tail property questions when the normalized listing index may miss relevant evidence. Results are cached by source hash and extractor version; every candidate includes its exact source slice and raw message id. Do not use for public page counters or complete inventory totals.",
+        {
+            "query": {"type": "string", "description": "Locality, building, configuration, broker phrase, or property question to retrieve from captured WhatsApp evidence"},
+            "limit": {"type": "integer", "description": "Maximum raw messages to extract (default 3, max 5)"},
+        },
+        ["query"],
+    ),
+    _function(
+        "list_whatsapp_chats",
+        "List every WhatsApp group with captured messages for the current tenant. Use this when the user asks which groups PropAI can search. This is a captured-message directory, not only the active workspace connection list.",
+        {
+            "query": {"type": "string", "description": "Optional group name or identifier filter"},
+            "limit": {"type": "integer", "description": "Maximum groups to return (default 25, max 100)"},
+        },
+        [],
+    ),
+    _function(
+        "lookup_building",
+        "Look up a building, society, or project in the PropAI building directory. Use this for questions about where a project is, its address, developer, aliases, or directory profile; do not search listings unless the user also asks for available properties.",
+        {
+            "query": {"type": "string", "description": "Building, society, or project name"},
+            "limit": {"type": "integer", "description": "Maximum directory matches (default 5)"},
+        },
+        ["query"],
+    ),
+    _function(
+        "get_client_requirements",
+        "Read the saved requirements for one workspace client.",
+        {"client_id": {"type": "string", "description": "Client ID"}},
+        ["client_id"],
+    ),
+    _function(
+        "match_client_to_listings",
+        "Compare a client's saved primary requirement against fresh listings and return explainable matches.",
+        {"client_id": {"type": "string", "description": "Client ID"}},
+        ["client_id"],
+    ),
+    _function(
+        "get_broker_profile",
+        "Read a tenant-scoped broker profile and activity summary.",
+        {"broker_id": {"type": "string", "description": "Broker ID"}},
+        ["broker_id"],
+    ),
+    _function(
+        "create_client_property_candidate",
+        "Propose saving a listing as a candidate for a client. This always requires user confirmation before writing.",
+        {
+            "client_id": {"type": "string"},
+            "listing_id": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        ["client_id", "listing_id", "notes"],
+    ),
+    _function(
+        "create_lead",
+        "Propose creating a lead for a client from a listing. This always requires user confirmation before writing.",
+        {
+            "listing_id": {"type": "integer", "description": "Typed listing ID; required by the leads table"},
+            "client_id": {"type": "integer", "description": "Optional client ID when a workspace client is resolved"},
+            "source": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        ["listing_id", "source", "notes"],
+    ),
+    _function(
+        "log_internal_note",
+        "Propose adding an internal workspace note. This always requires user confirmation before writing.",
+        {
+            "entity_type": {"type": "string"},
+            "entity_id": {"type": "string"},
+            "note": {"type": "string"},
+            "author_id": {"type": "string"},
+        },
+        ["entity_type", "entity_id", "note", "author_id"],
+    ),
+    _function(
+        "save_private_inventory",
+        "Save broker-owned property inventory to the workspace Private CRM after explicit user confirmation. Use this by default when a broker shares their own stock, listing, owner property, or inventory in chat. It remains tenant-private and is excluded from Market Inbox, marketplace search, and Auto Match. Never use save_my_deal for broker-owned inventory unless the broker explicitly asks to share, publish, or post it to the market.",
+        {
+            "source_text": {"type": "string", "description": "Original property or broker inventory text; preserve it as private evidence"},
+            "building_name": {"type": "string"},
+            "location": {"type": "string"},
+            "tower": {"type": "string"},
+            "bhk": {"type": "string"},
+            "floor": {"type": "string"},
+            "area_sqft": {"type": "number"},
+            "quote": {"type": "string"},
+            "furnishing": {"type": "string"},
+            "amenities": {"type": "string"},
+            "owner_name": {"type": "string"},
+            "availability": {"type": "string"},
+            "pets_okay": {"type": "string"},
+            "contact_name": {"type": "string"},
+            "contact_number": {"type": "string"},
+            "notes": {"type": "string"},
+            "attachments": {
+                "type": "array",
+                "description": "Private CRM file metadata staged by the chat attachment uploader",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "storage_bucket": {"type": "string"},
+                        "storage_path": {"type": "string"},
+                        "file_name": {"type": "string"},
+                        "mime_type": {"type": "string"},
+                        "size_bytes": {"type": "integer"},
+                        "extracted_text": {"type": "string"},
+                        "text_supported": {"type": "boolean"},
+                    },
+                },
+            },
+        },
+        [],
+    ),
+    _function(
+        "save_my_deal",
+        "Publish a broker's listing or requirement into the shared typed PropAI market inventory after explicit user confirmation. Use only when the broker explicitly asks to share, publish, or post it to the market; broker-owned inventory is private by default and belongs in save_private_inventory. The source_text must be the supplied property/requirement text so the market record can show evidence.",
+        {
+            "source_text": {"type": "string", "description": "Original property or requirement text supplied by the broker"},
+            "message_type": {"type": "string", "enum": ["listing", "requirement"]},
+            "transaction_type": {"type": "string", "enum": ["rent", "sale"]},
+            "asset_type": {"type": "string", "enum": ["residential", "commercial"]},
+            "building_name": {"type": "string"},
+            "locality": {"type": "string"},
+            "bhk": {"type": "string"},
+            "price": {"type": "number"},
+            "budget_min": {"type": "number"},
+            "budget_max": {"type": "number"},
+            "price_unit": {"type": "string", "enum": ["abs", "per_sqft", "L", "Cr", "K"]},
+            "area_sqft": {"type": "number"},
+            "furnishing": {"type": "string"},
+            "summary_title": {"type": "string"},
+        },
+        ["source_text", "message_type", "transaction_type", "asset_type"],
+    ),
+]
+
+BROWSER_TOOL_DEFINITIONS = [
+    _function(
+        "browser_open",
+        "Open a browser session on a permitted route or URL and return the current page state. Use this for navigating PropAI pages or external websites when the workspace route policy permits it.",
+        {
+            "browser_session_id": {"type": "string", "description": "Existing browser session id; omit to create a new session"},
+            "url": {"type": "string", "description": "URL to open"},
+            "session_label": {"type": "string", "description": "Optional label for tracing"},
+        },
+        ["url"],
+    ),
+    _function(
+        "browser_state",
+        "Inspect the current browser session state, including URL, title, visible text, and interactable elements.",
+        {
+            "browser_session_id": {"type": "string", "description": "Browser session id"},
+        },
+        ["browser_session_id"],
+    ),
+    _function(
+        "browser_click",
+        "Click an interactable element by index in the current browser state.",
+        {
+            "browser_session_id": {"type": "string"},
+            "index": {"type": "integer", "description": "Element index from browser_state"},
+        },
+        ["browser_session_id", "index"],
+    ),
+    _function(
+        "browser_fill",
+        "Fill an input or textarea element by index in the current browser state.",
+        {
+            "browser_session_id": {"type": "string"},
+            "index": {"type": "integer", "description": "Element index from browser_state"},
+            "text": {"type": "string"},
+        },
+        ["browser_session_id", "index", "text"],
+    ),
+    _function(
+        "browser_type",
+        "Type text into the active browser page.",
+        {
+            "browser_session_id": {"type": "string"},
+            "text": {"type": "string"},
+        },
+        ["browser_session_id", "text"],
+    ),
+    _function(
+        "browser_select",
+        "Select an option in a select element by index in the current browser state.",
+        {
+            "browser_session_id": {"type": "string"},
+            "index": {"type": "integer", "description": "Element index from browser_state"},
+            "value": {"type": "string", "description": "Option label or value"},
+        },
+        ["browser_session_id", "index", "value"],
+    ),
+    _function(
+        "browser_scroll",
+        "Scroll the page by a number of pixels. Positive values scroll down; negative values scroll up.",
+        {
+            "browser_session_id": {"type": "string"},
+            "amount": {"type": "integer", "description": "Pixels to scroll"},
+        },
+        ["browser_session_id", "amount"],
+    ),
+    _function(
+        "browser_screenshot",
+        "Capture a screenshot of the current page for traceability.",
+        {
+            "browser_session_id": {"type": "string"},
+            "output_path": {"type": "string", "description": "Optional local file path"},
+        },
+        ["browser_session_id"],
+    ),
+    _function(
+        "browser_close",
+        "Close the browser session and release any associated runtime resources.",
+        {
+            "browser_session_id": {"type": "string"},
+        },
+        ["browser_session_id"],
+    ),
+]
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, default=str, separators=(",", ":"))
+
+
+def _number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_phone(value: Any) -> str:
+    """Return a clean Indian phone number, never a WhatsApp JID."""
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if len(digits) >= 12 and digits.startswith("91"):
+        digits = digits[-10:]
+    return digits if len(digits) == 10 else ""
+
+
+def _clean_broker_name(value: Any, fallback: Any = None) -> str:
+    """Hide raw WhatsApp JIDs and phone numbers from listing cards."""
+    for candidate in (value, fallback):
+        text = str(candidate or "").strip()
+        if not text or "@s.whatsapp.net" in text.lower():
+            continue
+        if len(re.sub(r"\D+", "", text)) >= 10:
+            continue
+        return text
+    return "Broker"
+
+
+def _tenant_query(client: Any, table: str, tenant_id: str | None, columns: str):
+    query = client.table(table).select(columns)
+    if tenant_id:
+        query = query.eq("tenant_id", tenant_id)
+    return query
+
+
+def _client_row(client: Any, client_id: str, tenant_id: str | None) -> dict | None:
+    query = _tenant_query(client, "clients", tenant_id, "id,name,phone,email,notes,status")
+    rows = query.eq("id", client_id).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def _listing_query(client: Any, args: dict, tenant_id: str | None) -> list[dict]:
+    locality = str(args.get("locality") or "").strip()
+    requested_listing_type = str(args.get("listing_type") or "all").lower()
+    property_type = str(args.get("property_type") or "residential").lower()
+    listing_types = [requested_listing_type] if requested_listing_type in {"rent", "sale"} else ["rent", "sale"]
+    building_name = str(args.get("building_name") or "").strip()
+    # Listings are marketplace supply and intentionally cross-tenant: a broker
+    # may search inventory posted by any broker. Private objects (clients,
+    # requirements, leads, and notes) remain tenant-scoped below.
+    page_limit = max(1, min(int(args.get("limit") or 10), 50))
+    page_offset = max(0, int(args.get("offset") or 0))
+    # Fetch enough of the filtered, newest-first candidate set to support
+    # explicit follow-up pages. The old 100-row cap made offsets past 100
+    # silently return empty results even when matching inventory remained.
+    fetch_limit = min(1000, max(50, page_offset + page_limit))
+    all_rows = []
+    for listing_type in listing_types:
+        table = f"{property_type}_{listing_type}_listings"
+        price_column = "monthly_rent" if listing_type == "rent" else "total_asking_price"
+        unit_price_column = "rent_per_sqft" if listing_type == "rent" else "price_per_sqft"
+        bhk_column = "bhk," if property_type != "commercial" else ""
+        columns = (
+            "id,legacy_source_id,raw_message_id,building_name,micro_market,locality_raw,locality_resolved,landmark_name,"
+            f"broker_id,broker_name,broker_phone,{bhk_column}transaction_type,carpet_area_sqft,"
+            f"{price_column},{unit_price_column},created_at,needs_review,extraction_confidence"
+        )
+        query = client.table(table).select(columns)
+        search_values = []
+        if locality:
+            locality_like = locality.replace("%", "").replace("_", "")
+            search_values.extend(f"{field}.ilike.%{locality_like}%" for field in ("micro_market", "locality_raw", "locality_resolved", "building_name", "landmark_name"))
+        if building_name:
+            building_like = building_name.replace("%", "").replace("_", "")
+            search_values.append(f"building_name.ilike.%{building_like}%")
+        if search_values:
+            query = query.or_(",".join(search_values))
+        bhk_min = _number(args.get("bhk_min"))
+        bhk_max = _number(args.get("bhk_max"))
+        bhk = _number(args.get("bhk"))
+        if bhk_min is not None and bhk_max is not None:
+            lo = min(bhk_min, bhk_max)
+            hi = max(bhk_min, bhk_max)
+            # Include both integer and .0 variants for each value in range
+            bhk_values = []
+            for v in range(int(lo), int(hi) + 1):
+                bhk_values.append(f"{v:g}")
+                bhk_values.append(f"{v:g}.0")
+            # Also handle half-values if range spans them
+            if not bhk_min.is_integer() or not bhk_max.is_integer():
+                step = 0.5
+                current = float(lo)
+                while current <= float(hi) + 1e-9:
+                    val = f"{current:g}"
+                    if val not in bhk_values:
+                        bhk_values.append(val)
+                    current += step
+            if bhk_values:
+                query = query.in_("bhk", bhk_values)
+        elif bhk is not None:
+            bhk_text = f"{bhk:g}"
+            if bhk.is_integer():
+                query = query.in_("bhk", [bhk_text, f"{bhk_text}.0"])
+            else:
+                query = query.eq("bhk", bhk_text)
+        minimum = _number(args.get("price_min"))
+        maximum = _number(args.get("price_max"))
+        if minimum is not None:
+            query = query.gte(price_column, minimum)
+        if maximum is not None:
+            query = query.lte(price_column, maximum)
+        area_min = _number(args.get("area_min"))
+        area_max = _number(args.get("area_max"))
+        if area_min is not None:
+            query = query.gte("carpet_area_sqft", area_min)
+        if area_max is not None:
+            query = query.lte("carpet_area_sqft", area_max)
+        rows = query.order("created_at", desc=True).limit(fetch_limit).execute().data or []
+        for row in rows:
+            row["_listing_type"] = listing_type
+            row["_price_column"] = price_column
+        all_rows.extend(rows)
+    rows = sorted(all_rows, key=lambda row: str(row.get("created_at") or ""), reverse=True)[:fetch_limit]
+    broker_ids = {row.get("broker_id") for row in rows if row.get("broker_id") is not None}
+    broker_profiles = {}
+    if broker_ids:
+        try:
+            profiles = (
+                client.table("brokers")
+                .select("id,canonical_name,primary_phone")
+                .in_("id", list(broker_ids))
+                .execute()
+                .data
+                or []
+            )
+            broker_profiles = {row.get("id"): row for row in profiles}
+        except Exception:
+            broker_profiles = {}
+    for row in rows:
+        row["listing_id"] = str(row.get("id"))
+        row["legacy_listing_id"] = str(row.get("legacy_source_id")) if row.get("legacy_source_id") else None
+        row["price"] = row.get(row.get("_price_column") or ("monthly_rent" if row.get("_listing_type") == "rent" else "total_asking_price"))
+        row["property_type"] = property_type
+        row["listing_type"] = row.get("_listing_type") or requested_listing_type
+        profile = broker_profiles.get(row.get("broker_id"), {})
+        row["broker_phone"] = _clean_phone(row.get("broker_phone")) or _clean_phone(profile.get("primary_phone"))
+        row["broker_name"] = _clean_broker_name(row.get("broker_name"), profile.get("canonical_name"))
+    buckets: dict[str, list[dict]] = {}
+    for row in rows:
+        broker_key = str(row.get("broker_id") or row.get("broker_phone") or row.get("broker_name") or "unknown")
+        buckets.setdefault(broker_key, []).append(row)
+    balanced: list[dict] = []
+    while buckets:
+        for key in list(buckets):
+            bucket = buckets[key]
+            if bucket:
+                balanced.append(bucket.pop(0))
+            if not bucket:
+                buckets.pop(key, None)
+    return balanced[page_offset:page_offset + page_limit]
+
+
+def _nearby_localities(client: Any, locality: str) -> list[str]:
+    """Resolve adjacent market belts from persisted locality geography."""
+    target = str(locality or "").strip().casefold()
+    if not target:
+        return []
+    try:
+        rows = client.table("locality_reference").select(
+            "sub_locality,parent_locality,canonical_locality,alternate_names,sort_order"
+        ).order("sort_order").limit(500).execute().data or []
+    except Exception:
+        return []
+    matched = []
+    for row in rows:
+        values = [str(row.get(key) or "").casefold() for key in (
+            "sub_locality", "parent_locality", "canonical_locality"
+        )]
+        values.extend(str(value).casefold() for value in (row.get("alternate_names") or []))
+        if target in values or any(target in value for value in values if value):
+            matched.append(row)
+    positions = {
+        int(row["sort_order"])
+        for row in matched
+        if str(row.get("sort_order") or "").isdigit()
+    }
+    if not positions:
+        return []
+    adjacent = {position + delta for position in positions for delta in (-10, 0, 10)}
+    labels = []
+    seen = set()
+    for row in rows:
+        try:
+            position = int(row.get("sort_order"))
+        except (TypeError, ValueError):
+            continue
+        label = str(row.get("parent_locality") or row.get("canonical_locality") or row.get("sub_locality") or "").strip()
+        if position in adjacent and label.casefold() not in seen:
+            seen.add(label.casefold())
+            labels.append(label)
+    return labels
+
+
+_GROUP_SEARCH_STOP_WORDS = frozenset({
+    "what", "was", "were", "did", "do", "the", "a", "an", "about", "from", "in", "on", "for", "me",
+    "any", "requirement", "requirements", "or",
+    "show", "find", "search", "which", "brokers", "broker", "post", "posted", "by", "group", "groups",
+    "message", "messages", "broadcast", "broadcasts", "sent", "today", "recent", "latest", "listing",
+    "listings", "looking", "my",
+})
+
+
+def _group_search_terms(query_text: str) -> list[str]:
+    return [
+        token for token in re.findall(r"[a-z0-9]+", query_text.lower())
+        if len(token) > 2 and token not in _GROUP_SEARCH_STOP_WORDS
+    ][:5]
+
+
+def _group_message_query(client: Any, args: dict, tenant_id: str) -> list[dict]:
+    """Search original WhatsApp evidence without crossing workspace boundaries."""
+    query_text = str(args.get("query") or "").strip()
+    if not query_text:
+        return []
+    limit = max(1, min(int(args.get("limit") or 15), 25))
+    terms = _group_search_terms(query_text)
+    if not terms:
+        # Never turn a context-only follow-up such as "posted by?" into a
+        # wildcard scan of the raw-message ledger. The conversational path can
+        # answer from the preceding tool result, while a fresh search needs a
+        # meaningful location/property/broker term.
+        return []
+
+    columns = "id,group_name,sender,sender_phone,message,timestamp,created_at,message_type,is_group"
+    # Self-chat searches the broker's captured group evidence, never private
+    # DM rows. Keep the server-side predicate narrow: raw_messages is large,
+    # and OR-ing every term across message, group_name, and sender caused
+    # PostgREST statement timeouts in production.
+    source_query = (
+        client.table("raw_messages")
+        .select(columns)
+        .eq("tenant_id", tenant_id)
+        .eq("is_group", True)
+    )
+    # Broker support searches the active market, not an unbounded historical
+    # ledger. Keep this window short because raw_messages is large and the
+    # production database intentionally does not depend on a heavyweight
+    # trigram index for this interactive path.
+    days = max(1, min(int(args.get("days") or 30), 3650))
+    source_query = source_query.gte(
+        "timestamp",
+        (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+    )
+    # A message matching any meaningful term is fetched, then ranked locally so
+    # natural-language questions do not become an over-strict AND query.
+    # Group names and sender names are intentionally not part of this OR: a
+    # common broker name or locality in a group title can otherwise pull a
+    # huge, low-signal slice of the raw table.
+    clauses = []
+    for term in terms:
+        escaped = term.replace("%", "").replace("_", "")
+        like = f"%{escaped}%"
+        clauses.append(f"message.ilike.{like}")
+    source_query = source_query.or_(",".join(clauses))
+    group_name = str(args.get("group_name") or "").strip()
+    if group_name:
+        escaped_group = group_name.replace("%", "").replace("_", "")
+        source_query = source_query.ilike("group_name", f"%{escaped_group}%")
+    # Fetch enough candidates for locality ranking. Generic terms such as
+    # "requirements" can otherwise fill a small newest-first window before an
+    # exact Bandra East/BKC message is considered.
+    rows = source_query.order("timestamp", desc=True).limit(min(250, max(limit * 8, 60))).execute().data or []
+
+    query_lower = normalize_search_text(query_text)
+    # BHK/flat/apartment searches are residential by default. Keep this
+    # classification at the source boundary so the model cannot turn an
+    # irrelevant office post into a residential lead merely because the
+    # locality matches.
+    residential_request = bool(re.search(
+        r"\b(?:\d+(?:\.\d+)?\s*bhk|residential|flat|apartment)\b",
+        query_lower,
+    ))
+    locality_targets: list[tuple[str, tuple[str, ...]]] = []
+    # Keep locality intent explicit at the source-tool boundary. A broad
+    # token hit such as "Bandra" must not outrank an exact "Bandra East" or
+    # "BKC" request merely because it is newer.
+    for label, tokens in (
+        ("Bandra East", ("bandra", "east")),
+        ("Bandra West", ("bandra", "west")),
+        ("BKC", ("bkc",)),
+    ):
+        if all(token in query_lower for token in tokens):
+            locality_targets.append((label, tokens))
+
+    def locality_match(row: dict) -> tuple[int, str | None]:
+        haystack = normalize_search_text(" ".join(str(row.get(key) or "") for key in ("message", "group_name", "sender")))
+        for label, tokens in locality_targets:
+            if all(token in haystack for token in tokens):
+                return 2, label
+        if locality_targets and any(token in haystack for _, tokens in locality_targets for token in tokens):
+            return 1, None
+        return 0, None
+
+    def asset_scope(row: dict) -> str:
+        if not residential_request:
+            return "unspecified"
+        haystack = normalize_search_text(" ".join(
+            str(row.get(key) or "")
+            for key in ("message", "group_name", "sender")
+        ))
+        if re.search(r"\b(?:office|commercial|shop|retail|warehouse|showroom)\b", haystack):
+            return "commercial_mismatch"
+        return "residential_or_unspecified"
+
+    ranked_rows = sort_retrieval_results([
+        {**row, "match_scope": "exact" if locality_match(row)[0] == 2 else (
+            "nearby_or_broad" if locality_match(row)[0] == 1 else "unspecified"
+        )}
+        for row in rows
+    ])
+    if residential_request:
+        ranked_rows = [row for row in ranked_rows if asset_scope(row) != "commercial_mismatch"]
+    # A broker asking for options benefits from coverage across groups, not
+    # ten near-duplicate posts from the newest/highest-volume group. Take one
+    # representative per group first, then fill remaining slots by relevance.
+    selected_rows: list[dict] = []
+    selected_groups: set[str] = set()
+    for row in ranked_rows:
+        group = str(row.get("group_name") or "WhatsApp group").strip()
+        if group in selected_groups:
+            continue
+        selected_rows.append(row)
+        selected_groups.add(group)
+        if len(selected_rows) >= limit:
+            break
+    if len(selected_rows) < limit:
+        selected_ids = {row.get("id") for row in selected_rows}
+        selected_rows.extend(
+            row for row in ranked_rows
+            if row.get("id") not in selected_ids
+        )
+        selected_rows = selected_rows[:limit]
+
+    results = []
+    for row in selected_rows:
+        locality_score, matched_locality = locality_match(row)
+        results.append({
+            "message_id": row.get("id"),
+            "group_name": row.get("group_name") or "WhatsApp group",
+            "sender": _clean_broker_name(row.get("sender")) if row.get("sender") else "Unknown sender",
+            "sender_phone": _clean_phone(row.get("sender_phone")),
+            "timestamp": row.get("timestamp") or row.get("created_at"),
+            "message_type": row.get("message_type"),
+            "is_group": row.get("is_group"),
+            "source_text": str(row.get("message") or "").strip(),
+            "match_scope": "exact" if locality_score == 2 else ("nearby_or_broad" if locality_score == 1 else "unspecified"),
+            "matched_locality": matched_locality,
+            "asset_scope": asset_scope(row),
+        })
+    return results
+
+
+def _query_extract_raw_messages(client: Any, args: dict, tenant_id: str) -> dict:
+    """Extract a bounded raw-evidence window on demand for agent queries.
+
+    This deliberately reuses the normal source-grounding extractor but does
+    not persist into typed market tables. The cache is a disposable derived
+    representation keyed by the exact source text and extractor version.
+    """
+    query_text = str(args.get("query") or "").strip()
+    if not query_text:
+        return {"status": "error", "tool": "query_extract_raw_messages", "error": "query is required"}
+    limit = max(1, min(int(args.get("limit") or 3), 5))
+    source_rows = _group_message_query(client, {**args, "limit": limit}, tenant_id)
+    if not source_rows:
+        return {"status": "ok", "tool": "query_extract_raw_messages", "query": query_text, "results": [], "message": "No matching tenant WhatsApp evidence found."}
+
+    extractor_version = os.getenv("PROPAI_QUERY_EXTRACTOR_VERSION", "query-extractor-v1").strip() or "query-extractor-v1"
+    results: list[dict[str, Any]] = []
+    for source in source_rows[:limit]:
+        source_text = str(source.get("source_text") or "").strip()
+        if not source_text:
+            continue
+        source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        cached_payload: dict[str, Any] | None = None
+        cache_hit = False
+        try:
+            cached = (
+                client.table("query_extraction_cache")
+                .select("extracted_payload,provider_used,provider_model")
+                .eq("tenant_id", tenant_id)
+                .eq("raw_message_id", source.get("message_id"))
+                .eq("source_slice_hash", source_hash)
+                .eq("extractor_version", extractor_version)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if cached:
+                cached_payload = cached[0].get("extracted_payload") or {}
+                provider_used = cached[0].get("provider_used")
+                provider_model = cached[0].get("provider_model")
+                cache_hit = True
+            else:
+                provider_used = None
+                provider_model = None
+        except Exception:
+            # The cache migration may lag the API deployment. Query-time
+            # extraction remains useful without caching and fails closed.
+            provider_used = None
+            provider_model = None
+
+        if cached_payload is None:
+            try:
+                from ai_extraction import ai_extract
+                extracted = ai_extract(
+                    source_text,
+                    ctx={
+                        "tenant_id": tenant_id,
+                        "raw_id": int(source.get("message_id")) if source.get("message_id") is not None else None,
+                        "group_name": source.get("group_name") or "",
+                    },
+                )
+                provider_used = extracted.get("provider_used")
+                provider_model = extracted.get("provider_model")
+                cached_payload = {
+                    "extractions": extracted.get("extractions") or [],
+                    "extraction": extracted.get("extraction"),
+                    "extraction_source": extracted.get("extraction_source"),
+                    "needs_review": bool(extracted.get("needs_review")),
+                    "error": extracted.get("error"),
+                }
+                try:
+                    client.table("query_extraction_cache").upsert(
+                        {
+                            "tenant_id": tenant_id,
+                            "raw_message_id": source.get("message_id"),
+                            "source_slice_hash": source_hash,
+                            "extractor_version": extractor_version,
+                            "extracted_payload": cached_payload,
+                            "provider_used": provider_used,
+                            "provider_model": provider_model,
+                        },
+                        on_conflict="tenant_id,raw_message_id,source_slice_hash,extractor_version",
+                    ).execute()
+                except Exception:
+                    pass
+            except Exception as exc:
+                cached_payload = {"extractions": [], "extraction_source": "query_extraction_failed", "error": str(exc)[:300]}
+
+        extractions = cached_payload.get("extractions") if isinstance(cached_payload, dict) else []
+        if not isinstance(extractions, list):
+            extractions = []
+        results.append({
+            "message_id": source.get("message_id"),
+            "group_name": source.get("group_name"),
+            "sender": source.get("sender"),
+            "timestamp": source.get("timestamp"),
+            "source_text": source_text,
+            "source_slice_hash": source_hash,
+            "extractor_version": extractor_version,
+            "cached": cache_hit,
+            "provider_used": provider_used,
+            "provider_model": provider_model,
+            "extractions": extractions,
+            "extraction": cached_payload.get("extraction") if isinstance(cached_payload, dict) else None,
+            "needs_review": bool(cached_payload.get("needs_review")) if isinstance(cached_payload, dict) else True,
+            "error": cached_payload.get("error") if isinstance(cached_payload, dict) else None,
+        })
+    return {"status": "ok", "tool": "query_extract_raw_messages", "query": query_text, "search_window_days": 30, "results": results}
+
+
+def _whatsapp_chat_query(client: Any, args: dict, tenant_id: str) -> list[dict]:
+    """List every group represented in this tenant's captured raw evidence."""
+    limit = max(1, min(int(args.get("limit") or 25), 100))
+    query = client.table("raw_messages").select(
+        "group_name,timestamp,created_at,is_group"
+    ).eq("tenant_id", tenant_id).eq("is_group", True)
+    query = query.not_("group_name", "is", None)
+    needle = str(args.get("query") or "").strip()
+    if needle:
+        escaped = needle.replace("%", "").replace("_", "")
+        query = query.ilike("group_name", f"%{escaped}%")
+    rows = query.order("timestamp", desc=True).limit(min(5000, max(limit * 20, 100))).execute().data or []
+    groups: dict[str, dict] = {}
+    for row in rows:
+        name = str(row.get("group_name") or "").strip()
+        if not name:
+            continue
+        groups.setdefault(name, {
+            "group_jid": name if name.endswith("@g.us") else None,
+            "group_name": name,
+            "latest_message_at": row.get("timestamp") or row.get("created_at"),
+            "captured_message_count": 0,
+        })["captured_message_count"] += 1
+    return list(groups.values())[:limit]
+
+
+def _active_requirement(client: Any, client_id: str, tenant_id: str | None) -> dict | None:
+    query = _tenant_query(
+        client,
+        "client_requirements",
+        tenant_id,
+        "id,client_id,intent,bhk,price_min,price_max,micro_market,building_name,"
+        "area_sqft_min,area_sqft_max,furnishing,use_type,landmarks,must_have,"
+        "nice_to_have,notes,is_primary,created_at,updated_at",
+    )
+    rows = query.eq("client_id", client_id).order("is_primary", desc=True).order("updated_at", desc=True).limit(20).execute().data or []
+    return rows[0] if rows else None
+
+
+def _typed_listing_row(client: Any, listing_id: Any, tenant_id: str) -> dict | None:
+    """Resolve a listing ID across the four tenant-scoped typed tables."""
+    try:
+        numeric_id = int(listing_id)
+    except (TypeError, ValueError):
+        return None
+    matches = []
+    for table in (
+        "residential_rent_listings",
+        "residential_sale_listings",
+        "commercial_rent_listings",
+        "commercial_sale_listings",
+    ):
+        rows = (
+            client.table(table)
+            .select("id,tenant_id")
+            .eq("id", numeric_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        matches.extend(rows)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _confirmation_secret() -> bytes:
+    secret = os.getenv("PROPAI_AGENT_CONFIRMATION_SECRET") or os.getenv("SUPABASE_JWT_SECRET")
+    if not secret:
+        raise RuntimeError("PROPAI_AGENT_CONFIRMATION_SECRET is required for write confirmations")
+    return secret.encode()
+
+
+def make_confirmation_token(tool_name: str, args: dict, tenant_id: str | None, user_id: str | None) -> str:
+    payload = {"tool": tool_name, "args": args, "tenant_id": tenant_id, "user_id": user_id, "exp": int(time.time()) + 900}
+    body = base64.urlsafe_b64encode(_json(payload).encode()).decode().rstrip("=")
+    signature = hmac.new(_confirmation_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{signature}"
+
+
+def _read_confirmation_token(token: str, tenant_id: str | None, user_id: str | None) -> tuple[str, dict]:
+    try:
+        body, signature = token.split(".", 1)
+        expected = hmac.new(_confirmation_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid confirmation signature")
+        decoded = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        payload = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid confirmation token") from exc
+    if int(payload.get("exp") or 0) < int(time.time()):
+        raise ValueError("confirmation expired")
+    if str(payload.get("tenant_id") or "") != str(tenant_id or "") or str(payload.get("user_id") or "") != str(user_id or ""):
+        raise ValueError("confirmation does not belong to this user/workspace")
+    return str(payload.get("tool") or ""), dict(payload.get("args") or {})
+
+
+def _pending(tool_name: str, args: dict, tenant_id: str | None, user_id: str | None) -> dict:
+    if tool_name == "save_private_inventory":
+        message = (
+            "I’ve prepared this broker-owned property for Private CRM. Confirm to save it privately; "
+            "it will not appear in Market Inbox, marketplace search, or Auto Match."
+        )
+        title = "Save to Private CRM?"
+    else:
+        message = f"I’m ready to run {tool_name.replace('_', ' ')}, but this changes workspace data. Please confirm."
+        title = "Confirmation required"
+    return {
+        "status": "pending_confirmation",
+        "tool": tool_name,
+        "message": message,
+        "title": title,
+        "confirmation_token": make_confirmation_token(tool_name, args, tenant_id, user_id),
+        "args": args,
+    }
+
+
+def execute_tool(
+    name: str,
+    args: dict,
+    client: Any,
+    tenant_id: str | None,
+    *,
+    user_id: str | None = None,
+    confirmed: bool = False,
+) -> dict:
+    if name not in READ_TOOL_NAMES and name not in WRITE_TOOL_NAMES:
+        return {"status": "error", "error": f"Unknown agent tool: {name}"}
+    if not tenant_id:
+        return {"status": "error", "error": "An active workspace is required for agent tools"}
+    if name in WRITE_TOOL_NAMES and not confirmed:
+        return _pending(name, args, tenant_id, user_id)
+
+    if name == "search_listings":
+        requested_localities = [
+            str(value).strip()
+            for value in ([args.get("locality")] + list(args.get("localities") or []))
+            if str(value or "").strip()
+        ]
+        search_localities = list(requested_localities)
+        if args.get("include_nearby"):
+            seen = {value.casefold() for value in search_localities}
+            for locality in requested_localities:
+                for nearby in _nearby_localities(client, locality):
+                    if nearby.casefold() not in seen:
+                        seen.add(nearby.casefold())
+                        search_localities.append(nearby)
+        results = []
+        exact = {value.casefold() for value in requested_localities}
+        for locality in search_localities or [""]:
+            for row in _listing_query(client, {**args, "locality": locality}, tenant_id):
+                row["match_scope"] = "exact" if locality.casefold() in exact else "nearby"
+                row["matched_locality"] = locality
+                results.append(row)
+        return {"status": "ok", "tool": name, "results": sort_retrieval_results(results)}
+
+    if name == "find_opportunities":
+        limit = max(1, min(int(args.get("limit") or 10), 25))
+        shared_args = {**args, "limit": limit}
+        listing_result = execute_tool("search_listings", shared_args, client, tenant_id)
+        requirement_result = execute_tool("search_requirements", shared_args, client, tenant_id)
+        query_text = str(args.get("query") or "").strip()
+        if not query_text:
+            locations = ", ".join(str(v) for v in (args.get("localities") or [args.get("locality") or ""]) if v)
+            query_text = " ".join(str(v) for v in (args.get("bhk") or "", args.get("listing_type") or "", locations) if v)
+        raw_result = execute_tool(
+            "search_group_messages",
+            {"query": query_text, "limit": limit, "days": int(args.get("days") or 30)},
+            client,
+            tenant_id,
+        ) if query_text else {"results": []}
+        results = []
+        for source_name, result in (
+            ("parsed_listing", listing_result),
+            ("broker_requirement", requirement_result),
+            ("raw_whatsapp_evidence", raw_result),
+        ):
+            for row in (result.get("results") or []):
+                results.append({**row, "opportunity_source": source_name})
+        ranked = sort_retrieval_results(results)
+        return {
+            "status": "ok",
+            "tool": name,
+            "results": ranked[:limit * 3],
+            "source_counts": {
+                "parsed_listing": len(listing_result.get("results") or []),
+                "broker_requirement": len(requirement_result.get("results") or []),
+                "raw_whatsapp_evidence": len(raw_result.get("results") or []),
+            },
+        }
+
+    if name == "search_requirements":
+        localities = [
+            str(value).strip().casefold()
+            for value in ([args.get("locality")] + list(args.get("localities") or []))
+            if str(value or "").strip()
+        ]
+        bhk_min = str(args.get("bhk_min") or "").strip()
+        bhk_max = str(args.get("bhk_max") or "").strip()
+        bhk = str(args.get("bhk") or "").strip()
+        listing_type = str(args.get("listing_type") or "all").strip().lower()
+        property_type = str(args.get("property_type") or "residential").strip().lower()
+        limit = max(1, min(int(args.get("limit") or 10), 25))
+        offset = max(0, int(args.get("offset") or 0))
+        fetch_limit = min(1000, max(200, offset + limit))
+        select = (
+            "req_type,id,raw_message_id,building_name,micro_market,broker_name,"
+            "broker_phone,bhk_options,budget_min,budget_max,carpet_area_min_sqft,"
+            "carpet_area_max_sqft,status,created_at"
+        )
+        query = _tenant_query(client, "requirements_unified", tenant_id, select)
+        query = query.in_("status", ["active", "open", "pending"]).order("created_at", desc=True).limit(fetch_limit)
+        rows = query.execute().data or []
+        results = []
+        for row in rows:
+            req_type = str(row.get("req_type") or "").casefold()
+            if property_type == "residential" and not req_type.startswith("residential_"):
+                continue
+            if property_type == "commercial" and not req_type.startswith("commercial_"):
+                continue
+            if listing_type == "rent" and not req_type.endswith("_rent"):
+                continue
+            if listing_type == "sale" and not req_type.endswith("_sale"):
+                continue
+            if localities:
+                haystack = " ".join(
+                    str(row.get(key) or "") for key in ("micro_market", "building_name")
+                ).casefold()
+                if not any(locality in haystack for locality in localities):
+                    continue
+            # Support BHK range (bhk_min/bhk_max) or single bhk
+            bhk_match_ok = False
+            options = row.get("bhk_options") or []
+            option_text = " ".join(str(value) for value in options).casefold()
+            if bhk_min and bhk_max:
+                try:
+                    lo = float(bhk_min)
+                    hi = float(bhk_max)
+                    for opt in options:
+                        try:
+                            v = float(opt)
+                            if lo <= v <= hi:
+                                bhk_match_ok = True
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                except (TypeError, ValueError):
+                    bhk_match_ok = False
+            elif bhk:
+                bhk_match_ok = bhk.casefold() in option_text
+            else:
+                bhk_match_ok = True
+            if not bhk_match_ok:
+                continue
+            results.append({
+                "requirement_id": row.get("id"),
+                "raw_message_id": row.get("raw_message_id"),
+                "building_name": row.get("building_name"),
+                "micro_market": row.get("micro_market"),
+                "bhk_options": row.get("bhk_options"),
+                "budget_min": row.get("budget_min"),
+                "budget_max": row.get("budget_max"),
+                "broker_name": row.get("broker_name"),
+                "broker_phone": row.get("broker_phone"),
+                "requirement_type": req_type,
+                "created_at": row.get("created_at"),
+            })
+        ranked = sort_retrieval_results(results)
+        page = ranked[offset:offset + limit]
+        return {
+            "status": "ok",
+            "tool": name,
+            "results": page,
+            "matched": len(ranked),
+            "has_more": offset + limit < len(ranked),
+        }
+
+    if name == "search_group_messages":
+        results = _group_message_query(client, args, tenant_id)
+        matched_groups = len({str(row.get("group_name") or "WhatsApp group").strip() for row in results})
+        return {
+            "status": "ok",
+            "tool": name,
+            "query": str(args.get("query") or "").strip(),
+            "results": results,
+            "search_window_days": 30,
+            "matched_group_count": matched_groups,
+            "message": "No matching tenant WhatsApp group evidence found." if not results else None,
+        }
+
+    if name == "query_extract_raw_messages":
+        return _query_extract_raw_messages(client, args, tenant_id)
+
+    if name == "list_whatsapp_chats":
+        return {
+            "status": "ok",
+            "tool": name,
+            "results": _whatsapp_chat_query(client, args, tenant_id),
+        }
+
+    if name == "lookup_building":
+        query_text = str(args.get("query") or "").strip()
+        if not query_text:
+            return {"status": "error", "error": "A building or project name is required"}
+        limit = max(1, min(int(args.get("limit") or 5), 20))
+        columns = (
+            "id,building_id,canonical_name,micro_market,address,developer,pincode,status,"
+            "observed_listings,observed_requirements,observed_brokers"
+        )
+        rows = []
+        for tenant_filter in (tenant_id, None):
+            building_query = client.table("buildings").select(columns)
+            escaped = query_text.replace("%", "").replace("_", "")
+            building_query = building_query.or_(
+                f"canonical_name.ilike.%{escaped}%,micro_market.ilike.%{escaped}%"
+            ).neq("status", "quarantined").limit(limit)
+            if tenant_filter is None:
+                building_query = building_query.is_("tenant_id", "null")
+            else:
+                building_query = building_query.eq("tenant_id", tenant_filter)
+            rows = building_query.execute().data or []
+            if rows or tenant_filter is None:
+                break
+        return {"status": "ok", "tool": name, "query": query_text, "results": rows}
+
+    if name == "get_client_requirements":
+        if not _client_row(client, str(args.get("client_id") or ""), tenant_id):
+            return {"status": "not_found", "client_id": args.get("client_id")}
+        query = _tenant_query(
+            client,
+            "client_requirements",
+            tenant_id,
+            "id,client_id,intent,bhk,price_min,price_max,micro_market,building_name,"
+            "area_sqft_min,area_sqft_max,furnishing,use_type,landmarks,must_have,"
+            "nice_to_have,notes,is_primary,created_at,updated_at,building_grade_preference,"
+            "sourcing_preference,possession_timeline",
+        )
+        rows = query.eq("client_id", str(args.get("client_id"))).order("is_primary", desc=True).limit(20).execute().data or []
+        return {"status": "ok", "tool": name, "requirements": rows}
+
+    if name == "match_client_to_listings":
+        client_id = str(args.get("client_id") or "")
+        if not _client_row(client, client_id, tenant_id):
+            return {"status": "not_found", "client_id": client_id}
+        requirement = _active_requirement(client, client_id, tenant_id)
+        if not requirement:
+            return {"status": "ok", "client_id": client_id, "matches": [], "reason": "no_saved_requirement"}
+        intent = str(requirement.get("intent") or "rent").lower()
+        listing_type = "rent" if intent in {"rent", "lease", "pre_leased"} else "sale"
+        rows = _listing_query(client, {
+            "locality": requirement.get("micro_market") or "",
+            "bhk": requirement.get("bhk"),
+            "price_min": requirement.get("price_min"),
+            "price_max": requirement.get("price_max"),
+            "listing_type": listing_type,
+            "property_type": "commercial" if str(requirement.get("use_type") or "").lower() in {"office", "shop", "retail", "commercial"} else "residential",
+        }, tenant_id)
+        return {"status": "ok", "tool": name, "client_id": client_id, "requirement": requirement, "matches": rows}
+
+    if name == "get_broker_profile":
+        query = _tenant_query(client, "brokers", tenant_id, "id,canonical_name,primary_phone,observation_count,listing_count,requirement_count,rental_count,commercial_count,group_count,market_count,building_count,active_days_30,avg_ticket,is_hidden,created_at,updated_at")
+        rows = query.eq("id", str(args.get("broker_id") or "")).limit(1).execute().data or []
+        return {"status": "ok", "tool": name, "profile": rows[0] if rows else None}
+
+    if name == "create_client_property_candidate":
+        client_id = str(args.get("client_id") or "")
+        listing_id = str(args.get("listing_id") or "")
+        client_row = _client_row(client, client_id, tenant_id)
+        if not client_row:
+            return {"status": "not_found", "client_id": client_id}
+        legacy = _tenant_query(client, "listings_legacy", tenant_id, "id,building_name,micro_market,bhk,price,price_unit,area_sqft,furnishing,latest_raw_message_id,created_at").eq("id", listing_id).limit(1).execute().data or []
+        if not legacy:
+            return {"status": "not_found", "listing_id": listing_id, "reason": "listing_legacy_fk_required"}
+        row = legacy[0]
+        inserted = client.table("client_property_candidates").insert({
+            "client_id": client_id,
+            "listing_id": row["id"],
+            "message_id": row.get("latest_raw_message_id"),
+            "building_name": row.get("building_name"),
+            "micro_market": row.get("micro_market"),
+            "bhk": row.get("bhk"),
+            "price": row.get("price"),
+            "price_unit": row.get("price_unit"),
+            "area_sqft": row.get("area_sqft"),
+            "furnishing": row.get("furnishing"),
+            "source_text": row.get("building_name") or row.get("micro_market") or "",
+            "notes": str(args.get("notes") or "").strip(),
+            "status": "pending",
+            "tenant_id": tenant_id,
+            "source_timestamp": row.get("created_at"),
+        }).execute().data or []
+        return {"status": "ok", "tool": name, "candidate": inserted[0] if inserted else None}
+
+    if name == "create_lead":
+        listing_id = args.get("listing_id")
+        listing = _typed_listing_row(client, listing_id, tenant_id)
+        if not listing:
+            return {"status": "not_found", "listing_id": listing_id, "reason": "listing_id must resolve to exactly one typed listing in this workspace"}
+        client_id = args.get("client_id")
+        client_row = None
+        if client_id not in (None, ""):
+            client_row = _client_row(client, str(client_id), tenant_id)
+            if not client_row:
+                return {"status": "not_found", "client_id": client_id}
+        inserted = client.table("leads").insert({
+            "listing_id": int(listing_id),
+            "client_id": int(client_id) if client_id not in (None, "") else None,
+            "client_name": client_row.get("name") if client_row else None,
+            "client_phone": client_row.get("phone") if client_row else None,
+            "message": str(args.get("notes") or "").strip(),
+            "source": str(args.get("source") or "agent").strip() or "agent",
+            "tenant_id": tenant_id,
+        }).execute().data or []
+        return {"status": "ok", "tool": name, "lead": inserted[0] if inserted else None}
+
+    if name == "log_internal_note":
+        try:
+            author_id = int(args.get("author_id"))
+        except (TypeError, ValueError):
+            return {"status": "error", "tool": name, "error": "author_id must be a numeric team member ID"}
+        inserted = client.table("internal_notes").insert({
+            "entity_type": str(args.get("entity_type") or "").strip(),
+            "entity_id": str(args.get("entity_id") or "").strip(),
+            "author_id": author_id,
+            "mentioned_member_ids": [],
+            "body": str(args.get("note") or "").strip(),
+            "tenant_id": tenant_id,
+        }).execute().data or []
+        return {"status": "ok", "tool": name, "note": inserted[0] if inserted else None}
+
+    if name == "save_private_inventory":
+        source_text = str(args.get("source_text") or "").strip()
+        attachments = args.get("attachments") or []
+        if not isinstance(attachments, list):
+            return {"status": "error", "tool": name, "error": "attachments must be a list"}
+        if len(source_text) < 4 and not attachments:
+            return {"status": "error", "tool": name, "error": "source_text is required"}
+        try:
+            from routers.crm import _normalize_inventory_payload
+
+            payload = _normalize_inventory_payload({
+                "building_name": args.get("building_name"),
+                "location": args.get("location"),
+                "tower": args.get("tower"),
+                "bhk": args.get("bhk"),
+                "floor": args.get("floor"),
+                "area_sqft": args.get("area_sqft"),
+                "quote": args.get("quote"),
+                "furnishing": args.get("furnishing"),
+                "amenities": args.get("amenities"),
+                "owner_name": args.get("owner_name"),
+                "availability": args.get("availability"),
+                "pets_okay": args.get("pets_okay"),
+                "contact_name": args.get("contact_name"),
+                "contact_number": args.get("contact_number"),
+                "notes": args.get("notes") or source_text,
+                "source": "chat",
+            }, allow_evidence_only=bool(attachments))
+        except ValueError as exc:
+            return {"status": "error", "tool": name, "error": str(exc)}
+        attachment_rows = []
+        total_bytes = 0
+        prefix = f"{tenant_id}/{user_id}/"
+        for attachment in attachments:
+            if not isinstance(attachment, dict) or attachment.get("storage_bucket") != "private-crm":
+                return {"status": "error", "tool": name, "error": "invalid_private_attachment"}
+            path = str(attachment.get("storage_path") or "")
+            if not path.startswith(prefix) or ".." in path:
+                return {"status": "error", "tool": name, "error": "attachment_owner_mismatch"}
+            size_bytes = int(attachment.get("size_bytes") or 0)
+            total_bytes += size_bytes
+            if size_bytes < 0 or size_bytes > 25 * 1024 * 1024 or total_bytes > 100 * 1024 * 1024:
+                return {"status": "error", "tool": name, "error": "attachment_size_limit"}
+            attachment_rows.append({
+                "storage_bucket": "private-crm",
+                "storage_path": path,
+                "file_name": str(attachment.get("file_name") or "upload")[:255],
+                "mime_type": str(attachment.get("mime_type") or "application/octet-stream")[:255],
+                "size_bytes": size_bytes,
+                "extracted_text": str(attachment.get("extracted_text") or "")[:12000],
+                "text_supported": bool(attachment.get("text_supported")),
+            })
+        payload.update({
+            "tenant_id": tenant_id,
+            "created_by": user_id,
+            "source": "chat",
+        })
+        inserted = client.table("crm_inventory").insert(payload).execute().data or []
+        row = inserted[0] if inserted else None
+        if row and attachment_rows:
+            client.table("crm_inventory_attachments").insert([
+                {**attachment, "tenant_id": tenant_id, "inventory_id": row.get("id"), "created_by": user_id}
+                for attachment in attachment_rows
+            ]).execute()
+        return {
+            "status": "ok",
+            "tool": name,
+            "inventory_id": row.get("id") if row else None,
+            "private": True,
+            "attachments_saved": len(attachment_rows),
+            "message": "Saved to Private CRM. This record is excluded from Market Inbox, marketplace search, and Auto Match.",
+        }
+
+    if name == "save_my_deal":
+        # Reuse the canonical storage writer so this path has the same typed
+        # routing, price normalization, source fingerprint, and evidence
+        # contract as WhatsApp extraction.
+        from routers.common import storage
+        from storage.base import ParsedObservation, RawMessage
+        from datetime import datetime, timezone
+
+        connections = storage.list_org_whatsapp_connections(tenant_id)
+        phone = str((connections[0] if connections else {}).get("phone_number") or "")
+        source_text = str(args.get("source_text") or "").strip()
+        if not source_text:
+            return {"status": "error", "tool": name, "error": "source_text is required"}
+        message_type = str(args.get("message_type") or "listing").lower()
+        transaction = str(args.get("transaction_type") or "rent").lower()
+        asset = str(args.get("asset_type") or "residential").lower()
+        if message_type not in {"listing", "requirement"}:
+            return {"status": "error", "tool": name, "error": "message_type must be listing or requirement"}
+        if transaction not in {"rent", "sale"}:
+            return {"status": "error", "tool": name, "error": "transaction_type must be rent or sale"}
+        if asset not in {"residential", "commercial"}:
+            return {"status": "error", "tool": name, "error": "asset_type must be residential or commercial"}
+        typed_table = (
+            f"{asset}_{transaction}_requirements"
+            if message_type == "requirement"
+            else f"{asset}_{transaction}_listings"
+        )
+        # A duplicate check is part of the write boundary. If it cannot be
+        # completed, fail closed so retries cannot create another CRM record.
+        try:
+            existing = client.table(typed_table).select("id").eq(
+                "tenant_id", tenant_id
+            ).eq("normalized_message", source_text).limit(1).execute().data or []
+        except Exception as exc:
+            logging.getLogger(__name__).exception("AI Chat duplicate check failed")
+            return {"status": "error", "tool": name, "error": f"Could not verify duplicate: {exc}"}
+        if existing:
+            return {
+                "status": "ok",
+                "tool": name,
+                "message_type": message_type,
+                "typed_id": existing[0]["id"],
+                "message": "This source is already saved in My Deals.",
+                "idempotent": True,
+            }
+        now = datetime.now(timezone.utc).isoformat()
+        raw_id = storage.save_raw_message(RawMessage(
+            group_name="AI Chat",
+            sender="Workspace broker",
+            sender_phone=phone,
+            message=source_text,
+            message_type="text",
+            timestamp=now,
+            source="AI_CHAT",
+            message_uid=f"ai-chat:{tenant_id}:{uuid.uuid4().hex}",
+            raw_payload=json.dumps({
+                "full_text": source_text,
+                "source": "ai_chat",
+                "owner_user_id": str(user_id or ""),
+            }),
+            is_group=False,
+            processed=True,
+            processed_at=now,
+            tenant_id=tenant_id,
+        ))
+        parsed = ParsedObservation(
+            raw_message_id=raw_id,
+            message_type=message_type,
+            intent=("RENT" if transaction == "rent" else "SELL") if message_type == "requirement" else ("RENT" if transaction == "rent" else "SELL"),
+            transaction_type=transaction,
+            asset_type=asset,
+            building_name=str(args.get("building_name") or "").strip() or None,
+            micro_market=str(args.get("locality") or "").strip() or None,
+            location_raw=str(args.get("locality") or "").strip() or None,
+            bhk=(str(args.get("bhk") or "").strip() or None) if asset == "residential" else None,
+            configuration=(str(args.get("configuration") or "").strip() or None) if asset == "residential" else None,
+            price=args.get("price"),
+            budget_min=args.get("budget_min"),
+            budget_max=args.get("budget_max"),
+            price_unit=str(args.get("price_unit") or "abs"),
+            area_sqft=args.get("area_sqft"),
+            furnishing=str(args.get("furnishing") or "").strip() or None,
+            summary_title=str(args.get("summary_title") or "").strip() or None,
+            normalized_message=source_text,
+            raw_payload=json.dumps({
+                "full_text": source_text,
+                "source": "ai_chat",
+                "owner_user_id": str(user_id or ""),
+            }),
+            broker_phone=phone or None,
+            broker_name="Workspace broker",
+            tenant_id=tenant_id,
+            extraction_confidence_score=0.7,
+        )
+        typed_id = storage.save_typed_observation(parsed)
+        if message_type == "requirement":
+            # Matching is kept inline for the single newly saved requirement;
+            # the poll worker remains the backstop for all other ingestion
+            # paths. A matcher outage must never make a successful save fail.
+            try:
+                from matching.service import run_requirement
+                run_requirement(storage, tenant_id, typed_id, req_type=f"{asset}_{transaction}")
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Immediate requirement matching failed for tenant=%s requirement=%s",
+                    tenant_id, typed_id,
+                )
+        return {
+            "status": "ok",
+            "tool": name,
+            "message_type": message_type,
+            "typed_id": typed_id,
+            "raw_message_id": raw_id,
+            "message": "Saved to My Deals with the supplied source text as evidence.",
+        }
+
+    return {"status": "error", "error": "Unhandled agent tool"}
+
+
+def confirm_tool(token: str, client: Any, tenant_id: str | None, user_id: str | None) -> dict:
+    name, args = _read_confirmation_token(token, tenant_id, user_id)
+    if name not in WRITE_TOOL_NAMES:
+        raise ValueError("only write tools can be confirmed")
+    return execute_tool(name, args, client, tenant_id, user_id=user_id, confirmed=True)

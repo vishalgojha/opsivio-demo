@@ -1,0 +1,1229 @@
+# PropAI Living Architecture
+
+This is the operational architecture contract for PropAI. It records rules
+that are easy to rediscover incorrectly from code alone. Generated diagrams
+live in [`docs/architecture/generated/`](docs/architecture/generated/); this
+file is the hand-maintained layer and must change with architectural changes.
+
+## Public locality inventory invariant
+
+The public locality directory and detail pages use the same complete 30-day
+listing-record scope. `needs_review` is diagnostic metadata and does not hide
+source-backed listings. Counts are records, not inferred unique homes; same
+building, price, and BHK are not sufficient grounds to merge units. The
+server-only `get_public_locality_inventory` RPC supplies grouped inventory,
+fresh activity, and conservative comparable-price ranges. Unknown locality text
+is counted as unmapped and is never promoted into an SEO locality route.
+
+Public locality and building pages remain server-rendered with live,
+source-derived data, but their read models are cached for the same five-minute
+freshness contract as the route. Building relational intelligence, nearby
+building/landmark links, listing collections, and building resolution share
+request-stable persistent cache entries so crawler bursts and SSR retries do
+not repeatedly execute the same expensive public-view scans. A database fetch
+is bounded below the gateway timeout; if the database is degraded, the page
+may omit optional intelligence while preserving the page shell and grounded
+data that completed. This is a read-performance boundary only: it never
+creates inventory, changes freshness timestamps, or bypasses public privacy
+projections.
+
+Generated artifacts are intentionally evidence-labelled. A schema diagram
+generated without Supabase credentials is a source fallback, not proof of the
+live database. Regenerate with `SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY` before treating it as current.
+
+## External lead ingestion boundary
+
+Magicbricks, 99acres, Meta Lead Ads, and website forms enter through the
+provider-neutral lead webhook contract in `routers/lead_ingestion.py`. Each
+event is idempotently retained in `public.inbound_leads` with its raw payload,
+private contact data, provider identity, and deterministic parsed requirement.
+Meta webhook requests are HMAC-verified and the lead record is fetched from
+Graph API when `META_PAGE_ACCESS_TOKEN` is configured; portal adapters use the
+same authenticated POST contract because partner access is configured by the
+portal account rather than scraped by PropAI.
+
+External leads are buyer enquiries, not WhatsApp market inventory. They never
+create a fabricated `raw_messages` row and are not published to the shared
+market feed. On arrival, `services/lead_ingestion.py` applies the existing
+tenant-safe `score_candidate()` matcher against typed listings and stores
+explainable results in `public.inbound_lead_matches`; it does not auto-send or
+auto-merge anything. The matching surface therefore converges with existing
+matching behavior without weakening the WhatsApp source-authority invariant.
+
+## System map
+
+### WhatsApp ingestion and consent
+
+The isolated WhatsMeow ingestor captures raw WhatsApp events and sends them to
+the FastAPI ingestion boundary. Raw messages retain tenant, group, sender,
+timestamp, and source evidence. Group selection, opt-out, pause, and stop
+controls decide whether a raw message is eligible for extraction; eligibility
+does not delete historical evidence. Main entry points are
+`services/whatsmeow-ingestor/`, `routers/infra.py`, `routers/whatsapp_sync.py`,
+and `routers/whatsapp_group_controls.py`.
+
+An unpaired connection may already be showing a QR window when its authorized
+operator requests a phone-link code. That request must wake and restart the
+unpaired session immediately so the new pairing window can issue `PairPhone`;
+it must not wait for the older QR window to expire or for a background
+reconnect. This control-plane transition changes only the linked-device setup
+state and never alters captured messages or extraction eligibility.
+
+Pairing is an explicit operator choice: QR scan or phone-link code. Both use
+the same authorized broker session, and switching methods must wake/restart
+that unpaired session rather than running competing WhatsApp pairing flows.
+Reconnect remains reserved for an already-paired saved session; a connected
+session rejects a new QR-pairing request.
+
+For ordinary workspaces, the earliest active WhatsApp connection is the sole
+continuous-extraction owner and may select at most three groups. A workspace
+owned by a verified Super Admin is the deliberate platform exception: its
+primary connection has no group-count cap so it can populate the shared
+PropAI capture pool. Additional connected numbers still retain raw messages as
+tenant-scoped evidence, but their traffic is raw-only and is not continuously
+parsed. The same rule is enforced at the ingestion boundary and in the
+extraction worker, so queued rows, self-authored messages, and reconnects
+cannot bypass the ordinary three-group limit. On-demand self-chat retrieval
+may search authorized raw evidence without promoting those messages into
+official parsed inventory.
+
+WhatsApp Message-Yourself traffic is a separate private-agent path. The
+ingestor detects the account owner's self-chat before raw persistence and
+dispatches it to `/api/internal/self-chat`; it is not inserted into
+`raw_messages`, is not eligible for extraction, and cannot add market
+evidence. The self-chat agent must direct owner-supplied listings and
+requirements to a selected WhatsApp group or a private owner broadcast/group
+added to PropAI's group directory; it must not parse the DM as an ingestion
+source. The API stores only the tenant-scoped conversation transcript in
+`ai_chat_sessions`/`ai_chat_messages`. Every turn uses the native LangGraph
+agent loop with tenant-scoped tools; the model decides whether a turn is
+conversation, search, comparison, or an action. OpenClaw is optional for
+operations work and is not in the WhatsApp reply path. Sarvam requests do not
+receive a gateway-imposed output-token ceiling. This path
+intentionally does not wait on the raw-message extraction backlog.
+
+### Google Drive inventory export
+
+The `google-drive-sync` is an outbound, tenant-scoped adapter for broker-owned
+private CRM inventory. The API stores encrypted Google OAuth credentials and a
+selected inventory export definition; the worker consumes sync jobs and writes
+one Google Sheet inside a dedicated Drive folder. It never reads Drive data,
+does not ingest into `raw_messages`, and cannot publish private CRM rows to the
+shared market. Google Drive/Meta freshness is external behaviour, so the Sheet
+includes a last-updated field and the API records checksum, row count, errors,
+and job history. OAuth, Drive, and Sheets scopes must remain narrow and the
+tenant boundary must be checked before every export selection and sync.
+
+### Public editorial content
+
+`public.blog_posts` is an editorial table separate from WhatsApp inventory.
+Super Admin manages drafts and publication through the authenticated app. The
+public Next.js site reads only rows with `status = 'published'` and a past
+`published_at`, renders `/blog` and `/blog/[slug]` server-side, and adds those
+URLs to the sitemap. The article editor stores plain text with a deliberately
+small heading/bullet convention rather than accepting arbitrary HTML, keeping
+public rendering safe without introducing an unbounded CMS surface.
+
+### Extraction and typed persistence
+
+`extraction_worker.py` claims eligible raw messages, splits independent
+broadcast slices (using an LLM boundary-only fallback for ambiguous multi-item
+messages), calls the configured extraction model, applies deterministic
+grounding and plausibility checks, and persists one of the eight typed listing
+or requirement tables. `extraction.py` owns persistence and source-boundary
+rules; `ai_extraction.py` owns model/schema prompts and normalization. The
+typed tables are write sources; `listings_unified` and `requirements_unified`
+are live read projections.
+
+Explicit JODI expansion is source-scoped: a message that says a combined
+opportunity is also available as separate units may produce one combined
+JODI record and one record per individual unit. The individual records retain
+the JODI relationship but do not inherit the combined price unless an
+individual price is explicitly present. An explicit sale-and-rent statement
+likewise produces separate transaction records without cross-copying prices.
+
+The public listing projection is a privacy-shaped derivative of the live
+listing read model. It may expose only source-grounded buyer facts used by
+public cards, such as BHK, area, parking, bathrooms, and deal tags; broker
+contact fields and raw message evidence stay out of public HTML and are
+resolved only through the contact action.
+
+Public listing photos follow the same boundary: the site may resolve a
+time-limited signed URL for an attached listing-media object, but it must not
+expose storage paths, raw message media, or broker contact data in HTML.
+
+Exact-repost reconciliation is maintenance work and is disabled in the hot
+extraction loop by default. `EXTRACTION_WORKER_RECONCILE_PENDING_ON_CYCLE=true`
+is an explicit incident/maintenance override; a slow reconciliation query must
+not delay fresh message extraction.
+
+Extraction provider order is deployment-configured and quality-gated: the
+optional `openrouter/free` lane is disabled by default, the configured
+OpenRouter DeepSeek model can be used as a fallback, and Doubleword remains
+the paid quality fallback. Every provider response still passes the same JSON
+parsing, source-grounding, deterministic routing, and plausibility checks
+before typed persistence; provider success alone never authorizes an inventory
+write.
+
+The active unified extraction contract is generated from the union of the
+eight typed destination schemas. Preflight remains structural, but it also
+emits source-shape cues for built-up/carpet area, parking, qualitative floor,
+furnishing, and combination-unit shorthand. The extractor must return all
+applicable route fields, preserve exact field provenance, and retain explicit
+broker detail in typed fields, `broker_notes`, or `unstructured_facts`.
+Conservative source-only recovery may fill an omitted field only from an
+unambiguous phrase in that item's exclusive slice (for example `BU area`,
+`2 car parks`, `Higher Floor`, or `1+1 BHK Jodi`); it may not borrow from a
+sibling item or external enrichment. Enriched building data may resolve a
+source-mentioned alias to a canonical building, but may not invent a building
+absent from the source.
+
+Normal extraction uses one unified model call per source unit. A conservative
+numbered-broadcast recognizer runs before that call for clearly priced rows
+such as `1. ... ₹85K`, `2. ... ₹93K`; it materializes one raw child per row so
+each child gets an exclusive source slice. Ambiguous numbered prose remains a
+single source unit and follows the unified model path. That response
+must contain all detected listings or requirements, route fields, broker notes,
+and source evidence. Focused per-item extraction is not a routine second pass;
+additional calls are limited to ambiguous source-boundary segmentation,
+provider fallback, or one bounded repair of an explicitly reviewable response.
+`ai_usage_log.call_stage`, `attempt_number`, and `retry_reason` record those
+exceptional calls so spend and retry behaviour is auditable per raw message.
+The LLM boundary-segmentation helper remains reserved for explicit
+preview/repair workflows; the numbered recognizer does not call a model and
+does not infer semantic fields. Ordinary ambiguous multi-listing messages
+still follow unified extraction without a second model call.
+An additional deterministic recognizer may materialize uppercase
+`PROJECT — LOCALITY` blocks only when every block independently contains a
+configuration and a price/rate anchor. Shared broadcast headings such as
+“Direct Outright Opportunities” are excluded from those slices and can never
+be assigned as a building identity.
+Mixed requirement broadcasts are likewise split when an unnumbered first
+request is followed by numbered request blocks; the first block must contain
+an explicit demand cue and each resulting block remains its own verbatim
+source evidence.
+The authenticated `/extractions` audit surface exposes the stored title,
+provider/model provenance, source slice, full raw WhatsApp evidence, AI
+response, validation flags, and quality decision for each typed row. Super
+Admins can correct bounded display/routing fields or queue the source message
+for a controlled retry; corrections never replace the original evidence.
+The extraction audit endpoint must resolve and expose one source slice per typed
+row using the same source-boundary rules as market cards. Historical payloads may
+contain multiple offers in `slice_text`; the complete WhatsApp message remains
+available separately, but the selected slice must not silently include an adjacent
+offer when a unique building, BHK, price, or title anchor is available.
+When a broadcast has a named header before its first property block, the
+shared header may be copied to each item only as a source-derived building
+fact; later item headings are never borrowed. A source-backed WhatsApp sender
+phone/name remains sufficient broker attribution when the item slice omits the
+signature, while optional unsupported broker metadata is quarantined without
+zeroing confidence in the property facts. Explicit non-numeric quotes such as
+“On Call” remain visible as raw price text and are never converted into a PSF
+unit.
+When a provider omits BHK from an item slice, the typed extraction bridge may
+recover it from the complete broadcast only when every explicit BHK marker in
+that broadcast has the same numeric value. The recovery is recorded as a
+`source_bhk_context_fallback` validation flag; mixed-BHK broadcasts remain
+unresolved rather than borrowing a sibling item's configuration.
+Broadcast headings such as “Direct Outright Opportunities” and “Direct
+Inventory” are listing context, never building identities. Deterministic
+building validation must quarantine those labels, preserve the raw evidence,
+and mark the row for review rather than creating or linking a building.
+Market-feed deduplication prefers the raw WhatsApp sender JID/phone joined via
+`raw_message_id`, then falls back to persisted broker identity for legacy rows.
+The item-level `source_fingerprint` and listing index remain provenance and
+same-broadcast boundaries: reposts with changed transport metadata collapse
+while distinct blocks in one broadcast remain separate. Numeric extraction
+variants are canonicalized before hashing, and a re-indexed listing is
+collapsed only when it comes from a different source message; same-message
+siblings remain separate. When compatible observations differ in completeness,
+the read projection keeps the richer source-grounded facts while retaining the
+newest freshness timestamp. Residential area values above the plausibility ceiling are retained
+only as source evidence and review metadata, not as searchable/displayed area.
+When a source slice contains one unambiguous PSF quote, that quote is the
+authority for the rate; it must not be multiplied into a monthly total unless
+the product explicitly has a supported area basis for that item.
+
+Mumbai broker shorthand is normalized at this shared boundary: `S/F`/`SF`
+means semi-furnished, and `S/F @ amount` is treated as a rental quote unless
+the source explicitly says sale. This prevents furnishing abbreviations from
+becoming transaction labels in typed tables or generated titles.
+
+Asset category is AI-owned. Deterministic keyword matching must not classify or
+reclassify a source as residential or commercial: terms such as “bare shell”,
+“office”, or “BHK” can occur in mixed or copied broker text and are not safe
+authority for table routing. The typed write requires normalized AI
+`asset_type` to be `residential` or `commercial`; a missing or invalid category
+is held for review rather than inferred or defaulted. Deterministic checks may
+validate schema and source-grounded fields, and may flag contradictions, but
+they may not override the model category.
+
+Canonical typed tables also carry `source_notes` for concise, source-grounded
+broker context that has no typed field, `broker_notes` for bounded explicit
+operational/deal notes with category, faithful text, and source wording, and
+`unstructured_facts` for structured extras. These fields may not introduce
+unsupported facts; raw contacts/instructions remain operational evidence and
+are not public card copy. `broker_notes` is internal evidence and must not be
+added to public projections or public SEO copy automatically.
+Explicit broker-stated suitability or use context (for example, “ideal for
+production house” or “suitable for a wellness centre”) belongs in
+`unstructured_facts.suitable_for`. It is distinct from AI-owned `asset_type`
+and must never be promoted to `building_name`.
+Explicit reprocessing/retry requests bypass repost and content-hash cloning;
+those paths exist for ingestion deduplication, not for reparsing a stale typed
+row under the current extraction contract.
+
+Broker directory aggregates are derived from all eight typed listing and
+requirement tables. The removed `parsed_output` table is never a broker
+directory source. Legacy broker graph tables are rebuildable presentation
+cache; typed rows and their source evidence remain authoritative.
+
+Broker team intelligence is a separate grouping layer. `broker_teams` groups
+contacts only when explicit agency/team signatures are present in source
+messages; `broker_team_members` preserves each phone/name identity separately
+and `broker_team_evidence` retains the raw-message proof. Team grouping must
+never merge broker identities or imply trust without evidence. Memberships are
+explicitly `proposed` until an operator confirms the source-backed relationship;
+only `confirmed` memberships may be used as hard signals or to aggregate a
+team umbrella's inventory. Proposed/rejected/expired relationships remain
+review data and must not affect identity resolution or search results.
+
+### Enrichment and locality/buildings
+
+Deterministic locality normalization runs during extraction and correction.
+`building-enrichment-worker` processes bounded `building_enrichment_jobs` and
+stores evidence separately from the canonical building registry. Building
+aliases are searchable evidence, not permission to merge distinct properties.
+Google Places is the sole external provider for building enrichment. Building
+jobs are never routed to a web crawler; unresolved or conflicting identities
+remain reviewable instead of being inferred from web search.
+Automatically discovered building candidates stop in `needs_review`; the
+worker claims only `pending` jobs. A super-admin must confirm or edit the
+building name/locality, or reject it as not a building, before the job becomes
+eligible for Google Places. Context-triggered requeues follow the same gate;
+an explicit operator refresh remains the approval action.
+Provider results are also stored in the tenant-scoped `entity_enrichment_cache`
+using a deterministic entity key and source-evidence fingerprint. The cache is
+an optimization for repeated building/locality/landmark enrichment: it cannot
+create inventory, overwrite source listing facts, or authorize an identity
+merge. Changed evidence produces a new cache entry. The worker persists a
+successful provider result before canonical building/listing propagation, so a
+retry caused by a downstream Supabase failure reuses the provider result rather
+than issuing another paid Places request. Places may supply a corrected spelling;
+bounded fuzzy token matching can record that spelling as a building alias only
+when locality and source-evidence gates also pass.
+Before a provider call, the worker also gathers a small name neighborhood and
+passes the top five identity signals (or fewer when decisive) as evidence.
+This is candidate grouping for context, not an automatic merge: distinct
+building IDs remain distinct and competing locality/address evidence stays
+reviewable.
+Discovery rejects boilerplate and currency/price-shaped labels before they can
+create enrichment work; legitimate building suffixes remain eligible.
+For noisy broker broadcasts, the model boundary pass is the only source
+segmentation path. It returns verbatim slices only; each child is sent back
+through the shared LLM extraction and typed-persistence path. Deterministic
+regex parsing is not used to create new observations or to drive repair
+previews.
+Pre-AI document classification has one public ownership point in
+`preflight_classifier.py`. It returns structural document type, deterministic
+pattern, block count, and evidence signals without extracting property facts.
+`deterministic_splitters.py` supplies low-level boundary primitives, while
+`ai_extraction.py` and `extraction.py` consume the preflight contract rather
+than maintaining competing document classifiers.
+When an extraction result contains multiple item-scoped source slices, each
+item receives a second preflight classification of its exclusive slice. The
+document-level classification remains attached separately for audit only;
+document cues such as a sale or furnishing marker must never be presented as
+facts about a sibling listing. Source-grounded fallback recovery may populate
+unambiguous fields such as commercial use, deposit months, parking, and
+``suitable_for`` from that same slice, while invalid building candidates such
+as ``Location: ...`` are quarantined rather than persisted.
+Main entry points are `location.py`, `building_enrichment_worker.py`,
+`agents/building_enrichment/`, and `frontend/src/app/buildings/`.
+
+The authenticated building directory and building profile must resolve through
+the same tenant-scoped Supabase `buildings` registry. The directory uses the
+direct storage query (`get_buildings`), and profile/detail actions use
+`get_building`; the legacy SQL compatibility adapter is not a source of truth
+for building directory reads. This keeps the immutable `building_id` link from
+the directory pointed at the same canonical record shown by the profile.
+
+Typed listings and requirements retain raw locality text for evidence, but
+their `locality_id` must resolve to `locality_reference` whenever the match is
+deterministic. A child micro-location such as Pali Hill remains the precise
+display value while its `locality_reference.parent_locality` (Bandra West)
+drives rollups. Free-text `micro_market` is a compatibility field, not the
+relational identity. Verified Google Places building addresses are permitted
+as a separate locality evidence source only for unresolved typed rows; a
+promotion requires one unique reference row and parent, while conflicting or
+unmapped address evidence remains in validation flags. Existing matched
+locality links are never overwritten by this evidence path.
+For new LLM-extracted observations, the typed persistence adapter runs the
+structured locality object through `registry/locality_resolver.py` before the
+row is written. The resolver uses only Unicode/case/separator normalization and
+exact gazetteer/alias lookup; it does not use regex or substring scanning.
+Unique matches receive `locality_id`; missing, unmatched, and ambiguous
+decisions remain explicit statuses with validation flags.
+
+### Search and semantic indexing
+
+Structured search uses typed fields and is the correctness path. The optional
+`semantic-embedding-worker` consumes `semantic_embedding_jobs`, stores
+privacy-clean vectors in `semantic_embeddings`, and exposes tenant-aware
+retrieval through `match_semantic_embeddings`. Semantic similarity can improve
+recall or ranking; it cannot create inventory, merge identities, or authorize
+contact. Main entry points are `semantic_embeddings.py`,
+`semantic_embedding_worker.py`, `routers/search.py`, and `routers/ai_chat.py`.
+
+### Matching
+
+`matching/requirement_listing_matcher.py` applies tenant-safe hard eligibility
+gates before scoring active requirements against active listings using
+explainable facts. `matching/service.py` reads the live unified views and
+upserts `requirement_matches`; `requirement_match_preferences` stores the
+broker's per-requirement threshold, cap, freshness, tolerance, and cadence;
+`matching/worker.py` is the due-only polling backstop across active tenants.
+Save-triggered matching reuses the same scorer and policy; a match is a
+broker-review suggestion, not a deal or an automatic merge. `matching_item_approvals`
+is the explicit bridge from broker-owned My Deals into matching: both the
+requirement and listing must be approved, and private listings only match the
+same approving broker. `match_buckets` and `match_bucket_items` provide
+client-specific listing/requirement curation without changing source evidence.
+Requirements may carry multiple canonical locality options, so a broker can
+explicitly allow Bandra West, Khar West, and Santacruz West without the matcher
+inventing geographic adjacency. The cap removes only duplicate typed listing
+identities: same building or broker does not imply the same flat.
+
+### Frontend surfaces
+
+`frontend/` is the authenticated workspace at `app.propai.live`; its App
+Router pages call the FastAPI API and expose operational controls, evidence,
+My Deals, Auto Matched, and admin health. `apps/www/` is the public discovery
+surface at `www.propai.live`; it must remain source-safe, crawlable, and free
+of phone numbers in HTML. Public browse/search/detail pages read the live
+privacy-shaped `listings_unified_public`, `buildings_public`, and
+`building_aliases_public` projections; those views run with owner security so
+anonymous reads do not inherit service-role-only base-table policies. Deployment
+wiring lives under `deploy/coolify/`.
+
+Building detail pages additionally use `listings_by_building_public` to map the
+immutable typed-table `building_id` to public listing IDs. That mapping must use
+the buyer-facing projection as its allowlist; it must not expose every typed row
+merely because a row has a building link.
+
+### Realtor Ads Studio and operations agent
+
+`frontend/src/app/social-flow-studio/` is the authenticated Realtor Ads
+Studio surface. Its native `/api/social-flow/*` agent, setup, and action paths
+forward to FastAPI. The authenticated `/admin/ops` surface uses the
+PropAI-owned LangGraph state machine in `services/propai_ops_graph.py`, with
+the OpenAI-compatible wire adapter isolated in
+`services/propai_agent_runtime.py`. The graph has explicit read-only tools, a
+six-model-step maximum, bounded provider timeouts, and approval-gated
+production mutations. It runs inside the API process and uses the dedicated
+Coolify `langgraph-redis` service for durable checkpoints when
+`LANGGRAPH_REDIS_URL` is configured. Each authenticated Ops session is the
+LangGraph `thread_id`; the database transcript remains the user-facing audit
+history, while Redis holds in-flight graph state for recovery.
+The chat endpoint only creates an authenticated run and returns a `run_id`; the
+graph executes as a detached API task and
+`/api/admin/ops/runs/{run_id}` exposes bounded status until completion. The
+assistant UI polls that status, so a slow model/tool call cannot be cancelled
+by a browser or proxy request timeout.
+
+### Broker-facing AI Chat grounding
+
+`/api/ai/chat` keeps property facts behind tenant-scoped, reviewed functions
+such as `search_listings`, `get_client_requirements`, and
+`match_client_to_listings`. The broker-facing model does not receive bulk live
+inventory context, generic dataset/raw-message query tools, or arbitrary SQL.
+Concrete property questions must obtain a typed tool result before the model
+can answer; if the tool loop cannot produce one, the response fails closed.
+Conversational explanations are allowed only when the request is not also a
+property-data query. Workspace, WhatsApp self-chat, and the direct
+`/api/ai/chat` route now use `services/propai_workspace_graph.py`; tenant
+provider selection, typed-tool grounding, confirmation blocks, browser policy,
+and response normalization remain in their existing boundaries. This boundary
+is separate from the operations agent.
+
+The workspace agent also exposes `lookup_building` for project-directory
+questions. A question such as “where is Rustomjee Paramount?” must not be
+silently converted into an inventory search; the model selects building lookup,
+listing search, broker/client reads, clarification, or an approved write based
+on the user's meaning. The graph remains bounded at sixteen WhatsApp
+model/tool rounds so multi-step reasoning is possible without allowing an
+unbounded agent loop.
+
+WhatsApp self-chat uses the same bounded LangGraph workspace loop as web AI
+chat for all turns and data searches. The model decides whether to converse or
+call a tool; keyword heuristics are not the agent's routing layer. Every
+inbound and assistant turn is persisted in the
+tenant-scoped AI chat transcript. Short follow-ups retain that transcript;
+only a genuinely new search may start with a fresh context window. The loop
+exposes `search_listings` for normalized shared, cross-broker marketplace
+inventory and `search_group_messages` for all original WhatsApp evidence
+currently captured for the tenant, not merely the active workspace directory.
+This lets one answer compare what was posted with what was successfully
+structured, while the raw-message tool always applies the workspace tenant
+filter. The self-chat persona is a direct, context-aware broker closing buddy.
+When a provider rejects a turn, deterministic reads are retained only as an
+explicit failure recovery path for evidence-backed results; they are not the
+normal router and cannot replace an agent answer. The two source types remain
+labeled separately, and this recovery path must not weaken tenant, locality,
+or asset-type guards. Follow-ups and conversational turns continue through
+the agent loop.
+The WhatsMeow self-chat handler marks the inbound message read immediately and
+keeps transcript writes ordered per connection. A newer inbound turn cancels
+an older in-flight agent request, so a provider stall cannot queue subsequent
+WhatsApp messages behind a long transport timeout.
+
+## Data model conventions
+
+Private CRM uses the canonical inventory fields as a stable base and adds
+tenant-scoped `crm_inventory_fields` definitions with per-row
+`crm_inventory.custom_fields`. These fields are private workspace metadata;
+they do not change shared typed market schemas or overwrite WhatsApp evidence.
+
+| Rule | Why it exists |
+| --- | --- |
+| Requirements use `budget_min`/`budget_max`; a requirement does not have a single listing-style `price` contract. | A demand range must not be collapsed into a supply price; doing so caused save/edit and matching failures. |
+| Listings use `price`, with `price_unit`, `price_model`, and optional `price_per_sqft`; PSF input is not automatically a total price. | Rent, sale, and PSF values have different units and must not be compared without normalization. |
+| A typed listing table is authoritative for transaction display: `*_rent_listings` renders Rent and `*_sale_listings` renders Sale, even if a legacy discriminator disagrees. | Compatibility fields can be stale after extraction or schema repair; trusting them misroutes rental inventory into sale. |
+| If a typed listing has no normalized numeric price, the feed may normalize its explicit `price_raw_text`; it must not invent a price from arbitrary prose. | This keeps source-grounded price visibility useful while preserving the evidence contract. |
+| `listings_unified` and `requirements_unified` are plain live `VIEW`s over typed tables. | A saved typed row is query-visible immediately; “refresh lag” is not a valid explanation until the view definition is rechecked. |
+| Every cross-record match and query carries an unconditional tenant rule; null never equals null for isolation. | A missing tenant is unsafe data, not a global tenant, and must never become cross-workspace visibility. |
+| Agent gateway contract: Ads Studio and the super-admin operations agent use `OPENCLAW_*` only. | Prevents an unapproved gateway from silently serving production workflows. | `routers/social_flow.py`, `routers/admin_ops.py` |
+| Shared inventory is explicit (`visibility = shared_market`); it is not inferred from a missing tenant. | Shared-network visibility must be auditable and cannot turn bad tenant data into public inventory. |
+| Workspace shortlist/pipeline rows are tenant-owned references (`workspace_market_candidates`) to a typed source table/id; they never copy, merge, or mutate shared market evidence. | Brokers can save shared opportunities for client follow-up while keeping them in Market Inbox; My Deals remains limited to the broker's own/saved inventory, and Private CRM holds client relationships and sent-listing history. |
+| Removing a record from My Deals creates a tenant-scoped `workspace_hidden_deals` reference; it never deletes the typed source row or its raw WhatsApp evidence. | Bulk CRM cleanup must be reversible at the data layer and must not remove public inventory or audit evidence. |
+| Saved Inbox searches are tenant-scoped query definitions with a source-time cursor (`saved_market_searches.last_seen_record_at`); WABA alert delivery remains a separate opt-in workflow. | Search persistence must distinguish new evidence from previously viewed results without implying that a saved query is a complete market alert. |
+| Raw message, normalized field, and inferred/enriched field remain distinguishable. | The original evidence is the audit trail and prevents an enrichment guess from becoming fabricated inventory. |
+| Raw-message idempotency is unique per `(tenant_id, message_uid, source)` for inbound WhatsApp paths. | A retry in one workspace is deduplicated without allowing one tenant's message UID to suppress another tenant's evidence. |
+| Exact broker repost extraction is serialized by a tenant-scoped `(author_content_fingerprint)` claim; later raw events remain evidence and become repeat observations or `repeat_pending`, never a second concurrent baseline. | A read-then-write repeat check allowed concurrent workers and retries to extract the same WhatsApp content twice. |
+| `repeat_pending` raw events are reconciled by the extraction worker after the baseline receives parsed output. | Concurrent arrival can precede baseline persistence; a durable retry pass prevents pending reposts from becoming a permanent queue state. |
+| Locality grounding accepts only a labelled location or one unambiguous canonical locality in the item slice; bare parent names remain generic, and market filters compare canonical locality keys only (never building names/substrings). | Broadcast context can misclassify a property and building names can contain locality words; precision avoids moving inventory into the wrong micro-market. |
+| Textual broker identity fields (`broker_name`, `broker_company`, `broker_rera_number`) must have compact-token overlap with the item-scoped source slice before typed persistence; unsupported values are cleared and review-flagged, while the otherwise source-grounded row is still persisted. Sender phone/JID and directory linkage remain provenance metadata. | Broker metadata can otherwise become a fabricated message fact and contaminate outreach/contact matching; quarantine the unsupported optional field and retain the opportunity plus audit evidence instead of dropping the whole row. |
+| Review-flagged typed rows are represented in the durable reprocessing queue by `(source_table, source_row_id)`; terminal `fixed`, `still_unresolved`, `no_source`, and `failed` states are not automatically retried. | Historical repair must be observable and budget-controlled. Missing source evidence is a terminal availability outcome, not an infinite extraction retry. |
+| A requirement does not require a building identity. Locality alternatives, landmarks, roads, budget, and tenant/amenity preferences are valid demand evidence; missing building is not itself a review failure. | Buyer/tenant demand commonly names an area or landmark rather than a society. Treating every requirement like supply inventory created false review flags and lost useful search context. |
+| `needs_review` is an operational extraction signal, not the public SEO gate. Public supply requires a non-placeholder title, source evidence, and safe source-grounded public copy; requirements are not published as supply listings. | A fully structured row can still need an operator look, while a malformed placeholder must never become a public page. These concerns must remain separate. |
+| Public www browse, building, and detail surfaces use the same shared eligibility helper; `needs_review` is not itself a publication decision. | Prevents one public route from hiding a source-grounded row solely because an internal operator-review flag differs, while explicit public blocks and parser placeholders remain excluded. |
+| Public building pages resolve listings by the canonical `buildings.id` plus reviewed `building_name_aliases`; rows assigned to another building are excluded even when their text looks similar. | Typo recovery must improve recall without turning a building page into a substring feed or mixing unrelated commercial/residential inventory. |
+| Building aliases are scoped to a canonical building and may repeat across buildings when the observed name is ambiguous; locality/address context is retained with the alias. | Two real properties can share a name, so a global alias uniqueness rule would hide legitimate inventory or force an unsafe merge. |
+| Enriched building identity reconciliation may relink an existing typed row only when its source message independently confirms the enriched locality and address context; otherwise it remains review work. | Recurring typo recovery must improve recall without allowing a name-only or AI-only guess to move inventory between buildings. |
+| Incomplete building inventory is deduped by the source-generated title plus building, locality, intent, price, and available physical facts; a raw WhatsApp message hash is provenance and never overrides those repost-stable anchors; BHK is required only for residential identity, never for commercial identity. | Prevents the same low-information commercial opportunity reposted by multiple brokers from rendering as dozens of cards, without applying residential-only assumptions to offices, shops, warehouses, or showrooms. |
+| Repost confirmation uses raw WhatsApp sender JID/phone from the source message when available; extracted broker contact fields are fallback identity evidence only. A compatible representative keeps the richer parse while freshness follows the newest observation. | A listing may be advertised with a co-broker/client phone or parsed with optional fields missing; source authorship and information completeness must not be confused with those fields. |
+| LLM source slices and public SEO metadata are item-scoped. SEO copy is limited to verified fields, excludes private contacts/instructions, and is rendered only on `www.propai.live`; `app.propai.live` shows structured facts and evidence. | Prevents cross-item facts, phone leakage, and private broker workflow text from becoming crawlable public content. |
+| Explicit inventory markers outrank incidental business names, landmarks, and suitability phrases when generating titles. | A residential BHK message mentioning “Near Tawa Restaurant” must not become a restaurant listing; titles remain source-grounded and reviewable. |
+| Same building does not identify the same unit; no automatic merge. | Reposts, floors, wings, and units can be different opportunities even when the building name matches. |
+| Requirement reposts may be collapsed only in the market-feed projection when the same broker, asset/transaction, title, and strong structured anchors agree; missing optional fields do not split the demand signal. | A repeated requirement can be parsed once with area/furnishing/building context and once without it. This projection-level collapse keeps the richest evidence visible without auto-merging supply listings or deleting source rows. |
+| Building presentation/grouping keys are case-insensitive and derived from canonical identity. | `Bandra West`, `bandra west`, and source casing must not create duplicate cards. |
+| Building registry lookup canonicalizes an unambiguous locality found inside noisy WhatsApp context before forming the tenant-scoped identity key; raw locality evidence remains unchanged. | Phrases such as “Near Lilavati Hospital, Reclamation, Bandra West Fully Furnished” must not create a second `Kamal Pushpa` registry row, while genuinely different markets remain separate. |
+| Broker blocks are workspace-scoped and reversible; they hide feed results but do not delete raw evidence or change another tenant. | A broker relationship preference is a view control, not destructive data mutation. |
+| Public HTML never contains phone numbers; contact resolution is server-side after user action. | Protects broker privacy and the public crawlability contract. |
+| Pipeline stages are independently observable: ingestion, extraction, enrichment, semantic indexing, and matching. | A healthy worker heartbeat proves liveness, not complete coverage of every row. |
+| Intelligence claims state scope, coverage, time window, freshness, and source count; partial captured data is descriptive, not a market census. | Prevents a small or tenant-scoped sample from being presented as “high demand,” “low supply,” or another unsupported market conclusion. |
+| Every ingestion entry point, including scheduler/replay and admin repair preview, uses the shared LLM boundary and extraction path. Boundary output is verbatim source text; deterministic validators may check the resulting fields but may not create semantic observations. | Divergent regex parsers caused legacy rows and inconsistent handling of the same WhatsApp broadcast. |
+| Market-feed totals are bounded recent-window sample counts and are optional for rendering the page. Locality-filtered feeds inspect a wider bounded candidate window before applying canonical locality matching, so unrelated recent localities do not hide newer matching rows. | Counting across every typed table must not make the live feed fail, and a bounded sample count must never be presented as a database-wide census; the API exposes `total_scope=bounded_recent_market_sample` and the UI says that more records may exist. |
+| Public latest-listing surfaces must reflect newly saved typed rows promptly, while avoiding an unbounded polling load. | The homepage ticker uses an uncached server endpoint with a 30-second browser poll; locality aggregates use a 60-second cache. Public price formatters convert absolute rupees to lakh/crore labels consistently. |
+| Enriched building addresses are advisory and may only be shown when their building locality agrees with the listing's resolved locality. | Same-named buildings and stale/mislinked enrichment must not turn an Andheri West listing into a Bandra West address; conflicting addresses are withheld while source-grounded listing data remains visible. |
+| Market Inbox asset tabs filter at the typed-feed boundary before pagination; the bounded total and cards therefore describe the same asset scope. | Client-side filtering of a mixed batch can show two residential cards beside a misleading batch count, even when more residential evidence exists outside that batch. |
+| Property-scale price corruption must never become public inventory. | The typed persistence boundary quarantines impossible sale/rent totals, the repair migration handles historical rows, and public listing queries exclude `needs_review` rows while retaining source evidence for review. PSF rates remain a separate field. |
+
+### Source-boundary extraction contract
+
+The extraction boundary has one typed source check (`source_boundary.py`). It
+records exclusive rent/sale evidence and conflicts with the model's non-null
+route, but does not replace a grounded model value merely because a keyword
+regex did not match. Numeric normalization, source-span grounding, and PSF
+arithmetic remain deterministic; a failed plausibility check retains the AI
+value, marks `needs_review`, and lowers confidence. This keeps reviewer-visible
+evidence while preventing silent regex-driven data loss.
+
+Every model item is evaluated against its own verbatim source slice at every
+boundary, including typed persistence. A stable `raw_message_id:listing_index`
+slice identity is carried through authority decisions, and provenance retains
+the slice's line breaks. Fields that are commonly inferred from neighbouring
+blocks, such as possession status and price basis, are cleared and review
+flagged when their explicit cue is absent from that item slice. This prevents
+multi-listing broadcasts from cross-wiring a sibling quote or operational fact
+into the published row.
+
+Model-provided slices also have to contain the item's own BHK, quoted price,
+area, and supplied building anchors; a short substring that merely happens to
+occur inside a longer inline broadcast is rejected and sent through fallback
+segmentation/review.
+
+WhatsApp transport/control events such as sender-key distribution and protocol
+messages are retained in `raw_messages` for audit but are quarantined before
+an extraction attempt: the row is marked processed and extraction-suppressed
+with outcome `protocol_event`. `messageContextInfo` alone is not sufficient to
+quarantine a row because it can accompany real listing text. Exact-copy
+identity uses the same conservative whitespace and forwarding-banner
+normalization as the extraction cache, while sender identity remains separate
+from tenant, group, and raw observation provenance.
+
+Successful exact-copy extraction output may be reused across tenants through
+`shared_extraction_results`, keyed only by the versioned content hash. Each
+tenant/raw-message use is recorded in `shared_extraction_observations`; typed
+rows still retain the observing tenant and raw evidence, and broker identities
+are never merged by this optimisation.
+
+Concurrent exact-copy misses are serialized by the service-role-only
+`shared_extraction_claims` table. A claim coordinates who pays for the first
+LLM call; it never authorizes cross-tenant evidence access or identity merging.
+The claim is released after the reusable result is published and can be
+reclaimed after a bounded stale interval if a worker dies. False merges and
+missed duplicates are measured only from a reviewed corpus, not inferred from
+cache hits alone.
+
+Commercial typed listing persistence is source-grounded and schema-explicit:
+office facts such as workstations, cabins, meeting/conference rooms, server
+rooms, pantry, reception, washroom splits, telephone booths, and play areas
+must survive the extraction allow-list and commercial table projection.
+Explicit rent rates tied to carpet, built-up, or chargeable area retain their
+source wording and basis; downstream monthly-rent arithmetic uses the named
+area rather than silently substituting another area.
+
+The extraction worker also partitions each eligible fetch into deterministic
+pre-LLM exact-copy batches using the versioned content hash. Rows in one batch
+are processed in timestamp/ID order so the first successful result becomes the
+reuse source; every row still retains its own tenant, group, sender, and raw
+evidence. Different content hashes remain parallel. This is orchestration for
+cost control, not a semantic merge or a shared raw-message payload.
+| Rent formatting preserves the source-declared period and amount; plausibility checks may flag a row for review but never rewrite a monthly rent as a non-monthly price. | A context-free numeric ceiling mislabels valid high-value commercial or luxury residential rents and damages broker evidence fidelity. |
+| A typed row's unit count is source-grounded: a single `N BHK` marker cannot inherit an LLM-provided listing count without explicit multi-unit syntax. | Prevents titles such as `5 × 5 BHK` when the source only describes one 5 BHK opportunity. |
+| Market detail evidence has two distinct contracts: a configuration-matched source slice and the complete original raw message fallback. | A full WhatsApp broadcast or header-only slice must not be presented as if it were the exact evidence for a typed listing or requirement. |
+| Building profiles expose linked listings and requirements by immutable typed table/id links into the evidence-preserving market detail view. | A canonical building is an index over captured opportunities, not a substitute for usable source records. |
+| Historical source-evidence repairs run through the same deterministic gate as forward extraction, write before/after field audits, and are reversible by run UUID; `extraction_needs_review` is the query surface for flagged typed rows. | Production cleanup must not fork extraction logic or create unauditable corrections. |
+
+## Intelligence and evidence contract
+
+PropAI may claim only what the selected evidence can measure. Every user-facing
+metric or insight must retain:
+
+- metric definition and units;
+- numerator/denominator where relevant;
+- tenant, workspace, group, and locality scope;
+- time window and comparable baseline, if a change is shown;
+- source record count and last-updated time;
+- coverage or limitation note.
+
+“Observed” language is the default: “12 requirements captured in the last 7
+days” is valid; “demand is high” is not. Market-wide labels such as high
+demand, low supply, most active broker, best locality, or rising prices require
+a documented method, sufficient sample size, and comparable coverage. LLMs can
+explain computed facts but cannot promote them into unsupported conclusions.
+
+## Known landmines and open risk log
+
+Status values: **resolved** means the invariant has a code/test or migration
+guard; **mitigated** means a guard exists but the underlying class of risk
+still needs monitoring; **open** means verify before relying on it.
+
+| Status | Landmine | Current guard / required verification | Commit or reference |
+| --- | --- | --- | --- |
+| resolved | Requirement/listing matching once enforced tenant isolation only when the requirement tenant was truthy. | Matcher rejects missing either tenant; focused null-never-matches-null test exists. | `2fde8e0e`, `tests/test_requirement_listing_matching.py` |
+| resolved | Requirement budget fields were confused with listing `price`. | Typed schemas, UI, and matcher use `budget_min`/`budget_max`; keep this rule in any new API. | `da30d77d`, `3701cfae` |
+| resolved | My Deals correction re-classified an already-typed requirement as a listing because typed requirement rows do not carry legacy `intent`/`message_type` discriminators. | Correction storage now derives asset, transaction, and requirement kind from the source typed table; regression tests cover all four route families. | `tests/test_typed_schema_cutover.py` |
+| mitigated | Building display grouping could split records by casing. | Registry dedupe and presentation keys normalize case; rerun duplicate query after locality/building changes. | `apps/www/src/lib/building-intelligence.ts`, `apps/www/src/lib/localities.ts` |
+| mitigated | AI price extraction is non-deterministic for PSF-style input. | Deterministic downstream price/unit and plausibility guards reject or flag implausible totals; verify before price-sensitive ranking. | `d27f39eb`, `matching/requirement_listing_matcher.py` |
+| mitigated | Market cards could trust a stale transaction discriminator and omit an explicit raw price. | Feed projection now uses the typed table route and deterministic `price_raw_text` fallback; keep regression coverage and audit historical rows separately. | current working change, `tests/test_market_feed_card_projection.py` |
+| open | Nested `ai_extraction.extraction_confidence` can disagree with the top-level confidence column. | `canonicalize_extraction_confidence` and persistence normalize current writes; audit historical rows and every consumer before declaring resolved. | `a5dc4c22`, `extraction_quality.py` |
+| resolved | `requirements_unified` was suspected to be materialized. | Migration defines a plain `VIEW`; matching reads it live. Recheck with the verification query below if save visibility appears delayed. | `supabase/migrations/20260803040000_cutover_typed_application_reads.sql` |
+| resolved | Semantic retrieval could treat null tenant vectors as globally visible. | Latest migration allows workspace rows only for the tenant, explicit shared inventory, or global locality data; no-tenant mode is reserved for protected Super Admin probing. | `2f421d65`, `supabase/migrations/20260823120000_fail_closed_semantic_tenant_scope.sql` |
+| mitigated | Semantic indexing is optional and can be disabled or unconfigured while structured search continues. | Worker heartbeat reports `running`, `degraded`, or `stopped`; never infer health from a deployed container. | `b7fa0608`, `semantic_embedding_worker.py` |
+| mitigated | Extraction live mode deliberately leaves historical backlog untouched. | Coolify worker configuration and UI must label live-only scope; replay requires an explicit bounded operation. | `docs/DATA_QUALITY.md`, `extraction_worker.py` |
+| mitigated | Locality classification can over-trust an AI guess, force a direction from a bare parent market, or match a building name as if it were locality evidence. | Forward extraction accepts only labelled or unambiguous source-locality signals; bare parents stay generic; feed filters use exact canonical locality keys. Historical repair is report-only until a reviewed dry run is approved. | `extraction.py`, `location.py`, `storage/supabase.py`, `scripts/locality_backfill_dry_run.py` |
+| resolved | AI extraction repeatedly proposed BHK values for commercial inventory. | BHK is residential-only; commercial typed schemas and the evidence backfill do not request or persist BHK fields. Treat any commercial BHK proposal as an extraction error. | `docs/DATA_QUALITY.md`, `scripts/backfill_source_evidence_gate.py` |
+| mitigated | Mixed WhatsApp broadcasts using slash-numbered rows or a clear unnumbered asset section could bypass deterministic slicing and become one giant listing. | Splitter recognizes `1/`-style boundaries and narrowly defined asset-plus-intent section headers; regression coverage uses the observed multi-property broadcast shape. | `deterministic_splitters.py`, `tests/test_deterministic_splitters.py` |
+| mitigated | The optional Market Inbox total query could fan out thousands of rows per typed table and turn a healthy page request into a 500. | Count is capped to a recent bounded window and the API falls back to the normal page with an explicit unavailable total. | `storage/supabase.py`, `routers/workspace.py` |
+| open | Auto Matched production end-to-end behavior still needs a real save → match → UI verification after deploy. The live matcher had been running the API/Uvicorn image command, and its first worker run exposed typed per-table IDs being written into legacy-FK `requirement_matches`; all current typed rows can have orphaned legacy_source_id values. | Matcher has a dedicated `Dockerfile.matcher` with an immutable worker CMD. Internal projections expose optional legacy_source_id, while `requirement_matches` stores the typed table discriminator and typed row ID as the authoritative identity; deploy and verify a saved match before closing. | `Dockerfile.matcher`, `matching/worker.py`, `matching/service.py`, `supabase/migrations/20260902230000_matching_legacy_id_projection.sql`, `supabase/migrations/20260902240000_matching_typed_identity_contract.sql`, `docs/PROPai_FRESH_OPERATIONAL_AUDIT_2026-09-02.md` |
+| open | Several operational workers have source wiring but incomplete live proof: matcher output is empty, extraction repair has a queued backlog without a current heartbeat, and reprocessing/enrichment have large unresolved or failed populations. | Use the dated independent audit and require code + deployed resource + heartbeat + row progress + truthful UI evidence before closing any item. | `docs/PROPai_FRESH_OPERATIONAL_AUDIT_2026-09-02.md` |
+| mitigated | Realtor Ads Studio and the operations-agent surface could silently use an unapproved gateway. | Native `/api/social-flow/*` paths now forward to FastAPI and both agent surfaces read only `OPENCLAW_*`; verify an authenticated Ads Studio request and operations-agent health after each deploy. | `routers/social_flow.py`, `routers/admin_ops.py`, `frontend/src/app/api/social-flow/[...path]/route.ts` |
+
+## Verification playbook
+
+These checks are intentionally copy-pasteable. Run read-only queries through
+the existing Supabase SQL bridge or a trusted Postgres connection. Never put
+service keys in this file or in shell history shared with others.
+
+### Confirm the unified requirement model is a live view
+
+```sql
+select table_name, table_type
+from information_schema.views
+where table_schema = 'public'
+  and table_name in ('listings_unified', 'requirements_unified');
+```
+
+### Find cross-tenant requirement matches
+
+```sql
+select rm.id, rm.requirement_id, rm.listing_id,
+       r.tenant_id as requirement_tenant, l.tenant_id as listing_tenant
+from requirement_matches rm
+join requirements_unified r on r.id = rm.requirement_id
+join listings_unified l on l.id = rm.listing_id
+where r.tenant_id is null
+   or l.tenant_id is null
+   or r.tenant_id <> l.tenant_id;
+```
+
+Expected result: zero rows. Null is a violation, not a match.
+
+### Review historical locality repairs without writing data
+
+The following command is deliberately read-only. It scans affected typed rows,
+shows the actual locality beside the source text and proposed source-grounded
+locality, and marks only clear proposals as eligible. Share and review the
+report before any future backfill write; do not add an apply flag to this
+script.
+
+```bash
+SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \\
+  python scripts/locality_backfill_dry_run.py \\
+  --sample 250 --output locality-review.json
+```
+
+Expected result: the report contains `raw_source`, `actual_locality`,
+`proposed_locality`, and `eligible_for_backfill`; the command writes only the
+local report file and never updates Supabase.
+
+The same source-attached guard is enforced at the typed persistence boundary
+for new worker output: structured locality is preferred, then the immutable
+current raw slice may fill locality only when it resolves to exactly one
+reference-table locality. A missing listing price may be filled only from one
+exclusive, labelled source quote. Multiple or mixed localities, mixed
+rent/sale copy, unit rates such as PSF, and ambiguous or unmatched evidence
+remain null; unrelated review flags are preserved. Requirement budgets are
+never populated by this listing-price fallback.
+
+### Find duplicate building display keys within a tenant and locality
+
+```sql
+select tenant_id, lower(trim(canonical_name)) as display_key,
+       lower(trim(coalesce(micro_market, ''))) as market_key,
+       count(*) as rows
+from buildings
+group by tenant_id, lower(trim(canonical_name)), lower(trim(coalesce(micro_market, '')))
+having count(*) > 1
+order by rows desc;
+```
+
+### Inspect PSF price plausibility samples
+
+```sql
+select id, tenant_id, price, price_unit, price_model, price_per_sqft,
+       area_sqft, price_raw_text, needs_review, extraction_confidence
+from listings_unified
+where price_per_sqft is not null and area_sqft is not null
+  and price is not null
+  and abs(price - price_per_sqft * area_sqft)
+      > greatest(price * 50, 1000000)
+order by updated_at desc
+limit 100;
+```
+
+### Check confidence distribution against populated price/area
+
+This catches a source-evidence regression that labels otherwise populated
+rows low merely because a brittle source regex failed. A normal day should
+return to roughly 50–60%+ high-confidence rows (subject to the day's data
+mix), with populated price/area counts visible alongside each bucket.
+
+```sql
+select date_trunc('day', updated_at) as day,
+       extraction_confidence,
+       count(*) as rows,
+       count(*) filter (where price is not null) as rows_with_price,
+       count(*) filter (where area_sqft is not null) as rows_with_area
+from listings_unified
+where updated_at >= now() - interval '48 hours'
+group by 1, 2
+order by 1 desc, 2;
+```
+
+Expected result: only reviewed/known exceptions. A large unexplained result
+means the deterministic guard or a typed projection has regressed.
+
+### Price plausibility guard
+
+The extraction boundary must validate the model's output rather than re-decide
+whether raw text contains a narrow price keyword. When a rate and area are
+available, check their arithmetic against the extracted total. Also check that
+an extracted numeric value is loosely traceable to the source text, allowing
+for commas, lakh/crore notation, and formatting differences. A failed check
+sets `needs_review` and lowers confidence but does not erase the extracted
+value; reviewers need to see what the model found. Do not restore the blanket
+price-evidence regex gate.
+
+### Public location evidence
+
+Public building addresses, coordinates, and nearby-radius claims require a
+verified Google Places enrichment row: `geocode_source =
+'google_places_text_search'`, valid latitude/longitude, and
+`geocode_confidence >= 0.90`. Legacy coordinates or an unverified address must
+not produce a public location claim. OpenStreetMap/Nominatim is not a runtime
+enrichment provider.
+
+```sql
+select geocode_source, count(*)::int as buildings
+from public.buildings
+group by geocode_source
+order by buildings desc;
+```
+
+### Tenant-scoped raw ingestion and deduplication
+
+Raw-message UID deduplication is scoped by `tenant_id`; the same WhatsApp UID
+must not be used as a cross-tenant lookup key. Webhook, WABA, self-chat, AI
+Chat, repair, and manual-save paths must resolve the active tenant before
+deduplication or persistence. If tenant resolution or a duplicate lookup
+fails, the path fails closed rather than inserting an unscoped row. Internal
+extraction triggers require the shared internal token and an explicit tenant.
+
+### Check confidence disagreement in recent typed rows
+
+```sql
+select id, tenant_id, extraction_confidence,
+       ai_extraction->>'extraction_confidence' as nested_confidence,
+       ai_extraction->>'extraction_confidence_score' as nested_score
+from listings_unified
+where coalesce(ai_extraction->>'extraction_confidence', '') <> coalesce(extraction_confidence, '')
+order by updated_at desc
+limit 100;
+```
+
+### Check worker liveness and stage coverage
+
+```sql
+select worker_name, status, heartbeat_at, last_error, config
+from worker_heartbeats
+order by worker_name;
+```
+
+Compare worker heartbeat with stage counts, not with deployment labels:
+
+```sql
+select status, count(*) from semantic_embedding_jobs group by status order by status;
+select status, count(*) from building_enrichment_jobs group by status order by status;
+```
+
+### Verify newest requirement matching backstop
+
+```sql
+select id, tenant_id, created_at, updated_at
+from requirements_unified
+where status = 'active'
+order by created_at desc
+limit 50;
+```
+
+After a fresh requirement save, its ID should be included in the next scoped
+run and its `requirement_matches` rows should have the same tenant.
+
+## Decision log
+
+### 2026-09-02 — Broker-facing AI Chat requires typed grounding
+
+**Context:** AI Chat had fallback paths where a property question could reach a
+no-tool conversational model or quote from a broad preloaded inventory
+snapshot.
+
+**Decision:** Route property signals ahead of conversational fallback, keep
+bulk live inventory out of normal model context, expose only reviewed typed
+tools to broker-facing chat, and fail closed when a required tool result is
+not produced. Raw SQL and broad raw-message/dataset tools remain unavailable
+to AI Chat.
+
+**Consequence:** New broker-facing data questions require a purpose-built,
+tenant-scoped function and a source-backed response contract.
+
+### 2026-08-26 — OpenClaw is the only agent gateway
+
+**Context:** The operations-agent runtime needed one explicit private gateway
+instead of a legacy agent deployment and mixed naming.
+
+**Decision:** Route Ads Studio and super-admin operations through the private
+OpenClaw gateway only. Expose the operations surface as `/admin/ops` and remove
+the retired gateway deployment and compatibility routes.
+
+**Consequence:** API and frontend services must be redeployed with `OPENCLAW_*`
+variables and the OpenClaw application must be healthy; an unconfigured agent
+fails closed.
+
+### 2026-08-31 — PropAI owns Ops orchestration
+
+**Context:** The OpenClaw gateway could be healthy while the user-facing Ops
+request still hung or failed inside its external model/tool loop, leaving no
+reliable response path or step-level diagnostics.
+
+**Decision:** Replace OpenClaw as the `/admin/ops` runtime with the existing
+PropAI-owned bounded agent runtime. Ops calls an explicit provider chain and
+allowlisted read tools directly from FastAPI; each request is capped at six
+model/tool steps and 45 seconds per provider. OpenClaw is retired from the
+Coolify deployment.
+
+**Consequence:** The API needs `OPENROUTER_API_KEY` and optionally
+`OPENROUTER_OPS_MODEL`; Coolify status is observational until a separate
+approval-gated mutation layer is added.
+
+### 2026-09-03 — Ops database actions are proposal-only until approval
+
+**Context:** Super Admin now has bounded in-app Supabase table/function
+controls, and PropAI Ops needs to help prepare database operations without
+turning an agent response into an implicit production write.
+
+**Decision:** Ops may inspect through its allowlisted read tools and emit one
+exact database action proposal. FastAPI signs a short-lived proposal for the
+authenticated Super Admin and the UI executes it only after an explicit
+approval click. The executor revalidates the live table/function catalog and
+row/function arguments; SQL, DDL, migrations, triggers, broad deletes, and
+unapproved writes remain unavailable to the agent.
+
+**Consequence:** A response must never claim a database mutation occurred until
+the approval endpoint returns success. Both the API and internal dashboard
+must be redeployed for this contract to be available in production.
+
+### 2026-09-03 — LangGraph owns Ops orchestration inside the API
+
+**Context:** The PropAI-owned Ops runtime had a hand-written model/tool loop.
+It was bounded, but provider parsing, tool execution, and loop termination were
+coupled in one function, making failures difficult to reason about and test.
+
+**Decision:** Use the open-source LangGraph library for the Ops state machine.
+The graph separates one provider completion, allowlisted tool execution, and
+conditional termination while preserving the existing provider chain, six-step
+limit, 45-second provider timeout, and proposal-only mutation contract.
+
+**Consequence:** This is an in-process orchestration migration, not a
+standalone LangSmith Agent Server rollout. Production API deployments should
+configure `LANGGRAPH_REDIS_URL` to the private `langgraph-redis` service and
+keep `LANGGRAPH_REDIS_REQUIRED=true`. The Redis service must provide RedisJSON
+and RediSearch for the Redis checkpointer indices. If the configured endpoint
+is reachable but lacks those Redis Stack modules, the API logs the checkpoint
+failure and runs the bounded request stateless when
+`LANGGRAPH_REDIS_FALLBACK=true`; the Supabase transcript remains the durable
+user-facing audit history. The HTTP boundary is
+asynchronous: the API returns a run identifier immediately and the dashboard
+polls the tenant-scoped run status endpoint. Redis remains the graph
+checkpoint/recovery store; the API task registry is only the short-lived
+request-status projection.
+
+### 2026-08-25 — Chat-first private CRM intake
+
+**Context:** Brokers already describe inventory naturally in chat and rejected
+form-first CRM entry. Treating a normal save instruction as a market write
+would also risk exposing broker-owned inventory without a deliberate choice.
+
+**Decision:** Route listing captures from chat to the tenant-scoped
+`save_private_inventory` flow by default. The assistant prepares a draft and
+requires explicit confirmation before writing `crm_inventory`. Only a clearly
+requested publish/share-to-market action may use the shared market save path.
+
+**Consequence:** Chat remains the fastest intake path, while private inventory
+is isolated from Market Inbox, public discovery, semantic search, and Auto
+Matched unless the broker explicitly publishes it.
+
+### 2026-08-25 — Private CRM inventory is not market inventory
+
+**Context:** Brokers need an internal inventory tool for records they own or
+manage, including CSV imports, without sharing those records with the PropAI
+market.
+
+**Decision:** Store Private CRM rows in a separate tenant-scoped table. Every
+read and write filters `tenant_id` unconditionally; CRM rows have no WhatsApp
+evidence claim and do not enter market feeds, public pages, semantic search,
+or Auto Matched. Manual and AI-assisted entry are draft-first; AI only returns
+an editable suggestion, and an explicit broker save is required. A future
+publish action must be explicit and reviewed.
+
+**Consequence:** Brokers can organize private inventory safely while the
+market remains grounded in captured evidence.
+
+**Attachment rule:** Chat uploads use the private `private-crm` storage bucket
+and `crm_inventory_attachments`, under an authenticated tenant/user prefix.
+They are linked to CRM inventory only after explicit confirmation and never
+enter Market Inbox, semantic search, or Auto Matched.
+
+### 2026-08-23 — Living architecture stays self-hosted
+
+**Context:** Architecture facts were living in conversation history and
+static markdown was becoming stale.
+
+**Decision:** Generate schema and dependency Mermaid artifacts from repository
+source plus live Postgres introspection, expose them through an authenticated
+workspace page, and use a non-blocking CI warning for architecture-sensitive
+changes. No external documentation SaaS or proprietary renderer is used.
+
+**Consequence:** Generated files are disposable and labelled with their source;
+`architecture.md` remains the durable human/agent contract and must be updated
+for invariant changes.
+
+### 2026-08-23 — Observed evidence before market claims
+
+**Context:** The workspace now has meaningful captured data, but its coverage
+is still limited by connected accounts, selected groups, tenant scope, and
+time windows.
+
+**Decision:** Product analytics uses descriptive, scoped metrics by default.
+Market-wide demand, supply, broker-activity, popularity, and price-direction
+claims require a documented method, sufficient sample size, and comparable
+coverage. LLMs may explain measured facts but may not invent the conclusion.
+
+**Consequence:** Users get auditable counts and distributions with explicit
+scope and freshness instead of false certainty from a partial feed.
+
+### 2026-08-12 — Embeddings are a ranking aid, not identity
+
+**Context:** Semantic search helps aliases and natural language but cannot
+prove that two listings are the same opportunity.
+
+**Decision:** Keep deterministic source, tenant, locality, and identity rules
+stronger than vector similarity; run embeddings asynchronously.
+
+**Consequence:** Structured search and evidence remain valid when the semantic
+worker is stopped or incomplete.
+
+### 2026-07-15 — Supabase over raw Postgres
+
+**Context:** The product needs managed Postgres, auth, RLS, and operational
+inspection without adding a second persistence abstraction.
+
+**Decision:** Use Supabase as the database/auth boundary, with protected SQL
+bridge functions for bounded complex reads.
+
+**Consequence:** Schema generation uses the same protected bridge and must use
+service credentials only in CI/deploy environments.
+
+### 2025-07 — Ink/parchment/signal theme; light app, dark sidebar
+
+**Context:** Workspace scanning benefits from a calm light canvas while the
+sidebar needs strong wayfinding contrast and brand anchoring.
+
+**Decision:** Keep the primary workspace light parchment and the navigation
+dark ink; use signal/olive only for action, status, and selection.
+
+**Consequence:** UI changes should reuse `unified-tokens.css` semantic roles,
+not introduce arbitrary new colors or invert the entire app.
+
+## Maintenance contract
+
+### Developer project crawl boundary
+
+Developer project pages are a separate, config-driven evidence pipeline. They
+store crawled source documents, deterministic project facts, and field-level
+evidence in the `developer_project_*` tables; they never write WhatsApp raw
+messages, typed listings/requirements, or the offline `evidence/schema.sql`
+registry. A project may link to `buildings.id` only after exact canonical name
+plus corroborating locality/address and developer evidence; name similarity
+alone cannot create a link. Public project pages remain noindex unless a
+recent successful crawl provides grounded project facts, and their live broker
+activity is read-only data from the existing public listing surface.
+
+### Public listing crawl notifications
+
+When a reviewed typed listing is persisted, the ingestion boundary may send a
+best-effort IndexNow notification if `INDEXNOW_KEY` is configured. The
+notification is advisory only: the dynamic public sitemap remains the source
+of truth, requirements are excluded, and a missing or failing IndexNow service
+never blocks persistence.
+
+### Broker directory building aggregates
+
+`broker_building_stats` is a derived directory table, not source evidence.
+The SQL broker-graph rebuild reads the typed listing/requirement tables, so its
+building-name boundary must remain conservative with the Python extraction
+boundary: locality names and broker market-segment labels such as `Preferred`
+are operating-area metadata, not buildings. A database trigger enforces this
+boundary during rebuilds and the rebuild migration backfills existing derived
+rows; source typed records are never modified by this cleanup.
+
+Server-only maintenance RPCs such as extraction-job claiming, workspace
+progress aggregation, and broker-team rebuilding are executable by
+`service_role` only. They are not client-facing PostgREST operations.
+
+Internal typed-data projections, including `parsed_output_unified` and
+`extraction_needs_review`, use invoker security and are readable only by
+`service_role`; public listing/contact routes expose their deliberately
+limited field contract instead of the raw projection.
+`parsed_output_unified` is a compatibility alias over the current wide
+`listings_unified` projection; migrations must not recreate it as the old
+narrow seven-column union because service readers depend on fields such as
+`normalized_message` and `listing_index`.
+
+Every typed listing/requirement row must carry the same `tenant_id` as its
+`raw_messages` source row. The database trigger
+`enforce_typed_raw_tenant_match()` rejects new or retargeted cross-tenant
+typed rows; explicit shared-market visibility is a separate field and never
+justifies changing source ownership. Existing mismatches remain quarantined
+for ownership review rather than being reassigned by guesswork. Application
+extraction paths pass the source tenant explicitly on every typed save; the
+database trigger remains the final defense against worker-context mistakes.
+Historical violations are represented in the service-only
+`tenant_boundary_review_queue` with raw JID/message evidence and an explicit
+decision (`replay`, `quarantine`, or `repaired`); they are never bulk-moved
+without an ownership decision.
+Super-admin review endpoints may mark one queue item `replay`, `quarantine`,
+or `rejected`; only `quarantine` changes the typed row, by setting
+`needs_review` and an explicit validation flag. Replay remains worker-authorized
+work and cannot mutate source evidence from the HTTP request. The tenant-boundary
+repair worker rechecks the raw tenant and typed source identity before aligning
+an approved row; missing or changed evidence is quarantined.
+
+Raw WhatsApp messages have a 24-hour extraction window. If a message remains
+unprocessed after that window, the worker marks it
+`skipped:retry_window_expired` and retains the immutable raw evidence; it is not
+retried indefinitely or sent through the reprocessing queue. This is a
+queue-lifecycle rule only. Successful messages retain the complete transport
+payload for three days after processing, while failed or suppressed messages
+retain it for fourteen days for diagnosis. The scheduled retention job then
+compacts the transport JSON to a small identity/evidence envelope; the
+`raw_messages` row, message text, sender identity, group, timestamp, source,
+message UID, and typed rows remain available. This storage-cost boundary does
+not permit deleting or rewriting source message evidence.
+
+The PropAI MCP exposes this boundary through `raw_message_search`: it is an
+explicitly separate, read-only, tenant-scoped source for original WhatsApp
+messages. It defaults to recent group evidence, caps result count and lookback
+window, omits raw payload blobs, and labels every response as unparsed evidence.
+Agents must use `market_search` for verified normalized inventory and may use
+raw messages only to investigate missing context or ambiguous source wording.
+
+Any change that modifies a data model invariant, tenant boundary, pipeline
+stage, source-of-truth rule, matching behavior, consent behavior, or a listed
+landmine must update this file in the same commit as code and tests. Generated
+Mermaid files are regenerated by the architecture workflow and must not be
+hand-edited. The warning is intentionally non-blocking, but ignoring it is a
+bus-factor risk.
+### Broker visibility versus extraction suppression
+
+Public publication does not use the extraction `needs_review` flag as a gate.
+Source-backed typed rows remain visible until their normal freshness expiry
+(currently 30 days); extraction flags remain historical provenance metadata.
+The human-review workflow is `listing_reports`, created by the public report
+button and readable only through service-role/admin tooling. The extraction
+reprocessing queue is not a publication mechanism.
+
+Workspace broker hiding is tenant-scoped presentation control: it removes a
+broker's inventory from that workspace's inbox/search without deleting source
+evidence. Global source blocks are a separate ingestion invariant. A blocked
+source is retained as raw audit evidence but is marked processed and suppressed
+before any extraction attempt, including direct webhook calls; it must never
+produce typed listings or requirements.
+## Google Drive market export
+
+The authenticated broker workspace may export selected, source-grounded Market
+Inbox listing references to a private Google Sheet in the broker's connected
+Drive. The export is a complete snapshot and includes the source listing's
+broker contact phone for the downstream Meta AI workflow. This phone remains
+outside public HTML. The API validates the typed listing table, visibility,
+review state, and blocked-broker policy before queueing the tenant-scoped sync
+job; the worker rechecks those rules before writing the Sheet.
+
+## Building enrichment evidence
+
+An enrichment job's `completed` state means the provider execution finished; it
+does not mean that a verified address or place identity was accepted into the
+canonical building record. The worker evidence RPC therefore exposes both the
+job lifecycle and the building evidence state. Admin rows link to the canonical
+building profile, which links onward to the source-grounded listings and their
+original evidence. Missing address, locality, or place ID remains explicit and
+must never be presented as a successful confirmation.
+
+## Named building versus property-type words
+
+The extraction source boundary treats a standalone property-type word such as
+`Villa` as listing text, not as a canonical building. A bounded, source-backed
+name such as `Villa Capri` or `Devansh Villa` may be recovered as the building
+when it appears in a broker inventory heading with its own price quote. The
+word `Villa` must not then be repeated as the property type in the generated
+title; the title falls back to a neutral property label while preserving the
+building name.
+
+Public locality/building lists apply the same junk-name guard as listing
+identity resolution. Parser placeholders such as `Config` and `Configuration`
+are not buildings and must not become public related-search links.
+
+## Public detail-page latency
+
+Public listing detail rendering must not wait indefinitely for optional
+recommendations, broker-area panels, related links, or photos. The core listing
+lookup is bounded, and secondary panels fail soft to empty states after a short
+timeout so slow enrichment or recommendation queries cannot block the listing
+itself.
+
+## Rich property intelligence
+
+Typed extraction fields are the searchable contract, not the complete
+information boundary. Each source-grounded item may also retain a bounded
+`property_intelligence` payload inside `ai_extraction` and
+`unstructured_facts`. Its entries are grouped by unit features, building
+features, pricing terms, access/rules, location context, relationships, and
+unresolved mentions. Every entry must include exact source wording (except an
+unresolved mention's explicit reason), remain item-local, and never introduce
+memory, enrichment, comparable properties, or sibling-block facts. This lets
+PropAI add future typed fields and intelligence without discarding broker
+detail or weakening the source-of-truth boundary.
+
+## Relational building intelligence
+
+Public building pages derive their market context from the existing
+`listings_unified_public` and `buildings_public` projections through
+`get_public_building_relational_intelligence(building_id)`. The function uses a
+30-day freshness window and returns observed supply counts, rent/sale-separated
+price bounds, residential configuration mix, broker coverage, locality totals,
+and coordinate-based nearby buildings with captured supply. It is a live read
+model rather than a second listings table or a manually maintained counter, so
+new listings and buildings are included on the next read. Plus-Code-only or
+otherwise weak addresses do not block coordinate relationships, but human
+readable address claims remain subject to the existing enrichment confidence
+gate. All metrics are descriptive observations with explicit scope and must not
+be presented as a market census or unsupported demand conclusion.
+
+## Generated public collections and requirement buckets
+
+Public collections are generated market slices, not manually assembled copies
+of inventory. `public_listing_collections` stores the factual slice metadata;
+`public_listing_collection_items` stores only `(listing_type, listing_id)`
+references, rank, score, and deterministic reason codes. The Python
+`public_collections_worker.py` reads the existing public listing projection,
+keeps only fresh eligible rows, generates reproducible locality/transaction/
+configuration slices, and archives slices that fall below the minimum supply
+threshold. The www collection pages read the published projections and resolve
+the referenced source listings at request time.
+
+Requirement-derived listing buckets remain tenant-private. The deterministic
+matcher maintains one generated `match_buckets` row per approved requirement
+and replaces its items from the authoritative `requirement_matches` result on
+each run. A requirement can therefore express multiple canonical localities,
+budget, BHK, transaction, and property constraints without exposing the
+client's private brief on www. Public demand-led collections require a separate
+explicit publication policy; private requirements are never promoted by the
+worker automatically.
+
+## Approval-first inbound lead operations
+
+`inbound_leads` remain tenant-private buyer enquiries and never become market
+inventory. The Lead Desk ranks existing explainable
+`inbound_lead_matches` results, creates a source-grounded follow-up draft, and
+records whether the broker opened it and what outcome was chosen in
+`inbound_lead_followups`. Opening WhatsApp is an explicit user action and the
+broker reviews and sends the message there; the agent does not silently send,
+invent property facts, or modify listings. Lead priority is a reproducible
+queue signal based on stored match score and lead status, not a market-quality
+claim.
+
+## Query-time raw-evidence extraction
+
+The workspace and WhatsApp agents may use `query_extract_raw_messages` for a
+bounded, tenant-scoped retrieval of recent raw group evidence when the
+structured market projection is insufficient or the question is ambiguous.
+The tool reuses the source-grounded extractor but does not write a market
+listing or requirement. Its disposable result is cached in
+`query_extraction_cache` by tenant, raw message, source hash, and extractor
+version, and includes the extracted candidates, provider provenance, and exact
+source text. Public SSR pages, counters, freshness gates, and matching remain
+on the existing typed projections; query-time extraction is an agentic
+long-tail path, not a replacement for those contracts.

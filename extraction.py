@@ -1,0 +1,5275 @@
+"""Async extraction pipeline — Layer 2-5 processing.
+
+This module contains the shared extraction logic used by both:
+  - The webhook background thread (runs per-message when webhook fires)
+  - The extraction worker (poll-based, picks up unprocessed messages)
+
+Extraction contract:
+  1. Preserve the untouched WhatsApp event as the parent raw message.
+  2. Deterministically split convincing bulk-broadcast templates into child
+     raw messages, carrying shared headers into every property block.
+  3. AI-extract each independent child (or the original single message).
+  4. Persist source-grounded typed opportunities only.
+
+Import pattern:
+  from extraction import process_raw_message
+"""
+
+import json
+import logging
+import os
+import hashlib
+import math
+import re
+import sys
+import time
+import unicodedata
+from copy import deepcopy
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from pathlib import Path
+
+_logger = logging.getLogger(__name__)
+
+from message_identity import is_protocol_event
+from extraction_dedup import should_skip
+
+# A WhatsApp contact number is evidence for broker_phone, never a broker name.
+_PHONE_LIKE_BROKER_NAME_RE = re.compile(r"^[+0-9 ()-]{7,15}$")
+_BROKER_NAME_PREFIX_RE = re.compile(
+    r"^(?:call\s+for\s+inspection|for\s+inspection|contact(?:\s+person)?|listed\s+by|listing\s+by|broker)"
+    r"\s*(?:[:\-–|]\s*)?",
+    re.IGNORECASE,
+)
+_BROKER_INSTRUCTION_RE = re.compile(
+    r"\b(?:im+e?diately\s+)?(?:contact|call|whatsapp)\s*(?:no\.?|number)?\b|"
+    r"\b(?:for\s+)?(?:details|inspection|visit|visits)\b|"
+    r"\b(?:please\s+share|suitable\s+options)\b",
+    re.IGNORECASE,
+)
+_BROKER_FIELD_LABELS = frozenset({
+    "mobile", "phone", "contact", "contact person", "email", "e-mail",
+    "whatsapp", "broker", "name", "address", "location",
+})
+
+# These are model-side absence markers, not domain values.  Persisting them
+# makes empty fields look populated and, for boolean columns, can make the
+# entire typed-row insert fail (for example: "Unknown" -> boolean).
+_NULL_LIKE_EXTRACTION_VALUES = frozenset({
+    "", "unknown", "not known", "not specified", "not available",
+    "not identified", "not found", "n/a", "na", "none", "null", "nil",
+})
+_BOOLEAN_EXTRACTION_FIELDS = frozenset({
+    "has_lift", "has_power_backup", "co_brokered", "plus_one_deal",
+    "fee_sharing_required", "client_profile_required", "is_converted_unit",
+    "is_combination_unit", "can_sell_separately", "balcony_present",
+    "terrace_present", "sit_out_present", "vastu_compliant",
+})
+
+# Deterministic boundary detection must happen before the model. The model can
+# still interpret each child slice, but a complete multi-property broadcast
+# must never be sent to the model and split only after the call. Keep the old
+# environment variable out of this decision: `EXTRACTION_LLM_FIRST=true` was
+# allowing cross-listing leakage and wasting one model call per broadcast.
+
+
+# Brokers frequently publish jammed numbered broadcasts ("...PSF++2) Bldg...")
+# or newline-separated "1) Sugee Marina Bay Bldg" lists. The list index is a
+# source marker, never part of the building identity, so strip it before the
+# name reaches a card. Only the unambiguous parenthesised ``N)``/``(N)`` form is
+# removed: a bare leading number ("1 Altamount Road", "3 BHK Residency") is a
+# legitimate name/title and must survive.
+_LIST_ITEM_ENUM_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    # "1) ", "12) ", "(3) " — the unambiguous list-index form.
+    r"(?:[*_~]\s*)*(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*\))[*_~:.\-–—]?\s*"
+    r"|"
+    # "*4.* Grotto", "*4* Grotto" — index wrapped in emphasis markers.
+    r"[*_~]\s*\d{1,3}\s*\.?\s*[*_~]\s*"
+    r")"
+)
+_BUILDING_IDENTITY_KEYS = frozenset({"building_name", "project_name"})
+
+
+def _clean_extraction_value(value: object, *, key: str = "") -> object:
+    """Convert provider absence markers to real nulls before persistence."""
+    if isinstance(value, dict):
+        return {
+            child_key: _clean_extraction_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [cleaned for item in value
+                if (cleaned := _clean_extraction_value(item, key=key)) is not None]
+    if isinstance(value, str):
+        # Evidence fields are copied verbatim for audit. Collapsing newlines
+        # here makes a provenance slice look like one line and can hide which
+        # listing block supplied a value in a multi-listing broadcast.
+        if key in {"source_slice", "source_text", "full_text", "slice_text"}:
+            text = value.strip()
+        else:
+            text = re.sub(r"\s+", " ", value).strip()
+        if key in _BUILDING_IDENTITY_KEYS:
+            text = _LIST_ITEM_ENUM_PREFIX_RE.sub("", text).strip()
+        lowered = text.casefold()
+        if lowered in _NULL_LIKE_EXTRACTION_VALUES:
+            return None
+        if key in _BOOLEAN_EXTRACTION_FIELDS:
+            if lowered in {"true", "yes", "y", "1"}:
+                return True
+            if lowered in {"false", "no", "n", "0"}:
+                return False
+            return None
+        return text
+    return value
+
+
+_GENERIC_TITLE_RE = re.compile(
+    r"^(?:property|listing|property details|property opportunity|real estate property)"
+    r"(?:\s+(?:for|on|available|details?|opportunity)\b.*)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_usable_extraction_title(title: object) -> bool:
+    text = re.sub(r"\s+", " ", str(title or "")).strip(" -:|,;")
+    if not text or re.match(r"^\[?unstructured\]?\b", text, re.IGNORECASE):
+        return False
+    if re.search(
+        r"(?:—|–|\||:)\s*(?:none|null|unknown|not\s+(?:specified|identified|found))\s*$",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return not _GENERIC_TITLE_RE.fullmatch(text)
+
+
+def _clean_broker_name(value: object) -> str | None:
+    text = str(value or "").strip()
+    if re.search(r"(?:https?://)?(?:www\.)?wa\.me/|whatsapp", text, re.IGNORECASE):
+        return None
+    if not text or (_PHONE_LIKE_BROKER_NAME_RE.fullmatch(text) and re.search(r"\d", text)):
+        return None
+    text = _BROKER_NAME_PREFIX_RE.sub("", text).strip(" :-–|")
+    if (
+        not text
+        or text.casefold().rstrip(":") in _BROKER_FIELD_LABELS
+        or _BROKER_INSTRUCTION_RE.search(text)
+        or (_PHONE_LIKE_BROKER_NAME_RE.fullmatch(text) and re.search(r"\d", text))
+    ):
+        return None
+    return text
+
+
+_REQUIREMENT_BUDGET_RANGE_RE = re.compile(
+    r"\bbudget\s*[:\-]?\s*(?:₹|rs\.?\s*)?([\d,.]+)\s*"
+    r"(k|thousand|l|lac|lakh|lakhs|cr|crore|crores)?\s*"
+    r"(?:-|\u2013|to|se)\s*(?:₹|rs\.?\s*)?([\d,.]+)\s*"
+    r"(k|thousand|l|lac|lakh|lakhs|cr|crore|crores)?\b",
+    re.IGNORECASE,
+)
+_RENTAL_REQUIREMENT_CUE_RE = re.compile(
+    r"\b(?:rent|rental|rantal|rant|lease|monthly|tenant|tenancy|family\s+party|"
+    r"bachelor|company\s+lease|deposit|on\s+(?:l\s*&\s*l|ll|l\s*and\s*l))\b",
+    re.IGNORECASE,
+)
+_REQUIREMENT_SINGLE_BUDGET_RE = re.compile(
+    r"\b(?:budget|rent|rental|rantal|rant)\s*[:\-]?\s*(?:₹|rs\.?\s*)?"
+    r"([\d,.]+)\s*(k|thousand|l|lac|lakh|lakhs|cr|crore|crores)\b",
+    re.IGNORECASE,
+)
+_REQUIREMENT_UP_TO_BUDGET_RE = re.compile(
+    r"\bbudget\s*[:\-]?\s*(?:up\s*to|upto|maximum|max)\s*"
+    r"(?:₹|rs\.?\s*)?([\d,.]+)\s*"
+    r"(k|thousand|l|lac|lakh|lakhs|cr|crore|crores)\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_PG_RE = re.compile(
+    r"\b(?:p\.?\s*g\.?|paying\s+guest|hostel|dorm(?:itory)?|co[-\s]?living)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_budget_bound(value):
+    """Store money bounds as stable rupee integers, not float artifacts."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    rounded = round(numeric)
+    return int(rounded) if abs(numeric - rounded) < 1e-6 else numeric
+
+
+def _source_ground_requirement_item(item: dict, source_text: str) -> dict:
+    """Correct requirement route/budget from explicit source evidence.
+
+    Models sometimes expand ``38k`` as 3.8 lakh and default a bare
+    ``Requirement`` to purchase demand.  An explicit K-denominated budget in
+    the normal monthly-rent range plus a tenancy cue is authoritative.  This
+    runs after AI extraction and before typed-table routing.
+    """
+    corrected = dict(item or {})
+    source_has_listing_language = _has_explicit_rent_listing_language(source_text) or bool(
+        _explicit_source_inventory_type(source_text)
+    )
+    is_requirement = (
+        corrected.get("listing_type") == "requirement"
+        or corrected.get("message_class") == "requirement"
+        or bool(re.search(r"\b(?:requirement|required|looking\s+for|need|wanted)\b", source_text, re.I))
+    )
+    # “Need client's profile” is broker follow-up text attached to an offered
+    # property, not buyer demand. Source-local supply language wins unless the
+    # message has an explicit requirement heading.
+    if source_has_listing_language and not _has_explicit_requirement_heading(source_text):
+        return _normalize_source_inventory_route(corrected, source_text)
+    if not is_requirement:
+        return corrected
+
+    match = _REQUIREMENT_BUDGET_RANGE_RE.search(source_text or "")
+    if match:
+        first_unit = (match.group(2) or match.group(4) or "").lower()
+        second_unit = (match.group(4) or match.group(2) or "").lower()
+        multipliers = {
+            "k": 1_000, "thousand": 1_000,
+            "l": 100_000, "lac": 100_000, "lakh": 100_000, "lakhs": 100_000,
+            "cr": 10_000_000, "crore": 10_000_000, "crores": 10_000_000,
+        }
+        try:
+            low = float(match.group(1).replace(",", "")) * multipliers.get(first_unit, 1)
+            high = float(match.group(3).replace(",", "")) * multipliers.get(second_unit, 1)
+        except ValueError:
+            low = high = None
+        if low is not None and high is not None:
+            corrected["budget_min"], corrected["budget_max"] = (
+                _clean_budget_bound(value) for value in sorted((low, high))
+            )
+            # ``OUTRIGHT REQUIREMENT`` is a purchase demand.  In a mixed
+            # broadcast the full message may also contain rent listings, so
+            # the explicit demand heading must override the provider's stale
+            # transaction_type rather than inheriting sibling rent language.
+            if re.search(r"\boutright\s+requirement\b", source_text or "", re.I):
+                corrected["transaction_type"] = "sale"
+                corrected["classified_transaction_type"] = "sale"
+            elif _RENTAL_REQUIREMENT_CUE_RE.search(source_text or ""):
+                corrected["transaction_type"] = "rent"
+                corrected["classified_transaction_type"] = "rent"
+                locality = corrected.get("locality_options")
+                locality_label = locality[0] if isinstance(locality, list) and locality else locality
+                corrected["title"] = (
+                    f"Residential Rental Requirement in {locality_label}"
+                    if locality_label else "Residential Rental Requirement"
+                )
+
+    # A single capped budget is an upper bound, not a range. This source-level
+    # correction is authoritative because providers have historically turned
+    # "Up to ₹6 Cr" into the nonsensical ₹60L–₹600Cr range.
+    up_to = _REQUIREMENT_UP_TO_BUDGET_RE.search(source_text or "")
+    if not match and up_to:
+        multipliers = {
+            "k": 1_000, "thousand": 1_000,
+            "l": 100_000, "lac": 100_000, "lakh": 100_000, "lakhs": 100_000,
+            "cr": 10_000_000, "crore": 10_000_000, "crores": 10_000_000,
+        }
+        unit = up_to.group(2).lower()
+        try:
+            amount = float(up_to.group(1).replace(",", "")) * multipliers[unit]
+        except (ValueError, KeyError):
+            amount = None
+        if amount is not None:
+            corrected["budget_min"] = None
+            corrected["budget_max"] = _clean_budget_bound(amount)
+
+    single = _REQUIREMENT_SINGLE_BUDGET_RE.search(source_text or "")
+    if not match and single and _RENTAL_REQUIREMENT_CUE_RE.search(source_text or ""):
+        unit = single.group(2).lower()
+        multipliers = {
+            "k": 1_000, "thousand": 1_000,
+            "l": 100_000, "lac": 100_000, "lakh": 100_000, "lakhs": 100_000,
+            "cr": 10_000_000, "crore": 10_000_000, "crores": 10_000_000,
+        }
+        try:
+            numeric_amount = float(single.group(1).replace(",", ""))
+            # Mumbai rental shorthand: decimal k-quotes below 5 such as
+            # “1.50k” mean 1.50 lakh, not ₹1,500. Keep ordinary 14.5k/35k
+            # rents in thousands.
+            if unit == "k" and "." in single.group(1) and numeric_amount < 5:
+                amount = numeric_amount * 100_000
+            else:
+                amount = numeric_amount * multipliers[unit]
+        except (ValueError, KeyError):
+            amount = None
+        if amount is not None:
+            corrected["budget_max"] = _clean_budget_bound(amount)
+            corrected["transaction_type"] = "rent"
+            corrected["classified_transaction_type"] = "rent"
+
+    # BHK options must be configurations, never descriptive prose such as
+    # "furnished flat". `_normalized_bhk` accepts the valid numeric forms.
+    if corrected.get("bhk_options") is not None and _normalized_bhk(corrected.get("bhk_options")) is None:
+        corrected["bhk_options"] = []
+        corrected["needs_review"] = True
+    corrected["broker_name"] = _clean_broker_name(corrected.get("broker_name"))
+    return corrected
+
+PROJECT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_DIR))
+
+from lab.storage.base import RawMessage, ParsedObservation, ResolverDecision, dict_to_dataclass
+from storage import SupabaseStorage
+from lab.embedding import create_engine, observation_text, pack_embedding
+from lab.events import get_bus
+from agents.building_alias_engine import fuzzy_score, normalize_building_name
+from price_normalization import canonical_commercial_rental_price_rupees, canonical_price_rupees, canonical_rental_price_rupees, parse_explicit_price, price_to_rupees, rent_price_needs_review, source_attached_price
+from source_boundary import apply_source_boundary, enforce_source_boundary, classify_source_boundary
+from extraction_quality import (
+    apply_price_sanity_guard,
+    apply_broker_field_grounding,
+    building_name_problem,
+    canonicalize_extraction_confidence,
+    repair_building_assignment,
+)
+from source_authority_candidates import apply_authority_result, evaluate_extraction_authority
+
+
+def get_storage():
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("Supabase is required. Set SUPABASE_URL and SUPABASE_SERVICE_KEY.")
+    return SupabaseStorage(url, key)
+
+
+_EMOJI_ICON_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u200d"
+    "\u20e3"
+    "\u231a-\u23ff"
+    "\u25a0-\u25ff"
+    "\u2600-\u27bf"
+    "\u2934-\u2935"
+    "\u2b05-\u2b55"
+    "\u3030"
+    "\u303d"
+    "\u3297"
+    "\u3299"
+    "\ufe00-\ufe0f"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+_EXPLICIT_REQUIREMENT_HEADING_RE = re.compile(
+    r"^\s*[\W_]*(?:(?:very|urgent|immediate)\s+)*"
+    r"(?:(?:outright|property|rental|residential|commercial)\s+)*"
+    r"(?:(?:buyer|tenant|client)\s+)?"
+    # Keep generic "looking for"/"seeking" out of this source guard: brokers
+    # commonly use them as marketing hooks ("Looking for the perfect office?").
+    # The extraction prompt handles those cues semantically; this guard is for
+    # unambiguous request headings only.
+    r"(?:requirements?|required|require|wanted|want|"
+    r"need(?:s|ed)?|"
+    r"any\s+(?:(?:one|1)\s+)?(?:\S+\s+){0,6}(?:available|has|have)\b|"
+    r"koi\s+.*\b(?:hai|chahiye|milega|mil\s+sakta)\b|"
+    r"(?:chahiye|chaahiye|dhoondh|dhundh|dhoondh\s+rahe)\b)",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_RENT_LISTING_RE = re.compile(
+    r"\b(?:avl|available|for\s+rent|on\s+rent|rent\s*[:\-]?|for\s+lease|on\s+lease|lease)\b",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_DEMAND_RE = re.compile(
+    r"\b(?:looking\s+for|seeking|need(?:s|ed)?|wanted|required)\b",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_INVENTORY_MARKER_RE = re.compile(
+    r"(?:\b(?:avl|available|for\s+lease|on\s+lease|lease|for\s+sale|"
+    r"on\s+sale|asking|price)\b|\brent\s*[:=\-])",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_LISTING_UNIT_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:bhk|rk|bedroom)s?\b",
+    re.IGNORECASE,
+)
+
+
+def _has_explicit_requirement_heading(text: str) -> bool:
+    """Recognize a requirement heading without treating listing copy as one."""
+    for line in (text or "").splitlines():
+        # Broker follow-up text is commonly appended to an offered property:
+        # “Need Client's Profile” means the broker wants the prospect's
+        # details, not that this message is a buyer requirement.
+        if re.match(r"^\s*need\s+(?:the\s+)?client['’]?s\s+profile\b", line, re.I):
+            continue
+        if _EXPLICIT_REQUIREMENT_HEADING_RE.search(line):
+            return True
+    return False
+
+
+def _explicit_requirement_source_blocks(text: str) -> list[str]:
+    """Return exclusive source blocks beginning at explicit demand headings."""
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    starts = [index for index, line in enumerate(lines) if _has_explicit_requirement_heading(line)]
+    if not starts:
+        return []
+    blocks: list[str] = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        # A separator after a demand block marks the next document section.
+        for index in range(start + 1, end):
+            if lines[index] and re.fullmatch(r"[\W_]{5,}", lines[index]):
+                end = index
+                break
+        block = "\n".join(line for line in lines[start:end] if line).strip()
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _has_explicit_rent_listing_language(text: str) -> bool:
+    """Detect broker listing language that must not become a BUY demand."""
+    value = text or ""
+    return bool(
+        _EXPLICIT_RENT_LISTING_RE.search(value)
+        and re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk|bedroom)s?\b", value, re.IGNORECASE)
+    )
+
+
+def _explicit_source_inventory_type(text: str) -> str | None:
+    """Return the one source-grounded type; mixed text remains unresolved."""
+    value = str(text or "")
+    if _has_explicit_requirement_heading(value) or not _EXPLICIT_LISTING_UNIT_RE.search(value):
+        return None
+    return classify_source_boundary(value).explicit_route
+
+
+def _normalize_source_inventory_route(item: dict, source_text: str) -> dict:
+    """Apply the source route when explicit supply evidence is present.
+
+    ``apply_source_boundary`` records conflicts for generic callers.  This
+    extraction boundary is the authoritative pre-persistence guard, so an
+    explicit unit-plus-rent offer must also clear a stale provider demand
+    label before typed-table routing runs.
+    """
+    checked = apply_source_boundary(item, source_text)
+    result = classify_source_boundary(source_text)
+    if result.explicit_route in {"rent", "sale"} and not _has_explicit_requirement_heading(source_text):
+        checked.update({
+            "listing_type": result.explicit_route,
+            "routing_listing_type": result.explicit_route,
+            "message_class": "listing",
+            "classified_is_requirement": False,
+            "is_requirement": False,
+        })
+        checked["transaction_type"] = result.explicit_route
+        checked["classified_transaction_type"] = result.explicit_route
+    return checked
+
+
+def _apply_listing_transaction_guard(ai_items: list[dict], full_text: str, slices: list[str]) -> list[dict]:
+    """Prefer explicit rent listing evidence over an ambiguous AI label.
+
+    Messages such as ``Available 2 BHK For Rent`` are inventory posts.  The
+    AI occasionally labels them as ``requirement`` because of words like
+    ``available`` or ``rent``.  A real requirement has an explicit heading;
+    absent that heading, source-local listing language is authoritative.
+    """
+    corrected: list[dict] = []
+    for index, item in enumerate(ai_items):
+        item = dict(item or {})
+        source = slices[index] if index < len(slices) else full_text
+        has_requirement_heading = _has_explicit_requirement_heading(source) or (
+            len(ai_items) == 1 and _has_explicit_requirement_heading(full_text)
+        )
+        if not has_requirement_heading:
+            item = _normalize_source_inventory_route(item, source)
+        corrected.append(item)
+    return corrected
+
+
+def _apply_requirement_source_guard(ai_items: list[dict], full_text: str, slices: list[str]) -> list[dict]:
+    """Correct an LLM listing label when the source explicitly heads a demand.
+
+    A broker can write "VERY URGENT REQUIREMENT" and then mention the asset
+    they want to buy. The word "sale" inside that description must not turn
+    the buyer demand into inventory. Mixed documents remain item-scoped: only
+    an item whose source slice has a requirement heading is corrected, while a
+    single-item document may use the full source heading.
+    """
+    full_requirement = _has_explicit_requirement_heading(full_text)
+    corrected: list[dict] = []
+    for index, item in enumerate(ai_items):
+        source = slices[index] if index < len(slices) else full_text
+        is_requirement = _has_explicit_requirement_heading(source) or (
+            len(ai_items) == 1 and full_requirement
+        )
+        if is_requirement and item.get("listing_type") != "requirement":
+            item = {**item, "listing_type": "requirement"}
+        corrected.append(item)
+    return corrected
+
+
+def _strip_icons(text):
+    if text is None:
+        return None
+    cleaned = _EMOJI_ICON_RE.sub("", str(text))
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_parsed_value(value):
+    if isinstance(value, str):
+        return _strip_icons(value)
+    if isinstance(value, list):
+        return [_sanitize_parsed_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_parsed_value(item) for key, item in value.items()}
+    return value
+
+
+def _explicit_bold_building_context(text: str) -> tuple[str | None, str | None, bool]:
+    """Return an explicitly bolded building and adjacent locality.
+
+    Dense broker broadcasts commonly use ``*Building* locality - 3 BHK``.
+    The bold boundary is source evidence: text after it must not be appended
+    to the building identity. Generic headings still fail the normal building
+    quality guard.
+    """
+    for raw_line in str(text or "").splitlines():
+        if not re.search(r"(?i)\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b", raw_line):
+            continue
+        match = re.match(r"^\s*\*([^*\n]{2,70})\*", raw_line)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" .,;:|-_")
+        if building_name_problem(candidate):
+            return None, None, True
+
+        remainder = raw_line[match.end():].strip(" \t-–—:|,;")
+        locality_match = re.match(
+            r"(?i)^([A-Za-z][A-Za-z .'/&-]{1,48}?)(?=\s*(?:[-–—:|]\s*)?\d+(?:\.\d+)?\s*(?:bhk|rk)\b)",
+            remainder,
+        )
+        adjacent_locality = locality_match.group(1).strip(" .,;:|-_") if locality_match else None
+        return candidate, adjacent_locality or None, True
+    return None, None, False
+
+
+def _infer_building_name_from_source(text: str, locality: str | None = None) -> str | None:
+    """Recover a clearly labelled building line when the model omits it.
+
+    Broker formats commonly put the BHK headline first and the building on the
+    next non-empty line. This is deliberately conservative: ad labels,
+    locality lines, prices and contact text are never promoted to buildings.
+    """
+    explicit_building, _, explicit_boundary_seen = _explicit_bold_building_context(text)
+    if explicit_boundary_seen:
+        return explicit_building
+
+    lines = [re.sub(r"[*_`~]", "", line).strip(" -:•") for line in str(text or "").splitlines()]
+    # Broker inventory often puts a named project followed by its asking
+    # quote on the first line, without the words "Building" or "Project":
+    # ``Villa Capri @1.60 Lakhs`` / ``DEVANSH VILLA @1.60 Lakhs``.  The
+    # presence of a second token is important: standalone ``Villa`` is a
+    # property type, while these bounded names are building identities.
+    for line in lines[:3]:
+        heading = re.match(
+            r"^\s*(?P<name>[A-Za-z][A-Za-z0-9 &'./-]{2,68}?)\s*(?:@|[-–—:]\s*)"
+            r"(?:₹|rs\.?|inr)?\s*\d[\d,.]*\s*(?:k|thousand|l|lac|lacs|lakh|lakhs|cr|crore|crores)\b",
+            line,
+            re.IGNORECASE,
+        )
+        if heading:
+            candidate = heading.group("name").strip(" .,;|-_")
+            if len(candidate.split()) >= 2 and not building_name_problem(candidate, locality=locality):
+                return candidate
+    # Prefer explicit labels wherever they occur. This handles common broker
+    # blocks where the building line follows a heading rather than the BHK
+    # line, e.g. "Building Name: Ten BKC".
+    for line in lines:
+        labelled = re.match(
+            r"(?i)^(?:bildg|bldg|building(?:\s+name)?|project(?:\s+name)?|society)\s*[:=-]{1,2}\s*(.+)$",
+            line,
+        )
+        if not labelled:
+            continue
+        candidate = labelled.group(1).strip(" .,;|-_")
+        if (
+            candidate
+            and len(candidate) <= 70
+            and re.search(r"[A-Za-z]", candidate)
+            and candidate.casefold() not in {"on request", "price on request", "request", "unknown", "n/a", "na"}
+            and not re.search(r"(?i)\b(?:rent|sale|lease|available|carpet|area|floor|parking|possession|contact|details)\b", candidate)
+            and not re.search(r"(?:₹|\b\d{5,}\b|\b(?:sq\.?\s*ft|lakh|lakhs?|crore|cr|per\s+month)\b)", candidate)
+        ):
+            return candidate
+    # Numbered inventory headings often carry both identities in one line:
+    # ``1. IndiaBulls Blu – Worli``. This is source evidence, not enrichment.
+    for line in lines[:3]:
+        if not re.match(r"(?i)^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s*", line):
+            continue
+        heading = re.sub(r"(?i)^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s*", "", line).strip()
+        parts = re.split(r"\s+[–—-]\s+", heading, maxsplit=1)
+        if len(parts) == 2:
+            candidate, heading_locality = (part.strip(" .,;|-_") for part in parts)
+            if (
+                candidate
+                and heading_locality
+                and re.search(r"[A-Za-z]", candidate)
+                and not re.search(r"(?i)\b(?:rent|sale|available|requirement|price)\b", candidate)
+            ):
+                return candidate
+    # Some inventory headings put the project before the BHK marker:
+    # "Adani TEN BKC - 2 BHK RESIDENCES".
+    for line in lines:
+        bhk_marker = re.search(r"(?i)\s*[-–:]\s*\d+(?:\.\d+)?\s*(?:bhk|rk)\b", line)
+        if not bhk_marker:
+            continue
+        candidate = line[:bhk_marker.start()].strip(" .,;|-_")
+        candidate = re.sub(r"(?i)^(?:inventory|options?|exclusive)\s*[:|-]?\s*", "", candidate).strip()
+        if candidate and len(candidate) <= 70 and re.search(r"[A-Za-z]", candidate):
+            return candidate
+    for index, line in enumerate(lines):
+        if not re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b", line, re.IGNORECASE):
+            continue
+        for candidate in lines[index + 1:index + 5]:
+            if not candidate or len(candidate) > 70 or (locality and candidate.lower() == locality.lower()):
+                continue
+            if re.match(r"(?i)^(?:bildg|bldg|building(?:\s+name)?|project(?:\s+name)?|society)\s*[:=-]", candidate):
+                continue
+            if re.search(r"\b(?:prime location|location|rent|sale|lease|available|carpet|area|status|floor|parking|possession|inspection|photos?|contact|details|site visit|brokerage)\b", candidate, re.IGNORECASE):
+                continue
+            if re.search(r"(?:₹|\b\d{5,}\b|\b(?:sq\.?\s*ft|lakh|lakhs?|crore|cr|per\s+month)\b)", candidate, re.IGNORECASE):
+                continue
+            if re.search(r"[A-Za-z]", candidate):
+                return candidate.strip(" .,")
+    # Commercial posts may have no BHK line. If they explicitly name a
+    # location, the next descriptive line is commonly the building/project.
+    for index, line in enumerate(lines):
+        if not re.match(r"(?i)^location\s*[:=-]", line):
+            continue
+        for candidate in lines[index + 1:index + 4]:
+            if (
+                candidate
+                and len(candidate) <= 70
+                and re.search(r"[A-Za-z]", candidate)
+                and not re.search(
+                    r"(?i)\b(?:area|floor|rent|sale|lease|parking|contact|details|brokerage|possession|photos?|available|road|location)\b|₹|\b\d{4,}\b",
+                    candidate,
+                )
+            ):
+                return candidate.strip(" .,")
+    return None
+
+
+_infer_shared_nonbuilding_prefix = re.compile(
+    r"(?i)^(?:dear|hi|hello|hey|greetings|good\s+(?:morning|afternoon|evening)|"
+    r"regards|thanks|thank\s+you|please|note|important|associates|team|all|everyone)\b"
+)
+
+
+def _infer_shared_building_name(text: str, locality: str | None = None) -> str | None:
+    """Find a conservative building header shared by a multi-item broadcast.
+
+    Broadcasts often put a named project on its own line before the locality
+    and several BHK blocks (for example ``MARINA BAY`` followed by WORLI and
+    multiple options).  The item source slice intentionally excludes shared
+    headers, so this helper only inspects the short prefix before the first
+    property anchor and never borrows a later item's building.
+    """
+    lines = [
+        re.sub(r"[*_`~]", "", line).strip(" -:•")
+        for line in str(text or "").splitlines()
+    ]
+    first_anchor = next(
+        (index for index, line in enumerate(lines)
+         if re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?|br)\b", line, re.I)),
+        None,
+    )
+    if first_anchor is None or first_anchor == 0:
+        return None
+    locality_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", str(locality or "").casefold())
+        if len(token) >= 2
+    }
+    generic = re.compile(
+        r"(?i)\b(?:available|residential|commercial|property|apartment|flat|"
+        r"premium|residences?|homes?|luxury|sale|rent|lease|furnished|"
+        r"bare[- ]?shell|inventory|options?|contact|details|location|locality|"
+        r"listings?|added|associates)\b"
+    )
+    for line in lines[:first_anchor]:
+        # A numbered line (``1) Sugee Marina Bay``, ``(2) ...``, ``3. ...``)
+        # is an individual inventory heading, never a header shared by the
+        # whole broadcast. Promoting the first item's numbered heading here
+        # would prefix one item's building onto every later item's slice and
+        # cross-wire building names across the document.
+        if re.match(r"^\s*(?:[\W_]*)\s*(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.)])\s*", line):
+            continue
+        candidate = _strip_icons(line).strip(" .,:;|-_")
+        if not candidate or len(candidate) > 70 or not re.search(r"[A-Za-z]", candidate):
+            continue
+        if candidate.casefold() in {"for sale", "for rent", "rent", "sale"}:
+            continue
+        # Greetings, addressees and salutations are never a shared building
+        # header even when they sit before the first property anchor.
+        if _infer_shared_nonbuilding_prefix.search(candidate):
+            continue
+        if generic.search(candidate) or re.search(r"(?:₹|\b\d{4,}\b|sq\.?\s*ft|lakh|crore|per\s+month)", candidate, re.I):
+            continue
+        candidate_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", candidate.casefold())
+            if len(token) >= 2
+        }
+        if locality_tokens and locality_tokens.issubset(candidate_tokens):
+            continue
+        if not building_name_problem(candidate):
+            return candidate
+    return None
+
+
+_CORE_BHK_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed(?:\s*rooms?)?|bedrooms?|br)\b", re.IGNORECASE)
+_CORE_AREA_RE = re.compile(
+    r"\b(?:carpet|built\s*[- ]?up|super\s*[- ]?built\s*[- ]?up|area|size)\s*"
+    r"(?:is|:|-)?\s*(\d[\d,]*(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sft|square\s*feet)\b"
+    r"|\b(\d[\d,]*(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sft|square\s*feet)\b",
+    re.IGNORECASE,
+)
+_CORE_PRICE_RE = re.compile(
+    r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)\s*"
+    r"(cr(?:ore|ores)?|lac(?:s)?|lakh(?:s)?|l|k|thousand(?:s)?)\b",
+    re.IGNORECASE,
+)
+_MULTI_UNIT_BHK_RE = re.compile(
+    r"\b(?P<count>\d+)\s*(?:x|×|\*|\s+)\s*"
+    r"(?P<bhk>\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?|br)\b",
+    re.IGNORECASE,
+)
+_COMBINATION_BHK_RE = re.compile(
+    r"\b(?P<first>\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?|br)\b"
+    r"\s*(?:\+|&|and)\s*"
+    r"(?P<second>\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?|br)\b"
+    r"(?:\s*\(?(?:jodi|joint)\)?|\s+jodi)?",
+    re.IGNORECASE,
+)
+_JODI_BHK_RE = re.compile(
+    r"\b(?P<bhk>\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?)\s*\(?jodi\)?\b",
+    re.IGNORECASE,
+)
+
+
+def _source_grounded_bhk_fallback(raw_text: str, slice_text: str | None) -> float | None:
+    """Recover one BHK value when the provider omitted it.
+
+    A deterministic fallback is safe only when the item slice has one value,
+    or when the complete broadcast contains the same BHK value everywhere.
+    The latter covers shared headings such as ``3 BHK FLATS RENTAL`` that the
+    source-boundary splitter intentionally keeps outside an item slice. Mixed
+    BHK broadcasts remain unresolved rather than borrowing a sibling value.
+    """
+    local_matches = list(_CORE_BHK_RE.finditer(str(slice_text or "")))
+    local_values = {float(match.group(1)) for match in local_matches}
+    if len(local_values) == 1:
+        return next(iter(local_values))
+    if local_values:
+        return None
+
+    full_matches = list(_CORE_BHK_RE.finditer(str(raw_text or "")))
+    full_values = {float(match.group(1)) for match in full_matches}
+    # A single explicit BHK in the complete message is safe even when the
+    # provider's item slice omitted it. Older rows commonly stored only a
+    # heading such as "Available 2bhk On Lease" in the slice, while the
+    # complete WhatsApp message held the actual item details.
+    if len(full_matches) == 1 and len(full_values) == 1:
+        return next(iter(full_values))
+    if len(full_matches) >= 2 and len(full_values) == 1:
+        return next(iter(full_values))
+    return None
+
+
+def _apply_source_grounded_bhk_fallback(
+    ai_extraction: dict,
+    raw_text: str,
+    slice_text: str | None,
+) -> dict:
+    """Annotate a provider omission recovered from source-only BHK context."""
+    if ai_extraction.get("bhk") is not None:
+        return ai_extraction
+    fallback = _source_grounded_bhk_fallback(raw_text, slice_text)
+    if fallback is None:
+        return ai_extraction
+    ai_extraction["bhk"] = fallback
+    flags = list(ai_extraction.get("validation_flags") or [])
+    ai_extraction["validation_flags"] = list(dict.fromkeys(
+        [*flags, "source_bhk_context_fallback"]
+    ))
+    return ai_extraction
+
+
+def _dedupe_exact_source_items(
+    ai_items: list[dict], slice_texts: list[str],
+) -> tuple[list[dict], list[str]]:
+    """Collapse repeated child items that point to the exact same source text.
+
+    A single WhatsApp broadcast may legitimately produce several listings, so
+    this is deliberately narrower than property identity matching. We only
+    remove a later AI item when its normalized source slice is byte-for-byte
+    equivalent to an earlier item. Different floors, prices, areas, or source
+    slices remain independent opportunities.
+    """
+    seen: set[str] = set()
+    kept_items: list[dict] = []
+    kept_slices: list[str] = []
+    for item, source_slice in zip(ai_items, slice_texts):
+        normalized = re.sub(r"\s+", " ", str(source_slice or "").strip()).casefold()
+        if normalized and normalized in seen:
+            _logger.warning("dropping duplicate AI child with identical source slice")
+            continue
+        if normalized:
+            seen.add(normalized)
+        kept_items.append(item)
+        kept_slices.append(source_slice)
+    return kept_items, kept_slices
+
+
+_NUMBERED_BROADCAST_START_RE = re.compile(
+    r"(?im)^\s*(?:[*_~]*\s*)?(?:\d+\s*[/.)]|\(\s*\d+\s*\))\s*[*_~]*\s*"
+)
+_NUMBERED_BROADCAST_PRICE_RE = re.compile(
+    r"(?i)(?:₹|rs\.?|inr)?\s*\d[\d,.]*\s*(?:k|thousand|l|lac|lacs|lakh|lakhs|cr|crore|crores)\b"
+)
+_JODI_SEPARATE_SALE_RE = re.compile(
+    r"\b(?:available|sold|sell|sale|selling)\b[^\n]{0,100}\b(?:individually|separately|each)\b|"
+    r"\b(?:individually|separately|each)\b[^\n]{0,100}\b(?:available|sold|sell|sale|selling)\b",
+    re.IGNORECASE,
+)
+_DUAL_TRANSACTION_RE = re.compile(
+    r"\b(?:available|offered|open)\b[^\n]{0,100}\b(?:for\s+)?sale\b[^\n]{0,100}\b(?:and|/|&|as\s+well\s+as)\b[^\n]{0,100}\b(?:for\s+)?(?:rent|lease)\b|"
+    r"\b(?:for\s+)?(?:rent|lease)\b[^\n]{0,100}\b(?:and|/|&|as\s+well\s+as)\b[^\n]{0,100}\b(?:for\s+)?sale\b",
+    re.IGNORECASE,
+)
+_DUAL_PRICE_TRANSACTION_RE = re.compile(
+    r"(?P<first>(?:₹|rs\.?|inr)?\s*\d[\d,.]*(?:\s*)"
+    r"(?:k|thousand|l|lac|lacs|lakh|lakhs|cr|crore|crores))\s*"
+    r"(?P<first_type>rent|rental|sale)\s*(?:/|\||&|and|or)\s*"
+    r"(?P<second>(?:₹|rs\.?|inr)?\s*\d[\d,.]*(?:\s*)"
+    r"(?:k|thousand|l|lac|lacs|lakh|lakhs|cr|crore|crores))\s*"
+    r"(?P<second_type>rent|rental|sale)",
+    re.IGNORECASE,
+)
+
+
+def _dual_transaction_prices(source_text: str) -> dict[str, tuple[float, str]]:
+    """Extract explicit rent/sale prices attached to the same source line."""
+    match = _DUAL_PRICE_TRANSACTION_RE.search(str(source_text or ""))
+    if not match:
+        return {}
+    result: dict[str, tuple[float, str]] = {}
+    for price_group, type_group in (("first", "first_type"), ("second", "second_type")):
+        raw_price = match.group(price_group).strip()
+        transaction = "rent" if match.group(type_group).casefold() == "rental" else match.group(type_group).casefold()
+        amount = _parse_raw_price_to_abs(raw_price)
+        if amount is not None:
+            result[transaction] = (amount, raw_price)
+    return result
+
+
+def _expand_source_explicit_variants(parsed_listings, ai_items, slice_texts):
+    """Expand only explicit source statements into independent cards.
+
+    Same-building similarity is never sufficient. This helper requires the
+    item-scoped source slice to say that a JODI is separately saleable or that
+    the same opportunity is available for both sale and rent.
+    """
+    expanded = []
+    expanded_ai = []
+    expanded_slices = []
+
+    def clear_inherited_price(row):
+        """Never present a combined quote as the price of an individual unit."""
+        for key in (
+            "price", "price_unit", "price_raw_text", "price_per_sqft",
+            "total_asking_price", "computed_total_asking_price",
+            "computed_price_confidence", "price_math",
+        ):
+            row[key] = None
+        row["needs_review"] = True
+        flags = list(row.get("validation_flags") or [])
+        flags.append("individual_unit_price_not_explicit")
+        row["validation_flags"] = list(dict.fromkeys(flags))
+    for parsed, ai, source in zip(parsed_listings, ai_items, slice_texts):
+        source_text = str(source or "")
+        is_residential_sale = (
+            str(parsed.get("asset_type") or "").casefold() == "residential"
+            and str(parsed.get("transaction_type") or parsed.get("intent") or "").casefold() == "sale"
+            and bool(parsed.get("is_combination_unit"))
+        )
+        separate_jodi = is_residential_sale and bool(_JODI_SEPARATE_SALE_RE.search(source_text))
+        dual_prices = _dual_transaction_prices(source_text)
+        dual_transaction = bool(_DUAL_TRANSACTION_RE.search(source_text) or len(dual_prices) == 2)
+        variants = [(parsed, ai)]
+        if separate_jodi:
+            details = str(parsed.get("configuration_details") or "3 BHK + 3 BHK (JODI)")
+            unit_match = re.search(r"(\d+(?:\.\d+)?)\s*BHK\s*\+\s*(\d+(?:\.\d+)?)\s*BHK", details, re.I)
+            unit_bhk = unit_match.group(1) if unit_match else str(parsed.get("bhk") or "")
+            combined = deepcopy(parsed)
+            combined["can_sell_separately"] = True
+            combined["summary_title"] = f"{details} for sale at {parsed.get('building_name') or parsed.get('micro_market') or 'property'}"
+            variants = [(combined, deepcopy(ai))]
+            for unit_number in (1, 2):
+                individual = deepcopy(parsed)
+                individual["bhk"] = float(unit_bhk) if unit_bhk else parsed.get("bhk")
+                individual["configuration_details"] = f"{unit_bhk} BHK (Individual unit; also available as JODI)"
+                individual["is_combination_unit"] = False
+                individual["can_sell_separately"] = True
+                clear_inherited_price(individual)
+                individual["summary_title"] = (
+                    f"{unit_bhk} BHK individual unit, also available as JODI for sale at "
+                    f"{parsed.get('building_name') or parsed.get('micro_market') or 'property'}"
+                )
+                individual_ai = deepcopy(ai)
+                individual_ai["is_combination_unit"] = False
+                individual_ai["can_sell_separately"] = True
+                individual_ai["configuration_details"] = individual["configuration_details"]
+                individual_ai["price"] = None
+                individual_ai["price_raw_text"] = None
+                individual_ai["needs_review"] = True
+                individual_ai["validation_flags"] = list(dict.fromkeys(
+                    list(individual_ai.get("validation_flags") or [])
+                    + ["individual_unit_price_not_explicit"]
+                ))
+                variants.append((individual, individual_ai))
+        elif dual_transaction:
+            sale = deepcopy(parsed)
+            sale["transaction_type"] = "sale"
+            sale["intent"] = "SELL"
+            sale["monthly_rent"] = None
+            rent = deepcopy(parsed)
+            rent["transaction_type"] = "rent"
+            rent["intent"] = "RENT"
+            rent["total_asking_price"] = None
+            if dual_prices.get("sale"):
+                sale_amount, sale_raw = dual_prices["sale"]
+                sale.update({
+                    "price": sale_amount, "price_unit": "abs", "price_raw_text": sale_raw,
+                    "total_asking_price": sale_amount, "monthly_rent": None,
+                })
+            if dual_prices.get("rent"):
+                rent_amount, rent_raw = dual_prices["rent"]
+                rent.update({
+                    "price": rent_amount, "price_unit": "abs", "price_raw_text": rent_raw,
+                    "monthly_rent": rent_amount, "total_asking_price": None,
+                })
+            else:
+                # The source may have quoted only one side. A transaction clone
+                # must not make that quote look like the other side's price.
+                for key in ("price", "price_unit", "price_raw_text", "price_per_sqft", "computed_total_asking_price", "price_math"):
+                    rent[key] = None
+                rent["needs_review"] = True
+                rent_flags = list(rent.get("validation_flags") or [])
+                rent_flags.append("rent_price_not_explicit")
+                rent["validation_flags"] = list(dict.fromkeys(rent_flags))
+            for variant in (sale, rent):
+                variant["listing_count"] = 2
+                variant["validation_flags"] = list(dict.fromkeys(
+                    list(variant.get("validation_flags") or []) + ["dual_transaction_expanded"]
+                ))
+            sale["summary_title"] = f"{parsed.get('bhk') or 'Property'} BHK for sale at {parsed.get('building_name') or parsed.get('micro_market') or 'property'}"
+            rent["summary_title"] = f"{parsed.get('bhk') or 'Property'} BHK for rent at {parsed.get('building_name') or parsed.get('micro_market') or 'property'}"
+            sale_ai = deepcopy(ai)
+            rent_ai = deepcopy(ai)
+            sale_ai["listing_type"] = "sale"
+            sale_ai["transaction_type"] = "sale"
+            rent_ai["listing_type"] = "rent"
+            rent_ai["transaction_type"] = "rent"
+            sale_ai["listing_count"] = 2
+            rent_ai["listing_count"] = 2
+            if dual_prices.get("sale"):
+                sale_amount, sale_raw = dual_prices["sale"]
+                sale_ai["price"] = {"amount": sale_amount, "unit": "total", "period": "one_time", "raw_price_text": sale_raw}
+            if dual_prices.get("rent"):
+                rent_amount, rent_raw = dual_prices["rent"]
+                rent_ai["price"] = {"amount": rent_amount, "unit": "total", "period": "per_month", "raw_price_text": rent_raw}
+            else:
+                rent_ai["price"] = None
+                rent_ai["price_raw_text"] = None
+                rent_ai["needs_review"] = True
+                rent_ai["validation_flags"] = list(dict.fromkeys(
+                    list(rent_ai.get("validation_flags") or []) + ["rent_price_not_explicit"]
+                ))
+            for variant_ai in (sale_ai, rent_ai):
+                variant_ai["validation_flags"] = list(dict.fromkeys(
+                    list(variant_ai.get("validation_flags") or []) + ["dual_transaction_expanded"]
+                ))
+            variants = [(sale, sale_ai), (rent, rent_ai)]
+        for variant, variant_ai in variants:
+            expanded.append(variant)
+            expanded_ai.append(variant_ai)
+            expanded_slices.append(source)
+    return expanded, expanded_ai, expanded_slices
+_PRICE_PER_SQFT_RE = re.compile(
+    r"(?:rate|price)\s*(?:per|/)\s*(?:sq\.?\s*ft|sqft|sft|square\s*feet)\.?"
+    r"(?:\s*on\s+(?:carpet|built[- ]?up|chargeable)\s*)?[:=\-]?\s*"
+    r"(?:₹|rs\.?|inr)?\s*(?P<rate>\d[\d,]*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+def _apply_source_evidence_gates(ai: dict, source_text: str) -> dict:
+    """Validate source-bound fields without classifying the asset by keywords."""
+    source = str(source_text or "")
+    ai = enforce_source_boundary(ai, source)
+    flags = list(ai.get("validation_flags") or [])
+    source_bhk = _CORE_BHK_RE.search(source)
+    if source_bhk and ai.get("bhk") is not None:
+        source_value = _safe_float(source_bhk.group(1))
+        if source_value is not None and _safe_float(ai.get("bhk")) != source_value:
+            flags.append("bhk_source_conflict_review")
+            ai["needs_review"] = True
+    if ai.get("carpet_area_sqft") is not None and not _CORE_AREA_RE.search(source):
+        flags.append("carpet_area_dropped_without_explicit_source_area")
+        ai["carpet_area_sqft"] = None
+        ai["needs_review"] = True
+    # These fields are especially prone to plausible model inference. Keep
+    # them only when the selected item slice contains an explicit cue; a
+    # neighbouring block must never make an item look ready or carpet-based.
+    possession = str(ai.get("possession_status") or "").strip()
+    if possession and not re.search(
+        r"(?i)\b(?:possession|ready\s*(?:to\s*)?move|immediate(?:ly)?\s+available|vacant|under\s+construction|completion)\b",
+        source,
+    ):
+        ai["possession_status"] = None
+        flags.append("possession_status_dropped_without_explicit_source")
+        ai["needs_review"] = True
+    price_basis = str(ai.get("price_basis") or "").strip().casefold()
+    if price_basis and not re.search(
+        r"(?i)\b(?:carpet|built\s*[- ]?up|super\s*[- ]?built\s*[- ]?up|chargeable|saleable)\b",
+        source,
+    ):
+        ai["price_basis"] = None
+        flags.append("price_basis_dropped_without_explicit_source")
+        ai["needs_review"] = True
+    ai["validation_flags"] = list(dict.fromkeys(flags))
+    from price_plausibility import apply_price_plausibility_guard
+    checked = apply_price_plausibility_guard(ai, source)
+    # Multiple explicit asking quotes in one item slice are ambiguous even
+    # when the AI value is preserved. Record that ambiguity for review rather
+    # than letting a single regex-selected quote look authoritative.
+    asking_quotes = re.findall(
+        r"(?im)\basking\s*(?:price)?\s*[:=-]?\s*(?:₹|rs\.?|inr)?\s*\d",
+        source,
+    )
+    if len(asking_quotes) > 1:
+        flags = list(checked.get("validation_flags") or [])
+        flags.append("multiple_sale_price_quotes_in_source_slice")
+        checked["validation_flags"] = list(dict.fromkeys(flags))
+        checked["needs_review"] = True
+    return checked
+
+
+_EXPLICIT_SOURCE_LOCATION_RE = re.compile(
+    r"^\s*(?:location|locality|micro\s*market|micro-market|area\s*location)"
+    r"\s*[:=\-]?\s*(?P<mention>[^|]+?)\s*$",
+    re.IGNORECASE,
+)
+
+_COMMON_MUMBAI_LOCALITIES = (
+    "Bandra East", "Bandra West", "Bandra", "Andheri East", "Andheri West",
+    "Santacruz East", "Santacruz West", "Santacruz", "Khar West", "Khar",
+    "BKC", "Lower Parel", "Worli", "Sion", "Goregaon East", "Goregaon West",
+    "Malad East", "Malad West", "Powai", "Chembur", "Dadar", "Prabhadevi",
+    "Pali Hill", "Kalina", "Juhu", "Lokhandwala",
+)
+
+# High-confidence WhatsApp locality forms seen in the audit sample. Normalize
+# these before the existing deterministic resolver runs; arbitrary place-like
+# text must remain ungrounded rather than becoming a market by guesswork.
+_SOURCE_LOCATION_ALIASES = (
+    ("s'cruz w", "Santacruz West"),
+    ("s'cruz west", "Santacruz West"),
+    ("santacruz w", "Santacruz West"),
+    ("santacruz west", "Santacruz West"),
+    ("khar w", "Khar West"),
+    ("khar west", "Khar West"),
+    ("bandra w", "Bandra West"),
+    ("bandra west", "Bandra West"),
+    ("kalanagar", "Bandra East"),
+)
+
+
+def _normalize_source_location_text(source_text: str) -> str:
+    # Keep this boundary parser deliberately literal.  Broker messages use
+    # punctuation as layout, not as a reliable grammar; regex replacement was
+    # dropping valid locality mentions next to headings and hyphens.
+    return unicodedata.normalize("NFKC", str(source_text or ""))
+
+
+def _source_line(line: str) -> str:
+    return str(line or "").translate(str.maketrans({"*": "", "_": "", "`": "", "~": ""})).strip(" -:•")
+
+
+def _source_words(value: str) -> list[str]:
+    cleaned = str(value or "").casefold().replace("'", "").replace("’", "")
+    return [word for word in "".join(ch if ch.isalnum() else " " for ch in cleaned).split() if word]
+
+
+def _known_locality_in_text(value: str) -> str | None:
+    # Check source aliases first: ``Bandra W`` must become ``Bandra West``
+    # before the shorter generic ``Bandra`` candidate can match.
+    choices = [alias for alias, _canonical in _SOURCE_LOCATION_ALIASES] + list(_COMMON_MUMBAI_LOCALITIES)
+    choices = sorted(set(choices), key=lambda item: len(_source_words(item)), reverse=True)
+    words = _source_words(value)
+    for choice in choices:
+        target = _source_words(choice)
+        width = len(target)
+        for index in range(max(0, len(words) - width + 1)):
+            if words[index:index + width] == target:
+                alias_canonical = next((canonical for alias, canonical in _SOURCE_LOCATION_ALIASES if alias.casefold() == choice.casefold()), None)
+                resolved = alias_canonical or choice
+                return "BKC" if resolved.casefold() == "bkc" else resolved
+    return None
+
+
+def _source_contextual_market(source_text: str) -> str | None:
+    """Return the longest known locality named in one source item."""
+    return _known_locality_in_text(_normalize_source_location_text(source_text))
+
+
+def _source_explicit_location(source_text: str) -> str | None:
+    """Return a locality explicitly labelled inside the current item slice.
+
+    Broadcast headings and the model's context can mention a wider market than
+    the individual property.  A labelled location in the contiguous source
+    block is stronger evidence and must not be replaced by that context.
+    """
+    normalized_source = _normalize_source_location_text(source_text)
+    labels = ("location", "locality", "micro market", "micro-market", "area location")
+    for line in normalized_source.splitlines():
+        cleaned = _source_line(line)
+        lowered = cleaned.casefold()
+        label = next((item for item in labels if lowered.startswith(item)), None)
+        if not label:
+            continue
+        remainder = cleaned[len(label):].lstrip(" :=-\t")
+        if remainder and not any(token in _source_words(remainder) for token in ("sq", "sqft", "sf")):
+            return " ".join(remainder.strip(" .;,|-_").split())
+    # Compact WhatsApp property blocks often use a standalone place line
+    # without a `Location:` label, for example `_Pali Naka Bandra_`.  Treat a
+    # line that deterministically resolves to one market as source evidence;
+    # otherwise the model can replace it with an unrelated parent/child guess.
+    try:
+        from location import infer_unique_micro_market
+        for line in normalized_source.splitlines():
+            cleaned = _source_line(line)
+            if not cleaned:
+                continue
+            # Inline forms such as “at Lower Parel” or “near BKC” often share
+            # a line with price/BHK fields. Only accept them with an explicit
+            # spatial/context marker (or a separator), keeping broad heading
+            # context out of the item boundary.
+            words = set(_source_words(cleaned))
+            if words.intersection({"at", "in", "near", "off", "opp", "opposite", "behind", "around", "location", "area"}) or "," in cleaned or "/" in cleaned:
+                contextual = _source_contextual_market(cleaned) or infer_unique_micro_market(cleaned)
+                if contextual:
+                    return contextual
+            # A numbered/labelled heading can combine the building and its
+            # locality with an em dash (for example, “IndiaBulls Blu – Worli”).
+            # Prefer the known locality token instead of returning the whole
+            # heading as the raw location.
+            if any(separator in cleaned for separator in (" - ", " – ", " — ")):
+                contextual = _source_contextual_market(cleaned)
+                if contextual:
+                    # Keep the raw mention's casing for the source-facing
+                    # field; canonicalization belongs to the resolved field.
+                    for locality in sorted(_COMMON_MUMBAI_LOCALITIES, key=len, reverse=True):
+                        if _known_locality_in_text(cleaned) == ("BKC" if locality.casefold() == "bkc" else locality):
+                            start = cleaned.casefold().find(locality.casefold())
+                            if start >= 0:
+                                return cleaned[start:start + len(locality)]
+                            return locality
+                    return contextual
+            if words.intersection({"rent", "sale", "bhk", "sq", "sqft", "carpet", "deposit", "furnished", "floor", "price", "rs"}) or "₹" in cleaned:
+                continue
+            if len(cleaned) <= 80 and infer_unique_micro_market(cleaned):
+                return cleaned
+    except Exception:
+        _logger.debug("unlabelled locality grounding skipped", exc_info=True)
+    return None
+
+
+def _ground_locality_to_source(ai: dict, source_text: str) -> dict:
+    """Keep locality inference inside the exact property evidence boundary.
+
+    The LLM may resolve a raw mention using broadcast-level context (for
+    example, returning Bandra West for a slice explicitly labelled Sanpada).
+    We still allow the LLM to infer a locality when no explicit source label
+    exists, but an explicit label always wins and cannot be overwritten by a
+    parent-market guess.
+    """
+    locality = ai.get("locality") if isinstance(ai.get("locality"), dict) else {}
+    explicit = _source_explicit_location(source_text)
+    if explicit:
+        if locality.get("raw_mention") != explicit or locality.get("resolved_locality") != explicit:
+            flags = list(ai.get("validation_flags") or [])
+            flags.append("locality_repaired_from_explicit_source_boundary")
+            ai["validation_flags"] = list(dict.fromkeys(flags))
+        locality = dict(locality)
+        locality["raw_mention"] = explicit
+        locality["resolved_locality"] = explicit
+        locality["confidence"] = max(_confidence_score(locality.get("confidence")), 0.9)
+        ai["locality"] = locality
+        ai["location_raw"] = explicit
+        ai["micro_market"] = explicit
+        return ai
+
+    # No explicit label: a model can mistake the listing's feature tail for a
+    # locality (for example, “Lift, Empty, @ 80k Rent, No CP, Rizvi, BANDRA”).
+    # If that happens, recover only a known locality that is actually present
+    # in this source slice; never keep the descriptive tail as a place name.
+    candidate = " ".join(
+        str(locality.get(key) or "") for key in ("raw_mention", "resolved_locality")
+    )
+    candidate_words = set(_source_words(candidate))
+    if candidate_words.intersection({"lift", "empty", "rent", "broker", "brokerage", "profile", "client", "need"}) or "no cp" in candidate.casefold():
+        repaired = _known_locality_in_text(_normalize_source_location_text(source_text))
+        if repaired:
+            flags = list(ai.get("validation_flags") or [])
+            flags.append("locality_repaired_from_feature_tail")
+            ai["validation_flags"] = list(dict.fromkeys(flags))
+            locality = dict(locality)
+            locality["raw_mention"] = repaired
+            locality["resolved_locality"] = repaired
+            locality["confidence"] = max(_confidence_score(locality.get("confidence")), 0.85)
+            ai["locality"] = locality
+            ai["location_raw"] = repaired
+            ai["micro_market"] = repaired
+            return ai
+
+    # Upgrade a broad model parent when the same property slice contains a
+    # unique, more specific locality signal (e.g. "Bandra" + "Pali Naka").
+    try:
+        from location import infer_unique_micro_market
+        contextual_market = infer_unique_micro_market(source_text)
+        current_market = str(locality.get("resolved_locality") or ai.get("micro_market") or "").strip().lower()
+        if contextual_market and current_market in {"bandra", "khar", "santacruz", "andheri"}:
+            locality = dict(locality)
+            locality["resolved_locality"] = contextual_market
+            locality["confidence"] = max(_confidence_score(locality.get("confidence")), 0.9)
+            ai["locality"] = locality
+            ai["micro_market"] = contextual_market
+    except Exception:
+        _logger.debug("contextual locality upgrade failed", exc_info=True)
+
+    # Otherwise retain the model's raw mention and resolution. This is the
+    # intended AI inference path, with no unrelated heading injected.
+    return ai
+
+
+def _rescue_core_fields(parsed: dict, source_text: str) -> dict:
+    """Recover only explicit core values the model omitted.
+
+    This is intentionally conservative. It improves common broker shorthand
+    but never invents values for media-only placeholders or ambiguous numbers.
+    """
+    source = str(source_text or "")
+    multi = _MULTI_UNIT_BHK_RE.search(source)
+    if multi:
+        parsed["listing_count"] = int(multi.group("count"))
+        parsed["bhk"] = f"{_safe_float(multi.group('bhk')):g} BHK"
+    else:
+        parsed["listing_count"] = None
+        if not parsed.get("bhk"):
+            match = _CORE_BHK_RE.search(source)
+            if match:
+                value = float(match.group(1))
+                parsed["bhk"] = "1 RK" if value == 0.5 else f"{int(value) if value.is_integer() else value:g} BHK"
+    if parsed.get("area_sqft") is None:
+        match = _CORE_AREA_RE.search(source)
+        if match:
+            parsed["area_sqft"] = _safe_float(match.group(1) or match.group(2))
+    price_value = parsed.get("price")
+    if isinstance(price_value, dict):
+        price_value = price_value.get("amount")
+    if price_value is None:
+        psf = _PRICE_PER_SQFT_RE.search(source)
+        match = None
+        if psf:
+            parsed["price"] = _safe_float(psf.group("rate").replace(",", ""))
+            parsed["price_unit"] = "per_sqft"
+        else:
+            match = _CORE_PRICE_RE.search(source)
+        if not psf and match:
+            raw_price = match.group(0)
+            parsed["price"] = _parse_raw_price_to_abs(raw_price)
+            parsed["price_unit"] = "abs" if parsed.get("price") is not None else parsed.get("price_unit")
+        elif re.search(r"(?:₹|rs\.?|inr)\s*\d[\d,]*(?:\.\d+)?", source, re.IGNORECASE):
+            plain = re.search(r"(?:₹|rs\.?|inr)\s*(\d[\d,]*(?:\.\d+)?)", source, re.IGNORECASE)
+            if plain:
+                parsed["price"] = _safe_float(plain.group(1).replace(",", ""))
+                parsed["price_unit"] = "abs" if parsed.get("price") is not None else parsed.get("price_unit")
+        elif re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:per\s*month|monthly|/\s*month|rent)\b", source, re.IGNORECASE):
+            plain = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(?:per\s*month|monthly|/\s*month|rent)\b", source, re.IGNORECASE)
+            if plain:
+                parsed["price"] = _safe_float(plain.group(1).replace(",", ""))
+                parsed["price_unit"] = "abs" if parsed.get("price") is not None else parsed.get("price_unit")
+    price_value = parsed.get("price")
+    if isinstance(price_value, dict):
+        price_value = price_value.get("amount")
+    if price_value is not None and parsed.get("price_unit") != "per_sqft":
+        if parsed.get("intent") == "RENT":
+            parsed["monthly_rent"] = price_value
+        elif parsed.get("intent") == "SELL":
+            parsed["total_asking_price"] = price_value
+    building = parsed.get("building_name")
+    if isinstance(building, str) and building.strip().casefold() in {"[document]", "[image]", "[video]", "[voice message]", "[sticker]"}:
+        parsed["building_name"] = None
+    if not parsed.get("building_name") and source.strip().casefold() not in {"[document]", "[image]", "[video]", "[voice message]", "[sticker]"}:
+        parsed["building_name"] = _infer_building_name_from_source(source, parsed.get("micro_market"))
+    return parsed
+
+
+def _title_evidence_mismatch(
+    title: object,
+    source_text: object,
+    building_name: object = None,
+    parsed: dict | None = None,
+) -> bool:
+    """Detect a title name that cannot be traced to the source message.
+
+    This is deliberately a flag, not a rewrite. Titles are model-generated
+    presentation text, while the source message is the evidence boundary.
+    Keep generic titles such as ``3 BHK for rent in Bandra West`` valid, but
+    quarantine named, numeric, or transaction-direction claims that cannot be
+    supported by the source/structured row.
+    """
+    title_text = str(title or "").strip()
+    source = str(source_text or "").strip()
+    if not title_text or not source:
+        return False
+
+    def compact(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    source_compact = compact(source)
+    if building_name:
+        building_compact = compact(building_name)
+        if building_compact and building_compact not in source_compact:
+            return True
+
+    # A title is a presentation layer, but its quoted amount and transaction
+    # direction must still agree with the structured row it represents.  Do
+    # not reject a title when the row has no authoritative amount; there is
+    # then nothing safe to compare it against.
+    parsed = parsed if isinstance(parsed, dict) else {}
+    title_amounts = []
+    for amount_match in re.finditer(
+        r"(?i)(?:₹|rs\.?\s*|inr\s*)([\d,]+(?:\.\d+)?)\s*"
+        r"(cr(?:ore|ores)?|lac(?:s)?|lakh(?:s)?|l|k|thousand(?:s)?)?\b",
+        title_text,
+    ):
+        raw_amount = amount_match.group(1).replace(",", "")
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            continue
+        unit = (amount_match.group(2) or "").casefold().rstrip("s")
+        multiplier = {
+            "cr": 10_000_000,
+            "crore": 10_000_000,
+            "lac": 100_000,
+            "lakh": 100_000,
+            "l": 100_000,
+            "k": 1_000,
+            "thousand": 1_000,
+        }.get(unit, 1)
+        title_amounts.append(amount * multiplier)
+
+    if title_amounts:
+        tx = str(parsed.get("transaction_type") or parsed.get("intent") or "").casefold()
+        is_requirement = (
+            str(parsed.get("message_type") or parsed.get("listing_type") or "").casefold()
+            in {"requirement", "demand"}
+            or str(parsed.get("intent") or "").casefold()
+            in {"buy", "buyer", "requirement", "rental_seeker", "tenant", "demand", "wanted"}
+        )
+        if is_requirement:
+            actual_candidates = [parsed.get("budget_max"), parsed.get("budget_min")]
+        elif tx in {"rent", "lease", "rental", "rental_seeker"}:
+            actual_candidates = [parsed.get("monthly_rent")]
+        elif tx in {"sale", "sell", "buy", "buyer"}:
+            actual_candidates = [parsed.get("total_asking_price")]
+        else:
+            actual_candidates = [parsed.get("budget_max"), parsed.get("total_asking_price"), parsed.get("monthly_rent")]
+        actual_amounts = []
+        for value in actual_candidates:
+            amount = _safe_float(value)
+            if amount is not None and amount > 0:
+                actual_amounts.append(amount)
+        if actual_amounts:
+            def close_enough(left: float, right: float) -> bool:
+                return abs(left - right) <= max(50_000.0, right * 0.05)
+            if not all(any(close_enough(title_amount, actual) for actual in actual_amounts) for title_amount in title_amounts):
+                return True
+
+    title_has_sale = bool(re.search(r"\b(?:sale|sell|selling|resale|buy|buying)\b", title_text, re.IGNORECASE))
+    title_has_rent = bool(re.search(r"\b(?:rent|rental|lease|leased|leasing)\b", title_text, re.IGNORECASE))
+    tx = str(parsed.get("transaction_type") or parsed.get("intent") or "").casefold()
+    actual_is_rent = tx in {"rent", "lease", "rental", "rental_seeker"}
+    actual_is_sale = tx in {"sale", "sell", "buy", "buyer"}
+    if (title_has_sale and actual_is_rent) or (title_has_rent and actual_is_sale):
+        return True
+
+    # A named title normally puts the building before an em dash, pipe, or
+    # explicit property qualifier. Only inspect a multi-token lead phrase so
+    # ordinary titles beginning with "Office" or "3 BHK" are not rejected.
+    lead = re.split(r"\s*(?:—|–|\||:\s+|\s+-\s+)\s*", title_text, maxsplit=1)[0]
+    lead = re.sub(
+        r"(?i)^(?:\d+(?:\.\d+)?\s*(?:bhk|rk)\b|office|shop|showroom|commercial\s+space|property)\s+",
+        "",
+        lead,
+    ).strip(" -:,|")
+    lead_tokens = re.findall(r"[a-z0-9]+", lead.casefold())
+    if len(lead_tokens) < 2:
+        return False
+    if all(token in {"for", "rent", "sale", "lease", "in", "at", "on", "office", "space", "property", "commercial"} for token in lead_tokens):
+        return False
+    lead_compact = compact(lead)
+    return bool(lead_compact and lead_compact not in source_compact)
+
+
+def _source_grounded_title(ai_extraction: dict, parsed: dict, source_text: str) -> str | None:
+    """Choose a useful title without allowing generic or stale model text."""
+    # `public_seo_title` is the model's deliberate public title. Fall back to
+    # the compatibility `title` field for historical payloads.
+    candidate = None
+    if isinstance(ai_extraction, dict):
+        candidate = ai_extraction.get("public_seo_title") or ai_extraction.get("title")
+    if re.match(
+        r"(?i)^\s*property\s+with\s+\d[\d,.]*\s*(?:sq\.?\s*ft|sqft|sft)\b",
+        str(candidate or ""),
+    ):
+        candidate = None
+    # In broker shorthand, ``Villa Capri`` / ``Devansh Villa`` is the
+    # building name. Do not let the word ``Villa`` survive as an unsupported
+    # property-type claim in the public title; the deterministic fallback will
+    # retain the building name and use the neutral "property" label.
+    building_for_title = str(parsed.get("building_name") or "").strip()
+    if building_for_title and re.search(r"\bvilla\b", building_for_title, re.IGNORECASE) and candidate:
+        title_without_building = re.sub(re.escape(building_for_title), "", str(candidate), flags=re.IGNORECASE)
+        if re.search(r"\bvilla\b", title_without_building, re.IGNORECASE):
+            candidate = None
+    furnishing = str(
+        parsed.get("furnishing") or parsed.get("furnishing_canonical") or ""
+    ).strip().casefold().replace("_", " ")
+    furnishing = re.sub(r"\s+", " ", furnishing)
+    if furnishing in {"none", "null", "n/a", "na", "not specified", "unknown"}:
+        furnishing = ""
+    furnishing_missing_from_candidate = bool(
+        furnishing
+        and furnishing not in {"furnished", "fully furnished", "semi furnished", "semi-furnished", "unfurnished"}
+        and not re.search(r"\b(?:fully\s+furnished|semi[- ]furnished|unfurnished|furnished)\b", str(candidate or ""), re.I)
+    )
+    if furnishing in {"fully furnished", "semi furnished", "semi-furnished", "unfurnished"}:
+        furnishing_missing_from_candidate = not bool(
+            re.search(r"\b(?:fully\s+furnished|semi[- ]furnished|unfurnished|furnished)\b", str(candidate or ""), re.I)
+        )
+    flags = set((ai_extraction or {}).get("validation_flags") or [])
+    model_price = (ai_extraction or {}).get("price")
+    model_period = model_price.get("period") if isinstance(model_price, dict) else None
+    title_text = str(candidate or "")
+    title_monthly = bool(re.search(r"(?:/\s*month|per\s+month|monthly)", title_text, re.IGNORECASE))
+    title_one_time = bool(re.search(r"\bone[- ]?time\b|lump\s*sum", title_text, re.IGNORECASE))
+    # A title must not contradict the structured price period. Let the
+    # source-grounded fallback regenerate it from the reconciled fields.
+    if (model_period == "per_month" and title_one_time) or (model_period == "one_time" and title_monthly):
+        candidate = None
+    # A commercial listing's opening inventory phrase is authoritative for
+    # the title.  Suitability copy later in the message commonly contains
+    # words such as “studio”, which must not relabel a shop as a studio.
+    primary_match = re.search(
+        r"(?im)^\s*[*_\-•]*\s*(shop|showroom|office|warehouse|godown|restaurant|cafe|retail\s+space|commercial\s+space)\b"
+        r"|\b(shop|showroom|office)\s+\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|sft|square\s+feet)\b",
+        source_text or "",
+    )
+    primary_type = ""
+    if primary_match:
+        primary_type = next((group for group in primary_match.groups() if group), "").casefold()
+    candidate_conflicts_with_primary = bool(
+        primary_type
+        and primary_type in {"shop", "showroom", "office"}
+        and re.search(r"\bstudio\b", str(candidate or ""), re.IGNORECASE)
+    )
+    is_residential_asset = str(parsed.get("asset_type") or parsed.get("property_category") or "").strip().casefold() in {
+        "residential", "residential property", "residential real estate",
+    }
+    candidate_conflicts_with_residential_bhk = bool(
+        is_residential_asset
+        and re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk|bed(?:room)?s?)\b", source_text or "", re.IGNORECASE)
+        and not re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk|bed(?:room)?s?)\b", str(candidate or ""), re.IGNORECASE)
+    )
+    # A model title can collapse "4 2BHK" into one arbitrary unit. Force the
+    # deterministic source-grounded title for explicit multi-unit messages.
+    if _MULTI_UNIT_BHK_RE.search(source_text or ""):
+        candidate = None
+    if (
+        _is_usable_extraction_title(candidate)
+        and "title_evidence_mismatch" not in flags
+        and not _title_evidence_mismatch(candidate, source_text, parsed.get("building_name"), parsed)
+        and not candidate_conflicts_with_primary
+        and not candidate_conflicts_with_residential_bhk
+        and not furnishing_missing_from_candidate
+    ):
+        return re.sub(r"\s+", " ", str(candidate)).strip()
+
+    # A specific AI title that fails source validation is still the best
+    # extraction truth available.  Preserve it for review instead of silently
+    # replacing it with a weaker deterministic label assembled from partial
+    # fields (for example, bare "For Sale").  Generic/placeholder titles may
+    # still use the deterministic presentation fallback below.
+    if (
+        _is_usable_extraction_title(candidate)
+        and str(candidate).strip().casefold() not in {
+            "sale", "rent", "lease", "for sale", "for rent", "property for sale", "property for rent",
+        }
+        and not candidate_conflicts_with_primary
+        and not candidate_conflicts_with_residential_bhk
+        and not furnishing_missing_from_candidate
+    ):
+        return re.sub(r"\s+", " ", str(candidate)).strip()
+
+    # The deterministic title uses only fields rescued from this source
+    # slice.  It is the fallback for generic AI titles and copied titles.
+    try:
+        from routers.infra import generate_summary_title
+        deterministic = generate_summary_title(parsed, source_text)
+    except Exception:
+        deterministic = None
+    if _is_usable_extraction_title(deterministic):
+        return deterministic
+    return None
+
+
+# ── Building name normalization against known buildings ────────────
+# The LLM often extracts ad text, locality names, or broker phrases as
+# building_name.  We fuzzy-match against the canonical building names
+# and aliases already in the DB to normalize to the correct name.
+
+_BUILDING_DICT: dict | None = None  # {normalized_name: canonical_name}
+
+
+def _load_building_dict() -> dict:
+    """Load buildings + aliases into a fuzzy-matchable dict.
+
+    Returns {normalized_name: canonical_name} for all known buildings
+    and their aliases.  Cached for the lifetime of the worker.
+    """
+    global _BUILDING_DICT
+    if _BUILDING_DICT is not None:
+        return _BUILDING_DICT
+
+    try:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        if not url or not key:
+            _BUILDING_DICT = {}
+            return _BUILDING_DICT
+
+        # Use PropAI's REST client.  The worker image intentionally does not
+        # depend on supabase-py, and a top-level ``supabase`` import can also
+        # resolve to an unrelated namespace in slim deployments.
+        client = SupabaseStorage(url, key).client
+
+        # Load canonical names
+        resp = client.table("buildings").select("canonical_name").execute()
+        rows = resp.data or []
+
+        # Load aliases
+        alias_resp = client.table("building_name_aliases").select("alias,canonical_name").execute()
+        alias_rows = alias_resp.data or []
+
+        d: dict[str, str] = {}
+        for r in rows:
+            cn = (r.get("canonical_name") or "").strip()
+            if len(cn) >= 3:
+                d[normalize_building_name(cn)] = cn
+        for r in alias_rows:
+            alias = (r.get("alias") or "").strip()
+            cn = (r.get("canonical_name") or "").strip()
+            if len(alias) >= 3 and len(cn) >= 3:
+                d[normalize_building_name(alias)] = cn
+
+        _BUILDING_DICT = d
+        _logger.info("Loaded %d normalized building name entries", len(d))
+    except Exception as exc:
+        _logger.warning("Failed to load building dict: %s", exc)
+        _BUILDING_DICT = {}
+
+    return _BUILDING_DICT
+
+
+def _normalize_building_to_canonical(name: str) -> str | None:
+    """Match an extracted building name against known buildings.
+
+    Returns the canonical name if a close match is found (>=0.80 score),
+    or the original name unchanged if no match — never silently drops it.
+    """
+    if not name or len(name.strip()) < 3:
+        return name
+
+    bdict = _load_building_dict()
+    if not bdict:
+        return name
+
+    norm = normalize_building_name(name)
+
+    # 1. Exact match after normalization
+    if norm in bdict:
+        return bdict[norm]
+
+    # 2. Fuzzy match against all known names
+    best_canonical = None
+    best_score = 0.0
+    for norm_cn, canonical in bdict.items():
+        score = fuzzy_score(name, canonical)
+        # Speech/transcription errors can split or alter a word boundary:
+        # "Metro Police" is a common noisy rendering of "Metropolis". The
+        # regular token score penalizes that too heavily, so use compact
+        # alphanumeric similarity only for genuinely substantial names and
+        # only when it independently clears a high bar.
+        compact_name = re.sub(r"[^a-z0-9]", "", norm)
+        compact_canonical = re.sub(r"[^a-z0-9]", "", norm_cn)
+        if min(len(compact_name), len(compact_canonical)) >= 8:
+            compact_score = SequenceMatcher(None, compact_name, compact_canonical).ratio()
+            if compact_score >= 0.84:
+                score = max(score, compact_score)
+        if score > best_score:
+            best_score = score
+            best_canonical = canonical
+
+    if best_score >= 0.80 and best_canonical:
+        _logger.debug(
+            "Building name normalized: %r -> %r (score %.2f)",
+            name, best_canonical, best_score,
+        )
+        return best_canonical
+
+    # 3. No good match — return original unchanged
+    return name
+
+
+def _message_hash(text: str) -> str:
+    # Content-addressed cache key: the raw message body is the input identity.
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _sender_template_key(sender_phone: str = "", sender_jid: str = "") -> str:
+    phone = re.sub(r"\D+", "", sender_phone or "")
+    if phone:
+        if len(phone) >= 12 and phone.startswith("91"):
+            phone = phone[-10:]
+        if len(phone) >= 10:
+            return f"phone:{phone[-10:]}"
+    jid = (sender_jid or "").strip()
+    if jid:
+        return f"jid:{jid}"
+    return ""
+
+
+def _clone_parsed_rows(storage, source_raw_id: int, target_raw_id: int) -> tuple[list[int], list[int], list[int]]:
+    """Copy typed extraction rows for a duplicate raw message."""
+    try:
+        rows = storage._fetch_typed_rows(
+            raw_message_id=source_raw_id, requirements=None, limit_per_table=1000
+        )
+    except Exception:
+        return [], [], []
+    if not rows:
+        return [], [], []
+
+    parsed_ids: list[int] = []
+    listing_ids: list[int] = []
+    requirement_ids: list[int] = []
+    for row in rows:
+        payload = dict(row)
+        table_name = payload.pop("_typed_table", "")
+        if not table_name:
+            continue
+        payload.pop("id", None)
+        payload.pop("created_at", None)
+        payload.pop("updated_at", None)
+        payload["raw_message_id"] = target_raw_id
+        source_fp = hashlib.sha256(
+            f"typed-observation:{target_raw_id}:{payload.get('listing_index') or 0}".encode()
+        ).hexdigest()[:32]
+        payload["source_fingerprint"] = source_fp
+        try:
+            new_id = storage.save_typed_listing(
+                table_name, payload, _already_filtered=True, _source_id=target_raw_id
+            )
+            if new_id:
+                parsed_ids.append(new_id)
+                if table_name.endswith("_requirements"):
+                    requirement_ids.append(new_id)
+                else:
+                    listing_ids.append(new_id)
+        except Exception as exc:
+            print(f"  [extract] duplicate typed extraction clone error for {target_raw_id}: {exc}", flush=True)
+    return parsed_ids, listing_ids, requirement_ids
+
+
+def preview_source_boundaries(
+    msg_text: str,
+    tenant_id: str | None = None,
+    raw_id: int | None = None,
+) -> tuple[str, list[dict]]:
+    """Preview LLM-only source boundaries for admin repair tooling."""
+    try:
+        from ai_extraction import llm_segment_message
+        llm_slices = llm_segment_message(msg_text, {
+            "raw_id": raw_id,
+            "tenant_id": tenant_id,
+        })
+    except Exception as exc:
+        _logger.warning("LLM boundary segmentation failed: %s", exc)
+        llm_slices = []
+    if len(llm_slices) < 2:
+        return "llm_full_block", []
+    return "llm_source_boundary", [
+        {
+            "normalized_message": slice_text,
+            "raw_payload": {"full_text": slice_text, "slice_text": slice_text},
+        }
+        for slice_text in llm_slices
+    ]
+
+
+def _run_template_splitter(
+    storage,
+    msg_text: str,
+    *,
+    raw_id: int | None = None,
+    tenant_id: str | None,
+    sender_phone: str = "",
+    sender_jid: str = "",
+) -> tuple[str | None, list[dict]]:
+    """Use the LLM only for uncertain source boundaries.
+
+    Returned chunks contain verbatim source text only. They are materialized as
+    child evidence and sent through ``process_raw_message`` again, so no
+    deterministic semantic parser can create a typed extraction row.
+    """
+    sender_key = _sender_template_key(sender_phone, sender_jid)
+    selected_pattern, parsed = preview_source_boundaries(msg_text, tenant_id, raw_id=raw_id)
+    if len(parsed) >= 2:
+        if sender_key:
+            try:
+                storage.upsert_sender_splitter_cache(
+                    sender_key=sender_key, pattern_id=selected_pattern,
+                    tenant_id=tenant_id, sender_phone=sender_phone,
+                    sender_jid=sender_jid, message_hash=_message_hash(msg_text),
+                    revalidated=True,
+                )
+            except Exception:
+                pass
+        return selected_pattern, parsed
+
+    # Do not fall back to regex/template splitting.  An uncertain boundary is
+    # safer as one complete source document: the normal AI extraction pass can
+    # return multiple item-scoped extractions while retaining broker context.
+    return "llm_full_block", []
+
+
+def _deterministic_numbered_broadcast_slices(msg_text: str) -> tuple[str | None, list[dict]]:
+    """Split a strongly numbered property broadcast before calling the model."""
+    source = str(msg_text or "").strip()
+    starts = list(_NUMBERED_BROADCAST_START_RE.finditer(source))
+    if len(starts) < 2:
+        return None, []
+
+    shared_prefix = source[:starts[0].start()].strip()
+    first_requirement = re.search(
+        r"(?im)^\s*(?:wanted|looking\s+for|need(?:ed)?|required)\b[^\n]*",
+        shared_prefix,
+    )
+    mixed_requirement = bool(first_requirement and re.search(
+        r"(?i)\b(?:budget|market\s+price|bandra|khar|santacruz|bkc|rent|sale|lease|office|shop|flat|duplex)\b",
+        shared_prefix[first_requirement.start():],
+    ))
+    chunks: list[dict] = []
+    blocks: list[str] = []
+    if mixed_requirement:
+        blocks.append(shared_prefix[first_requirement.start():].strip())
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(source)
+        blocks.append(source[match.start():end].strip())
+    for block in blocks:
+        if not block or not _NUMBERED_BROADCAST_PRICE_RE.search(block):
+            if not (mixed_requirement and re.search(r"(?i)\b(?:wanted|looking\s+for|need(?:ed)?|required)\b", block)):
+                return None, []
+        chunks.append({
+            "normalized_message": block,
+            "raw_payload": {"full_text": block, "slice_text": block},
+        })
+    if mixed_requirement:
+        return "deterministic:requirement_blocks", chunks
+
+    if shared_prefix and len(shared_prefix) <= 180 and re.search(
+        r"(?i)\b(?:available|rent|sale|lease|inventory|listing|property)\b",
+        shared_prefix,
+    ):
+        for chunk in chunks:
+            text = f"{shared_prefix}\n{chunk['normalized_message']}"
+            chunk["normalized_message"] = text
+            chunk["raw_payload"] = {"full_text": text, "slice_text": text}
+    return "deterministic:numbered", chunks
+
+
+_NAMED_BROADCAST_HEADING_RE = re.compile(
+    r"(?im)^\s*[A-Z0-9][A-Z0-9 .&'/()-]{1,70}\s+[—–-]\s+[A-Z][A-Z .'/()-]{1,50}\s*$"
+)
+
+
+def _deterministic_named_broadcast_slices(msg_text: str) -> tuple[str | None, list[dict]]:
+    """Split uppercase ``PROJECT — LOCALITY`` broker broadcasts safely."""
+    source = str(msg_text or "").strip()
+    starts = list(_NAMED_BROADCAST_HEADING_RE.finditer(source))
+    if len(starts) < 2:
+        return None, []
+    chunks: list[dict] = []
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(source)
+        block = source[match.start():end].strip()
+        if not re.search(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b", block, re.I):
+            return None, []
+        if not re.search(
+            r"(?:₹|rs\.?\s*\d|\b\d[\d,.]*\s*(?:cr|crore|lac|lakh|k)\b|per\s*sq\.?\s*ft)",
+            block,
+            re.I,
+        ):
+            return None, []
+        chunks.append({
+            "normalized_message": block,
+            "raw_payload": {"full_text": block, "slice_text": block},
+        })
+    return "deterministic:named_project", chunks
+
+
+def _materialize_split_raw_messages(storage, parent_raw_id: int, ctx: dict, chunks: list[dict]) -> list[int]:
+    """Persist LLM-selected broadcast chunks as child raw evidence rows.
+
+    The parent stays as the immutable WhatsApp event. Children are the units
+    sent through extraction, so each parsed item has one raw source slice and
+    broker identity never needs to be rediscovered by the LLM.
+    """
+    if not parent_raw_id or len(chunks) < 2 or ctx.get("parent_message_id"):
+        return []
+    parent_uid = str(ctx.get("message_uid") or parent_raw_id)
+    parent_payload = ctx.get("raw_payload")
+    if not isinstance(parent_payload, dict):
+        parent_payload = {
+            "data": {
+                "key": {
+                    "id": ctx.get("message_id") or "",
+                    "remoteJid": ctx.get("group") or "",
+                    "participant": ctx.get("sender_jid") or "",
+                },
+                "pushName": ctx.get("push_name") or "",
+                "sender": {
+                    "id": ctx.get("sender_jid") or "",
+                    "name": ctx.get("sender_name") or "",
+                },
+            }
+        }
+    child_ids: list[int] = []
+    for index, parsed in enumerate(chunks, start=1):
+        payload = json.loads(json.dumps(parent_payload))
+        slice_text = ""
+        raw_payload = parsed.get("raw_payload") if isinstance(parsed, dict) else None
+        if isinstance(raw_payload, dict):
+            slice_text = str(raw_payload.get("full_text") or raw_payload.get("slice_text") or "").strip()
+        if not slice_text:
+            slice_text = str(parsed.get("normalized_message") or "").strip()
+        if not slice_text:
+            continue
+        payload["split"] = {
+            "parent_message_id": parent_raw_id,
+            "split_index": index,
+            "pattern_id": ctx.get("split_pattern") or "",
+            "slice_text": slice_text,
+        }
+        child_uid = f"{parent_uid}:split:{index}"
+        try:
+            get_raw_by_uid = getattr(storage, "get_raw_by_uid", None)
+            existing = (
+                get_raw_by_uid(child_uid, tenant_id=ctx.get("tenant_id"))
+                if callable(get_raw_by_uid)
+                else None
+            )
+            if existing:
+                child_ids.append(int(existing.id))
+                continue
+            child = RawMessage(
+                group_name=ctx.get("group_name") or "",
+                sender=ctx.get("sender_name") or "",
+                sender_jid=ctx.get("sender_jid") or "",
+                sender_phone=ctx.get("sender_phone") or "",
+                message=slice_text,
+                message_type="text",
+                attachments="[]",
+                reply_context="{}",
+                timestamp=ctx.get("timestamp") or "",
+                source=ctx.get("source") or "WHATSAPP",
+                raw_payload=json.dumps(payload),
+                message_uid=child_uid,
+                pipeline_version=ctx.get("pipeline_version"),
+                synced_at=ctx.get("synced_at"),
+                event_id=ctx.get("event_id") or ctx.get("message_id") or "",
+                is_group=bool(ctx.get("is_group", not ctx.get("is_dm"))),
+                processed=False,
+                tenant_id=ctx.get("tenant_id") or None,
+                parent_message_id=parent_raw_id,
+                split_index=index,
+            )
+            child_id = storage.save_raw_message(child)
+            if child_id:
+                child_ids.append(int(child_id))
+        except Exception as exc:
+            _logger.warning("raw_id=%s split child %s failed: %s", parent_raw_id, index, exc)
+    return child_ids
+
+
+def _sanitize_parsed_listing(parsed: dict) -> dict:
+    cleaned = {key: _sanitize_parsed_value(value) for key, value in parsed.items()}
+
+    # Multi-listing parsers historically used ``floor`` or
+    # ``floor_description`` while parsed_output stores ``floor_range``. Keep
+    # one canonical save key for residential and commercial observations so a
+    # reviewed split cannot lose the option that made it a separate card.
+    if not cleaned.get("floor_range"):
+        cleaned["floor_range"] = (
+            cleaned.get("floor_description") or cleaned.get("floor")
+        )
+
+    # A project heading is the building identity for Market Inbox purposes.
+    # Tower/wing remain evidence metadata; they must never be promoted to a
+    # locality or allowed to replace an explicit sibling building.
+    if not cleaned.get("building_name") and cleaned.get("project_name"):
+        cleaned["building_name"] = cleaned["project_name"]
+
+    payload = cleaned.get("raw_payload")
+    if isinstance(payload, dict):
+        hierarchy = {
+            key: cleaned.get(key)
+            for key in ("project_name", "tower_name", "wing_name")
+            if cleaned.get(key)
+        }
+        if hierarchy:
+            payload = dict(payload)
+            payload.setdefault("hierarchy", {}).update(hierarchy)
+            cleaned["raw_payload"] = payload
+
+    return cleaned
+
+
+# Defence-in-depth validators for AI-only fields (deal_tags, additional_charges).
+# ai_extract() already runs _normalize_extraction in ai_extraction.py, but if
+# any code path bypasses that (mocked in tests, future schema migration, raw
+# LLM output without normalization), the row should still be safe to save.
+_VALID_DEAL_TAGS_STORAGE = frozenset({
+    "distress_sale", "urgent_sale", "negotiable", "bank_auction",
+    "resale", "exclusive_mandate", "price_drop", "brand_new_building",
+})
+_VALID_CHARGE_TYPES_STORAGE = frozenset({"fixed", "percent_of_price"})
+
+
+def _safe_deal_tags(raw) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        key = t.strip().lower()
+        if key and key in _VALID_DEAL_TAGS_STORAGE:
+            out.append(key)
+    return out
+
+
+def _safe_additional_charges(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        label = c.get("label")
+        amount = c.get("amount")
+        amount_type = c.get("amount_type")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        if not isinstance(amount_type, str) or amount_type.strip().lower() not in _VALID_CHARGE_TYPES_STORAGE:
+            continue
+        try:
+            amount_f = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if not (amount_f == amount_f):  # NaN check
+            continue
+        out.append({"label": label.strip(), "amount": amount_f, "amount_type": amount_type.strip().lower()})
+    return out
+
+
+_VALID_BROKER_NOTE_CATEGORIES_STORAGE = frozenset({
+    "negotiation", "legal", "charges", "access", "media", "utility",
+    "tenant_rule", "building", "unit", "brokerage", "other",
+})
+
+
+def _safe_broker_notes(raw) -> list[dict]:
+    """Keep explicit broker notes bounded and source-grounded at persistence."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for note in raw:
+        if not isinstance(note, dict):
+            continue
+        category = str(note.get("category") or "other").strip().lower()
+        if category not in _VALID_BROKER_NOTE_CATEGORIES_STORAGE:
+            category = "other"
+        text = str(note.get("text") or "").strip()
+        source_text = str(note.get("source_text") or text).strip()
+        if not text or not source_text:
+            continue
+        key = (category, text.casefold(), source_text.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "category": category,
+            "text": text[:1000],
+            "source_text": source_text[:1000],
+        })
+        if len(out) >= 32:
+            break
+    return out
+
+
+def _preserve_terrace_fact(ai: dict, source_text: str, row: dict) -> None:
+    """Keep an explicit terrace mention when the provider misses the typed value.
+
+    Terrace already has typed columns, so a model omission must not turn an
+    explicit source fact into invisible raw evidence. The source line is kept
+    as an unstructured fact as well, preserving wording for broker review.
+    """
+    source = str(source_text or "")
+    if not re.search(r"\bterrace\b", source, re.IGNORECASE):
+        return
+    if any(row.get(field) not in (None, "", []) for field in (
+        "terrace_area_sqft", "covered_terrace_area_sqft", "terrace_area_raw_text",
+    )):
+        return
+    line = next((line.strip() for line in source.splitlines() if re.search(r"\bterrace\b", line, re.IGNORECASE)), "")
+    if not line:
+        return
+    row["terrace_area_raw_text"] = line
+    facts = row.get("unstructured_facts") if isinstance(row.get("unstructured_facts"), dict) else {}
+    facts = dict(facts)
+    facts.setdefault("terrace", line)
+    row["unstructured_facts"] = facts
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("amount", "value", "price"):
+            coerced = _safe_float(value.get(key))
+            if coerced is not None:
+                return coerced
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _safe_float(item)
+            if coerced is not None:
+                return coerced
+        return None
+    text = str(value).strip().replace(",", "")
+    if re.search(r"\.{2,}", text):
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _confidence_score(value) -> float:
+    """Normalize model confidence labels and numeric scores for persistence."""
+    if isinstance(value, str):
+        label = value.strip().lower()
+        if label in {"low", "weak", "poor"}:
+            return 0.35
+        if label in {"medium", "moderate", "mid"}:
+            return 0.65
+        if label in {"high", "strong", "good"}:
+            return 0.9
+    numeric = _safe_float(value)
+    return max(0.0, min(1.0, numeric if numeric is not None else 0.0))
+
+
+def _safe_int(value) -> int | None:
+    coerced = _safe_float(value)
+    return int(coerced) if coerced is not None else None
+
+
+import re as _re
+
+_UNIT_TO_ABS = {
+    "cr": 10_000_000, "crore": 10_000_000,
+    "lac": 100_000, "lakh": 100_000, "l": 100_000,
+    "k": 1_000, "thousand": 1_000,
+}
+
+def _parse_raw_price_to_abs(raw_price_text: str) -> float | None:
+    """Best-effort parse of raw_price_text into absolute rupees.
+
+    Returns None if the text is unparseable.  Used to cross-check the AI
+    extraction amount which sometimes returns 10x/100x the correct value.
+    """
+    explicit = parse_explicit_price(raw_price_text)
+    if explicit:
+        amount, unit = explicit
+        return canonical_price_rupees(amount, unit)
+    if not raw_price_text:
+        return None
+    # Brokers commonly write prices as `1.15.Cr`, `75.Lakh`, or
+    # `₹2.80 to 3.35 Crore`.  The old expression stopped at the decimal
+    # punctuation and therefore could validate the AI value against `1.15`
+    # rupees instead of 1.15 crore.
+    m = _re.search(
+        r"([\d,]+(?:(?:\.\d+)|(?::\d+)|(?:['’]\d+))?)\s*[.\-/]*\s*"
+        r'(cr|crores?|crore|lac?s?|lakhs?|l|k|thousands?|thousand)\b',
+        raw_price_text.lower(),
+    )
+    if not m:
+        return None
+    try:
+        amount = float(
+            m.group(1)
+            .replace(",", "")
+            .replace(":", ".")
+            .replace("'", ".")
+            .replace("’", ".")
+        )
+    except ValueError:
+        return None
+    unit = (m.group(2) or "").rstrip("s")
+    multiplier = _UNIT_TO_ABS.get(unit, 1)
+    return amount * multiplier
+
+
+def _parse_raw_price_native(raw_price_text: str) -> tuple[float, str] | None:
+    """Return the first explicitly stated broker price in its native unit.
+
+    This is deliberately source-grounded.  The model is asked for absolute
+    rupees, but persisted inbox values use native units (Cr/Lac/K).  If the
+    source contains an explicit unit, it is safer to use that source value
+    than to trust a model conversion which can be off by 10x/1000x.
+    """
+    if not raw_price_text:
+        return None
+    m = _re.search(
+        r"([\d,]+(?:[.:'’]\d+)?)\s*[.:/\-]*\s*"
+        r'(cr|crores?|crore|lac?s?|lakhs?|l|k|thousands?|thousand)\b',
+        raw_price_text.lower(),
+    )
+    if not m:
+        return None
+    try:
+        amount = float(
+            m.group(1)
+            .replace(",", "")
+            .replace(":", ".")
+            .replace("'", ".")
+            .replace("’", ".")
+        )
+    except ValueError:
+        return None
+    unit = m.group(2).rstrip("s")
+    if unit in {"crore", "cr"}:
+        return amount, "cr"
+    if unit in {"lac", "lakh", "l"}:
+        return amount, "lac"
+    return amount, "K"
+
+
+def _price_from_ai_and_raw(
+    price_info: dict,
+    source_text: str | None = None,
+) -> tuple[float | None, str | None]:
+    """Convert a model price, preferring an explicit source quote when present.
+
+    The broker's explicit price text is the source of truth for punctuation
+    shorthand and decimal scale. This prevents values such as ``4'25 cr``
+    from becoming ``425 cr`` when a provider drops the separator.
+    """
+    if not isinstance(price_info, dict):
+        return None, None
+    unit = str(price_info.get("unit") or "").strip().lower()
+    amount = _safe_float(price_info.get("amount"))
+    if amount is None:
+        raw_text = str(price_info.get("raw_price_text") or "").strip()
+        if re.search(r"(?i)\b(?:on\s+call|price\s+on\s+(?:request|call)|on\s+request|call\s+for\s+price)\b", raw_text):
+            return None, None
+        return None, "per_sqft" if unit in {"per_sqft", "psf"} else None
+    raw_text = str(price_info.get("raw_price_text") or "").strip()
+    if unit in {"per_sqft", "psf"}:
+        # Providers occasionally misclassify a total commercial rent quote
+        # such as ``5.50Lacs + gst`` as a PSF rate. The broker's explicit
+        # money unit is stronger evidence than that classification. Keep PSF
+        # only when the source explicitly says PSF/per sqft; otherwise retain
+        # the quoted total and prevent an area multiplication later.
+        explicit = parse_explicit_price(raw_text)
+        explicit_psf = re.search(
+            r"(?:psf|per\s*(?:sq\.?\s*ft|sqft|square\s*foot))\b",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if explicit and not explicit_psf:
+            explicit_amount, explicit_unit = explicit
+            return canonical_price_rupees(explicit_amount, explicit_unit), "abs"
+        return amount, "per_sqft"
+    explicit = parse_explicit_price(raw_text)
+    if explicit:
+        explicit_amount, explicit_unit = explicit
+        return canonical_price_rupees(explicit_amount, explicit_unit), "abs"
+    if unit in {"cr", "crore", "crores", "lac", "lakh", "lakhs", "l", "k", "thousand", "thousands"}:
+        return price_to_rupees(amount, unit.rstrip("s")), "abs"
+    return amount, "abs"
+
+
+def _source_rent_price_text(source_text: str | None) -> str | None:
+    """Return the explicit rent quote, without picking a deposit or sale quote."""
+    match = re.search(
+        r"(?<![A-Za-z0-9])(?:rent|rental|monthly\s+rent)\s*[:=\-]?\s*"
+        r"((?:₹|rs\.?\s*)?\d[\d,.]*\s*"
+        r"(?:cr(?:ore|ores)?|lac(?:s)?|lakh(?:s)?|l|k|thousand(?:s)?)?"
+        r"(?:\s*(?:per\s*month|/\s*month|p\.?\s*m\.?)\b)?"
+        r"(?!\s*(?:psf|per\s*(?:sq\.?\s*ft|sqft))))",
+        str(source_text or ""),
+        re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else None
+
+
+def _source_rent_price_value(source_text: str | None) -> float | None:
+    """Parse the number attached to a labelled rent quote.
+
+    A bare value after ``rent`` is already rupees (for example ``rent
+    40000``). It must not fall through to the first monetary number in the
+    message, which is often the deposit. Small bare Mumbai rental quotes keep
+    the existing ``140`` => ``1.40 lakh`` convention.
+    """
+    text = str(source_text or "")
+    match = re.search(
+        r"(?<![A-Za-z0-9])(?:rent|rental|monthly\s+rent)\s*[:=\-]?\s*"
+        r"(?:₹|rs\.?\s*)?(?P<amount>\d[\d,.]*)\s*"
+        r"(?P<unit>cr(?:ore|ores)?|lac(?:s)?|lakh(?:s)?|l|k|thousand(?:s)?)?(?![A-Za-z])",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        amount = float(match.group("amount").replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    unit = str(match.group("unit") or "").lower().rstrip("s")
+    if unit:
+        # Mumbai residential rental shorthand: decimal k-quotes below 5 such
+        # as ``2.75k`` mean 2.75 lakh, not ₹2,750. Keep this source-first
+        # recovery path consistent with canonical_rental_price_rupees().
+        if unit == "k" and "." in match.group("amount") and 0 < amount < 5:
+            return amount * 100_000
+        return price_to_rupees(amount, unit)
+    return amount * 1_000 if 0 < amount < 1_000 else amount
+
+
+def _source_ground_rental_period(
+    price_info: dict,
+    source_text: str | None,
+    listing_type: str | None,
+    transaction_type: str | None,
+) -> dict:
+    """Correct a provider's one-time period for an explicit lease/rent quote.
+
+    Sarvam occasionally returns ``period=one_time`` for broker wording such as
+    ``QUOTE: 1.50 LACS`` even though the item is explicitly on lease. Only
+    rental/lease routes are corrected, and explicit sale/one-time wording is
+    left untouched.
+    """
+    corrected = dict(price_info or {})
+    route = str(transaction_type or listing_type or "").casefold()
+    source = str(source_text or "")
+    if (
+        route in {"rent", "lease", "pg"}
+        and corrected.get("period") == "one_time"
+        and re.search(r"(?i)\b(?:rent|rental|lease|on\s+lease|monthly|per\s*month|quote)\b", source)
+        and not re.search(r"(?i)\b(?:sale|sell|buy|one[- ]time)\b", source)
+    ):
+        corrected["period"] = "per_month"
+    return corrected
+
+
+def _parse_deposit(raw_text: str, monthly_rent: float | None = None) -> dict:
+    """Parse the compact deposit conventions used in broker messages."""
+    text = str(raw_text or "")
+    lower = text.lower()
+    if not re.search(r"\bdeposit\b|\d+(?:\.\d+)?\s*[kkl]?(?:\s*[+/&/]\s*\d+)?", lower):
+        return {}
+    amount = None
+    months = None
+    needs_review = False
+    explicit = re.search(
+        r"\bdeposit\b\s*[:\-]?\s*(?:rs\.?|₹)?\s*"
+        r"([\d,.]+)(?:\s*(lac|lakh|lacs|k|cr|crore|thousand|months?|mo))?",
+        lower,
+    )
+    if explicit:
+        value = _safe_float(explicit.group(1))
+        if value is not None:
+            unit = (explicit.group(2) or "").rstrip("s")
+            if unit in {"month", "mo"} or (not unit and value <= 12):
+                months = value
+            else:
+                amount = _price_from_ai_and_raw({
+                    "amount": value,
+                    "unit": unit,
+                    "raw_price_text": f"{value} {unit}".strip(),
+                })[0]
+    combined = re.search(
+        r"([\d,.]+)\s*(lac|lakh|lacs|k|cr|crore|thousand)?\s*[+/&/]\s*"
+        r"([\d,.]+)\s*(lac|lakh|lacs|k|cr|crore|thousand|months?|mo)?",
+        lower,
+    )
+    if combined:
+        value = _safe_float(combined.group(3))
+        if value is not None:
+            unit = (combined.group(4) or "").rstrip("s")
+            if unit in {"month", "mo"} or (not unit and value <= 12):
+                months = value
+            elif unit or value > 12:
+                amount = _price_from_ai_and_raw({
+                    "amount": value, "unit": unit, "raw_price_text": f"{value} {unit}".strip(),
+                })[0]
+    range_match = re.search(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*months?", lower)
+    if range_match:
+        months = (float(range_match.group(1)) + float(range_match.group(2))) / 2
+        needs_review = True
+    if months is not None and monthly_rent is not None and amount is None:
+        amount = monthly_rent * months
+    result = {
+        "deposit_amount": amount,
+        "deposit_months": months,
+        "deposit_applicable": True,
+        "deposit_raw_text": text.strip(),
+    }
+    if needs_review:
+        result["needs_review"] = True
+    return result
+
+
+def _ai_extraction_to_parsed(
+    ai_extraction: dict,
+    raw_text: str,
+    sender_name: str,
+    push_name: str,
+    slice_text: str | None = None,
+    *,
+    authority_result=None,
+    source_slice_id: str | None = None,
+) -> dict:
+    """Convert AI extraction schema to the existing parsed dict format.
+
+    This bridges the new AI extraction result to the legacy parsed_observation
+    columns so the rest of the pipeline (resolver, listing upsert, etc.)
+    remains unchanged. The full AI result is stored separately in the
+    `ai_extraction` JSONB column.
+    """
+    # Normalize provider absence markers before any routing or typed-field
+    # coercion.  This keeps webhook and worker persistence on one contract.
+    ai_extraction = _clean_extraction_value(dict(ai_extraction or {}))
+    ai_extraction = _source_ground_requirement_item(
+        ai_extraction,
+        slice_text or raw_text,
+    )
+    legacy_parking = ai_extraction.get("parking_details")
+    if isinstance(legacy_parking, dict) and set(legacy_parking).issubset({"key"}) and (
+        legacy_parking.get("key") == "explicit source-grounded value"
+        or re.fullmatch(r"\d+\s*cp", str(legacy_parking.get("key") or ""), re.IGNORECASE)
+    ):
+        ai_extraction["parking_details"] = {}
+    if authority_result is None:
+        authority_result = evaluate_extraction_authority(
+            ai_extraction,
+            slice_text or raw_text,
+            source_slice_id=source_slice_id,
+        )
+    ai_extraction = apply_authority_result(ai_extraction, authority_result)
+    ai_extraction = _apply_source_evidence_gates(
+        ai_extraction,
+        slice_text or raw_text,
+    )
+    ai_extraction = _ground_locality_to_source(
+        ai_extraction,
+        slice_text or raw_text,
+    )
+    # Publication safety may flag an AI price that cannot be traced to this
+    # source slice, but it must preserve the value for review. This is a
+    # safety annotation after the single authority decision, not a rewrite.
+    from price_plausibility import apply_price_plausibility_guard
+    ai_extraction = apply_price_plausibility_guard(ai_extraction, slice_text or raw_text)
+    listing_type = ai_extraction.get("routing_listing_type") or ai_extraction.get("listing_type")
+    if listing_type == "sale":
+        intent = "SELL"
+    elif listing_type == "rent":
+        intent = "RENT"
+    elif listing_type == "requirement":
+        intent = "BUY"
+    else:
+        intent = None
+
+    category = ai_extraction.get("property_category")
+    asset_type = category.lower() if category else None
+    classified_transaction = ai_extraction.get("transaction_type") or listing_type
+    if classified_transaction not in {"sale", "rent", "lease", "pg", "joint_venture"}:
+        classified_transaction = "sale"
+
+    bhk_val = ai_extraction.get("bhk")
+    bhk_str = None
+    if bhk_val is not None:
+        if bhk_val == 0.5:
+            bhk_str = "1 RK"
+        elif bhk_val == int(bhk_val):
+            bhk_str = f"{int(bhk_val)} BHK"
+        else:
+            bhk_str = f"{bhk_val} BHK"
+
+    source_for_inference = slice_text or raw_text
+    price_info = ai_extraction.get("price", {})
+    price_info = _source_ground_rental_period(
+        price_info, source_for_inference, listing_type, classified_transaction
+    )
+    ai_extraction["price"] = price_info
+    price_unit_price = price_info.get("unit") if isinstance(price_info, dict) else None
+    price_period = price_info.get("period") if isinstance(price_info, dict) else None
+    ai_extraction = _apply_source_grounded_bhk_fallback(
+        ai_extraction, raw_text, slice_text
+    )
+    ai_extraction = canonicalize_extraction_confidence(
+        ai_extraction, force_review=bool(ai_extraction.get("needs_review"))
+    )
+    # ``listing_count`` is a structural field, not a free-form AI fact.  Only
+    # persist it when the current source slice contains explicit multi-unit
+    # syntax; retain any provider value inside ``ai_extraction`` for review.
+    multi_unit = _MULTI_UNIT_BHK_RE.search(source_for_inference)
+    listing_count = int(multi_unit.group("count")) if multi_unit else None
+    combination = _COMBINATION_BHK_RE.search(source_for_inference) or _JODI_BHK_RE.search(source_for_inference)
+    if combination:
+        if combination.groupdict().get("first"):
+            combination_label = (
+                f"{combination.group('first')} BHK + {combination.group('second')} BHK (JODI)"
+            )
+        else:
+            combination_label = f"{combination.group('bhk')} BHK (JODI)"
+        # The source slice explicitly describes a combined/jodi unit. Keep
+        # that fact in the typed record and force title generation to retain
+        # it even when a provider collapses the item to a single BHK value.
+        ai_extraction["is_combination_unit"] = True
+        ai_extraction["configuration_details"] = combination_label
+        ai_extraction["title"] = None
+        ai_extraction["validation_flags"] = list(dict.fromkeys(
+            list(ai_extraction.get("validation_flags") or []) + ["combination_unit_source_grounded"]
+        ))
+    source_bhk = _CORE_BHK_RE.search(source_for_inference)
+    bhk_val = ai_extraction.get("bhk")
+    bhk_str = None
+    if bhk_val is not None and source_bhk:
+        if bhk_val == 0.5:
+            bhk_str = "1 RK"
+        elif bhk_val == int(bhk_val):
+            bhk_str = f"{int(bhk_val)} BHK"
+        else:
+            bhk_str = f"{bhk_val} BHK"
+    price_info = ai_extraction.get("price", {})
+    price, price_unit = _price_from_ai_and_raw(price_info, source_for_inference)
+    category = ai_extraction.get("property_category")
+    asset_type = category.lower() if category else None
+    if listing_type == "rent" and price_unit != "per_sqft" and price is not None:
+        if price_info.get("amount") is not None or price_info.get("raw_price_text"):
+            price = canonical_rental_price_rupees(
+                price_info.get("amount"),
+                price_info.get("unit"),
+                price_info.get("raw_price_text"),
+            )
+    # The provider can return a plausible-looking value with the wrong unit
+    # (for example 40k for a source quote of 4 lac). For an isolated slice
+    # containing exactly one explicit rent quote, the broker text is the
+    # authority. Mixed/multi-property text is rejected by source_attached_price.
+    if listing_type == "rent" and price_unit != "per_sqft":
+        recovered_price = source_attached_price(
+            source_for_inference,
+            "rent",
+            commercial=asset_type == "commercial",
+        )
+        if recovered_price:
+            recovered_value, recovered_raw, recovered_unit = recovered_price
+            if price is None or (recovered_value and abs(float(price) - recovered_value) > max(1000.0, recovered_value * 0.05)):
+                price = recovered_value
+                price_unit = recovered_unit
+                price_info = dict(price_info) if isinstance(price_info, dict) else {}
+                price_info["raw_price_text"] = recovered_raw
+                ai_extraction["price"] = price_info
+    # Use the source-grounded unit returned above, not the provider's raw unit.
+    price_model = "psf" if price_unit == "per_sqft" else None
+
+    locality = ai_extraction.get("locality", {})
+    if isinstance(locality, dict):
+        rl = locality.get("resolved_locality")
+        micro_market = rl if rl and str(rl).strip().lower() != "none" else None
+        rm = locality.get("raw_mention")
+        location_raw = rm if rm and str(rm).strip().lower() != "none" else None
+    else:
+        micro_market = None
+        location_raw = None
+
+    source_for_inference = slice_text or raw_text
+    if listing_type == "requirement":
+        # A requirement may mention a target building as a preference, but it
+        # is not supply inventory for that building. Never turn a sibling
+        # listing heading or a descriptive requirement line into identity.
+        inferred_building = None
+        inferred_locality = None
+        ai_extraction["building_name"] = None
+    else:
+        inferred_building, inferred_locality, _ = _explicit_bold_building_context(source_for_inference)
+        inferred_building = inferred_building or _infer_building_name_from_source(source_for_inference, micro_market)
+        # Shared broadcast headers are outside an item slice by design. Recover a
+        # named building only from the prefix before the first BHK/property block;
+        # this prevents one item's building from leaking into the next item.
+        inferred_building = inferred_building or _infer_shared_building_name(raw_text, micro_market)
+    # Keep explicit source labels authoritative when the model returns null.
+    # This covers broker shorthand such as ``Bildg : Vardhaman Estate`` and
+    # commercial blocks such as ``Location: Lower Parel West``.
+    source_lines = [re.sub(r"[*_`~]", "", line).strip(" -:•") for line in str(source_for_inference).splitlines()]
+    if source_lines:
+        explicit_source_locality = _source_explicit_location(source_for_inference)
+        if explicit_source_locality and not location_raw:
+            location_raw = explicit_source_locality
+            if not micro_market:
+                micro_market = explicit_source_locality
+        heading = re.sub(r"(?i)^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s*", "", source_lines[0]).strip()
+        heading_parts = re.split(r"\s+[–—-]\s+", heading, maxsplit=1)
+        if len(heading_parts) == 2 and not location_raw:
+            heading_locality = heading_parts[1].strip(" .,;|-_")
+            heading_tokens = set(_source_words(heading_locality))
+            non_locality_heading_tokens = {
+                "furnished", "furnish", "semi", "fully", "unfurnished",
+                "bare", "shell", "newly", "done", "rent", "sale",
+                "available", "bhk", "apartment", "flat", "villa", "office",
+                "commercial", "residential", "carpet", "sqft", "sf",
+            }
+            if (
+                heading_locality
+                and re.search(r"[A-Za-z]", heading_locality)
+                and not heading_tokens.intersection(non_locality_heading_tokens)
+            ):
+                location_raw = heading_locality
+                if not micro_market:
+                    micro_market = heading_locality
+    for source_line in source_lines:
+        location_match = re.match(r"(?i)^location\s*[:=-]\s*(.+)$", source_line)
+        if location_match and not location_raw:
+            location_raw = location_match.group(1).strip(" .,;|-_")
+            if not micro_market:
+                micro_market = location_raw
+        building_match = re.match(r"(?i)^(?:bildg|bldg|building(?:\s+name)?)\s*[:=-]\s*(.+)$", source_line)
+        if building_match and not inferred_building:
+            inferred_building = building_match.group(1).strip(" .,;|-_")
+    if inferred_locality and not micro_market:
+        micro_market = inferred_locality
+    if inferred_locality and not location_raw:
+        location_raw = inferred_locality
+    ai_building = ai_extraction.get("building_name")
+    # The enrichment registry is authoritative for identity.  Apply its
+    # canonical spelling before title generation, persistence, and property
+    # type interpretation; previously this helper existed but was never
+    # called, leaving names such as "Sethia Sea View" to model drift.
+    building_candidate = str(ai_building or inferred_building or "").strip()
+    canonical_building = _normalize_building_to_canonical(building_candidate)
+    if canonical_building and building_candidate:
+        if ai_building:
+            ai_building = canonical_building
+            ai_extraction["building_name"] = canonical_building
+        else:
+            inferred_building = canonical_building
+
+    broker_signature_names = _extract_broker_signature_names(source_for_inference)
+    # Invalid semantic tokens (prices, amenities, and localities) are not
+    # building identities. This is schema/content safety, not a source-based
+    # replacement of a valid AI value.
+    building_problem = building_name_problem(ai_building)
+    if building_problem:
+        ai_building = None
+        ai_extraction["building_name"] = None
+        ai_extraction["title"] = None
+        ai_extraction["needs_review"] = True
+        flags = list(ai_extraction.get("validation_flags") or [])
+        flags.extend((building_problem, "building_name_unresolved"))
+        ai_extraction["validation_flags"] = list(dict.fromkeys(flags))
+
+    # A name immediately associated with a phone number at the end of a
+    # WhatsApp post identifies the broker/team member who circulated it. It
+    # is never evidence of the property building, for either residential or
+    # commercial inventory. Clear it before the parsed bridge or title logic
+    # can promote it into a listing identity.
+    broker_candidate = str(ai_building or "").strip()
+    inferred_broker_candidate = str(inferred_building or "").strip()
+    signature_candidate = next(
+        (
+            candidate
+            for candidate in (broker_candidate, inferred_broker_candidate)
+            if candidate and candidate.casefold() in broker_signature_names
+        ),
+        None,
+    )
+    if signature_candidate:
+        if broker_candidate.casefold() == signature_candidate.casefold():
+            ai_building = None
+            ai_extraction["building_name"] = None
+        if inferred_broker_candidate.casefold() == signature_candidate.casefold():
+            inferred_building = None
+        ai_extraction["title"] = None
+        ai_extraction["needs_review"] = True
+        flags = list(ai_extraction.get("validation_flags") or [])
+        flags.extend(("building_name_is_broker_signature", "building_name_unresolved"))
+        ai_extraction["validation_flags"] = list(dict.fromkeys(flags))
+
+    title = ai_extraction.get("title") or None
+
+    # ── v2 schema fields — physical / deal attributes ──────────────
+    bathroom_count = ai_extraction.get("bathroom_count")
+    car_parking_count = ai_extraction.get("car_parking_count")
+    parking_type = ai_extraction.get("parking_type")
+    deposit_amount = ai_extraction.get("deposit_amount")
+    oc_status = ai_extraction.get("oc_status")
+    interior_value = ai_extraction.get("interior_value")
+    ceiling_height = ai_extraction.get("ceiling_height")
+    price_basis = ai_extraction.get("price_basis")
+    configuration_type = ai_extraction.get("configuration_type")
+    if configuration_type is not None:
+        configuration_type_text = str(configuration_type).strip()
+        if re.fullmatch(r"\d+(?:\.\d+)?", configuration_type_text):
+            configuration_number = _safe_float(configuration_type_text)
+            configuration_type = "1 RK" if configuration_number == 0.5 else f"{configuration_number:g} BHK"
+        elif re.fullmatch(r"(\d+(?:\.\d+)?)\s*(BHK|RK)", configuration_type_text, re.IGNORECASE):
+            configuration_type = re.sub(r"\s+", " ", configuration_type_text).upper()
+        else:
+            configuration_type = configuration_type_text
+    elif bhk_val is not None:
+        configuration_type = "1 RK" if bhk_val == 0.5 else f"{bhk_val:g} BHK"
+    lease_term_type = ai_extraction.get("lease_term_type")
+    contacts = ai_extraction.get("contacts") if isinstance(ai_extraction.get("contacts"), list) else []
+    society_restrictions = ai_extraction.get("society_restrictions")
+    if not isinstance(society_restrictions, list):
+        society_restrictions = []
+
+    # ── v2 schema — amenities split ────────────────────────────────
+    # building_amenities → routed to buildings.amenities via building_amenities key
+    building_amenities = ai_extraction.get("building_amenities") or []
+    # amenities → unit-specific items
+    unit_amenities = ai_extraction.get("amenities") or []
+    # vague claims → plain text, never structured
+    amenities_unverified_claim = ai_extraction.get("amenities_unverified_claim") or None
+
+    # ── v2 schema — rental / tenancy policy ────────────────────────
+    pet_policy = ai_extraction.get("pet_policy") or None
+    tenant_type_preference = ai_extraction.get("tenant_type_preference") or None
+    sharing_allowed = ai_extraction.get("sharing_allowed") or None
+    company_lease_criteria = ai_extraction.get("company_lease_criteria") or None
+    # IMPORTANT: tenant_nationality_preference is INTERNAL/BROKER-FACING ONLY.
+    # Must NEVER appear in any public-facing API response, search filter,
+    # or badge on propai.live / consumer surfaces.
+    tenant_nationality_preference = ai_extraction.get("tenant_nationality_preference") or None
+    brokerage_type = ai_extraction.get("brokerage_type") or None
+
+    deposit_fields = _parse_deposit(
+        str(ai_extraction.get("deposit_raw_text") or raw_text),
+        price if listing_type == "rent" and price_unit != "per_sqft" else None,
+    )
+    if deposit_amount is not None:
+        parsed_deposit_amount = _safe_float(deposit_amount)
+        if parsed_deposit_amount is not None:
+            deposit_fields["deposit_amount"] = parsed_deposit_amount
+            deposit_fields["deposit_applicable"] = True
+    if ai_extraction.get("deposit_months") is not None:
+        deposit_fields["deposit_months"] = ai_extraction.get("deposit_months")
+
+    parsed = {
+        "intent": intent,
+        "principal": None,
+        "bhk": bhk_str,
+        "listing_count": listing_count,
+        "configuration": None,
+        "price": price,
+        "price_unit": price_unit,
+        "price_model": price_model,
+        "price_per_sqft": price if listing_type == "sale" and price_unit == "per_sqft" else None,
+        "monthly_rent": price if listing_type == "rent" and price_unit != "per_sqft" else None,
+        "total_asking_price": price if listing_type in ("sale",) and price_unit != "per_sqft" else None,
+        "price_max": _safe_float(price_info.get("amount_max")) if isinstance(price_info, dict) else None,
+        "budget_min": _clean_budget_bound(ai_extraction.get("budget_min")),
+        "budget_max": _clean_budget_bound(ai_extraction.get("budget_max")),
+        "area_sqft": ai_extraction.get("carpet_area_sqft"),
+
+        "furnishing": ai_extraction.get("furnishing_status") or None,
+        "furnishing_canonical": None,
+
+        "location_raw": location_raw,
+        "building_name": ai_building or inferred_building,
+        "landmark_name": None,
+        "street_name": None,
+        "area": None,
+        "micro_market": micro_market,
+        "developer": None,
+
+        "asset_type": asset_type,
+        "property_type": None,
+        "transaction_type": ai_extraction.get("transaction_type") or classified_transaction,
+        "commercial_use_type": ai_extraction.get("commercial_use_type"),
+        "fitout_status": ai_extraction.get("fitout_status"),
+        "occupancy_type": ai_extraction.get("occupancy_status") or None,
+        "floor_range": None,
+        "rent_per_sqft": price if listing_type == "rent" and price_unit == "per_sqft" else None,
+
+        "availability_status": None,
+        "possession_status": ai_extraction.get("possession_status") or None,
+        "possession_date": ai_extraction.get("possession_date") or None,
+        "available_from": ai_extraction.get("available_from") or None,
+        "availability_date_raw": ai_extraction.get("availability_date_raw") or None,
+        "ready_by": None,
+        "construction_stage": None,
+        "launch_timeline": None,
+        "expected_possession": None,
+
+        "deposit": None,
+        "lock_in_period": None,
+
+        "broker_name": None,
+        "broker_phone": None,
+        "forwarded": 0,
+        "confidence": _confidence_score(
+            ai_extraction.get("extraction_confidence_score")
+            if ai_extraction.get("extraction_confidence_score") is not None
+            else ai_extraction.get("confidence", 0.0)
+        ),
+        "model_confidence": _confidence_score(ai_extraction.get("model_confidence")),
+        "pipeline_review": bool(ai_extraction.get("pipeline_review", ai_extraction.get("needs_review"))),
+        "pipeline_review_reasons": list(ai_extraction.get("pipeline_review_reasons") or ai_extraction.get("validation_flags") or []),
+        "needs_review": bool(ai_extraction.get("needs_review")),
+        "write_blocked": bool(ai_extraction.get("write_blocked")),
+        "validation_flags": list(ai_extraction.get("validation_flags") or []),
+        "raw_payload": {"full_text": raw_text, "slice_text": slice_text or raw_text},
+        "normalized_message": _lossless_normalized_message(raw_text, slice_text),
+        "location": None,
+        "message_type": listing_type,
+        "configuration_details": ai_extraction.get("configuration_details"),
+        "is_combination_unit": ai_extraction.get("is_combination_unit"),
+
+        # v2 schema — physical / deal attributes
+        "carpet_area_sqft": ai_extraction.get("carpet_area_sqft"),
+        "built_up_area_sqft": ai_extraction.get("built_up_area_sqft"),
+        "bathroom_count": _safe_int(bathroom_count),
+        "car_parking_count": _safe_int(car_parking_count),
+        "parking_type": parking_type,
+        **deposit_fields,
+        "deposit_amount": _safe_float(deposit_amount) if deposit_amount is not None else deposit_fields.get("deposit_amount"),
+        "deposit_months": ai_extraction.get("deposit_months") or deposit_fields.get("deposit_months"),
+        "deposit_raw_text": ai_extraction.get("deposit_raw_text") or deposit_fields.get("deposit_raw_text"),
+        "oc_status": oc_status,
+        "interior_value": _safe_float(interior_value),
+        "ceiling_height": ceiling_height,
+        "price_basis": price_basis,
+        "brokerage_type": brokerage_type,
+        "brokerage_context": ai_extraction.get("brokerage_context"),
+        "brokerage_terms_raw": ai_extraction.get("brokerage_terms_raw"),
+        "co_brokered": ai_extraction.get("co_brokered"),
+        "plus_one_deal": ai_extraction.get("plus_one_deal"),
+        "fee_sharing_required": ai_extraction.get("fee_sharing_required"),
+        "client_profile_required": ai_extraction.get("client_profile_required"),
+        "configuration_type": configuration_type,
+        "configuration_details": ai_extraction.get("configuration_details"),
+        "original_bhk": _safe_float(ai_extraction.get("original_bhk")),
+        "current_bhk": _safe_float(ai_extraction.get("current_bhk")),
+        "is_converted_unit": ai_extraction.get("is_converted_unit"),
+        "is_combination_unit": ai_extraction.get("is_combination_unit"),
+        "can_sell_separately": ai_extraction.get("can_sell_separately"),
+        "lease_term_type": lease_term_type,
+        "availability_status": ai_extraction.get("availability_status"),
+        "wing": ai_extraction.get("wing"),
+        "floor_min": _safe_int(ai_extraction.get("floor_min")),
+        "floor_max": _safe_int(ai_extraction.get("floor_max")),
+        "floor_label": ai_extraction.get("floor_label"),
+        "balcony_area_sqft": _safe_float(ai_extraction.get("balcony_area_sqft")),
+        "balcony_area_raw_text": ai_extraction.get("balcony_area_raw_text"),
+        "balcony_present": ai_extraction.get("balcony_present"),
+        "terrace_area_sqft": _safe_float(ai_extraction.get("terrace_area_sqft")),
+        "covered_terrace_area_sqft": _safe_float(ai_extraction.get("covered_terrace_area_sqft")),
+        "terrace_area_raw_text": ai_extraction.get("terrace_area_raw_text"),
+        "sit_out_present": ai_extraction.get("sit_out_present"),
+        "sellable_area_sqft": _safe_float(ai_extraction.get("sellable_area_sqft")),
+        "computed_total_asking_price": _safe_float(ai_extraction.get("computed_total_asking_price")),
+        "computed_price_confidence": ai_extraction.get("computed_price_confidence"),
+        "price_math": ai_extraction.get("price_math") if isinstance(ai_extraction.get("price_math"), dict) else {},
+        "unit_condition": ai_extraction.get("unit_condition"),
+        "vastu_compliant": ai_extraction.get("vastu_compliant"),
+        "view_description": ai_extraction.get("view_description"),
+        "has_lift": ai_extraction.get("has_lift"),
+        "has_power_backup": ai_extraction.get("has_power_backup"),
+        "power_load_kw": ai_extraction.get("power_load_kw"),
+        "parking_details": ai_extraction.get("parking_details") if isinstance(ai_extraction.get("parking_details"), dict) else {},
+        "society_restrictions": society_restrictions,
+        "society_restrictions_raw": ai_extraction.get("society_restrictions_raw"),
+        "broker_company": ai_extraction.get("broker_company"),
+        "contacts": contacts[:8],
+        "showing_instructions": ai_extraction.get("showing_instructions"),
+        "contact_instructions": ai_extraction.get("contact_instructions"),
+        "source_notes": ai_extraction.get("source_notes"),
+        "broker_notes": _safe_broker_notes(ai_extraction.get("broker_notes")),
+        "unstructured_facts": {
+            **(ai_extraction.get("unstructured_facts") if isinstance(ai_extraction.get("unstructured_facts"), dict) else {}),
+            **({"property_intelligence": ai_extraction["property_intelligence"]}
+               if isinstance(ai_extraction.get("property_intelligence"), dict)
+               else {}),
+        },
+        "availability_status": ai_extraction.get("availability_status"),
+        "availability_date_raw": ai_extraction.get("availability_date_raw"),
+        "unit_condition": ai_extraction.get("unit_condition"),
+        "lease_term_min_months": _safe_int(ai_extraction.get("lease_term_min_months")),
+        "lease_term_max_months": _safe_int(ai_extraction.get("lease_term_max_months")),
+        "lease_term_raw_text": ai_extraction.get("lease_term_raw_text"),
+
+        # v2 schema — amenities
+        "amenities": unit_amenities if isinstance(unit_amenities, list) else [],
+        "amenities_unverified_claim": amenities_unverified_claim,
+        "building_amenities": building_amenities if isinstance(building_amenities, list) else [],
+
+        # v2 schema — rental / tenancy policy
+        "pet_policy": pet_policy,
+        "tenant_type_preference": tenant_type_preference,
+        "sharing_allowed": sharing_allowed,
+        "company_lease_criteria": company_lease_criteria,
+        "tenant_nationality_preference": tenant_nationality_preference,
+    }
+    if signature_candidate:
+        parsed["building_name"] = None
+        parsed["building_name_raw_candidate"] = signature_candidate
+        parsed["_building_name_was_broker_signature"] = True
+        parsed["needs_review"] = True
+    # Core source recovery is complete before this bridge: BHK, area, price,
+    # locality, and building candidates have already passed through the
+    # shared authority contract. Do not invoke the legacy rescue helper here;
+    # it would create a second post-AI authority and could promote nearby text.
+    parsed["summary_title"] = _source_grounded_title(ai_extraction, parsed, source_for_inference)
+    if _title_evidence_mismatch(
+        title,
+        raw_text or source_for_inference,
+        parsed.get("building_name"),
+        parsed,
+    ):
+        flags = list(parsed.get("validation_flags") or [])
+        flags.append("title_evidence_mismatch")
+        parsed["validation_flags"] = list(dict.fromkeys(flags))
+        parsed["needs_review"] = True
+        ai_extraction["needs_review"] = True
+        ai_extraction["validation_flags"] = list(dict.fromkeys(
+            list(ai_extraction.get("validation_flags") or []) + ["title_evidence_mismatch"]
+        ))
+    if listing_type == "rent" and rent_price_needs_review(parsed.get("monthly_rent"), raw_text):
+        parsed["needs_review"] = True
+        parsed["confidence"] = 0.3
+    return parsed
+
+
+def _public_metadata(ai: dict, source_text: str, summary_title: str | None, is_requirement: bool) -> dict:
+    """Build the explicit public contract without changing app-facing facts.
+
+    ``needs_review`` is an operator signal. It is deliberately not reused as
+    the public gate: a field can need a human look while the listing still has
+    a source-grounded, safe public representation.
+    """
+    title = str(ai.get("public_seo_title") or summary_title or "").strip()
+    description = str(ai.get("public_seo_description") or "").strip()
+    description = _redact_indian_mobiles(description)
+    words = description.split()
+    if len(words) > 250:
+        description = " ".join(words[:250]).rstrip(" ,.;:") + "."
+    blocked: list[str] = []
+    if is_requirement:
+        blocked.append("requirements_are_not_public_supply_inventory")
+    if not source_text.strip():
+        blocked.append("missing_source_evidence")
+    if not title or re.match(r"^\[(?:unstructured|unknown|listing)\]", title, re.I):
+        blocked.append("placeholder_title")
+    if not description:
+        blocked.append("missing_public_description")
+    if re.search(r"\b(?:whatsapp|call|contact)\b|\+?\d[\d\s().-]{8,}", description, re.I):
+        blocked.append("private_contact_text")
+    return {
+        "public_seo_title": title or None,
+        "public_seo_description": description or None,
+        "public_eligible": not blocked,
+        "public_block_reasons": blocked,
+        "landmark_options": ai.get("landmark_options") or [],
+    }
+
+
+def _recover_explicit_source_fields(ai: dict, source_text: str) -> dict:
+    """Recover only unambiguous broker shorthand from this item slice.
+
+    The model remains responsible for semantic extraction. This narrow bridge
+    prevents an explicit, source-grounded fact from disappearing when a model
+    omits an otherwise valid optional field. It never guesses from a sibling
+    block or from the complete broadcast.
+    """
+    corrected = dict(ai or {})
+    source = str(source_text or "")
+    provenance = dict(corrected.get("provenance") or {})
+    field_confidence = dict(corrected.get("field_confidence") or {})
+
+    # A composite commercial quote such as "600 + 360 Loft" contains a
+    # primary area plus a loft/mezzanine. Providers sometimes incorrectly sum
+    # those values into carpet_area_sqft. Keep the components separate and
+    # refuse to invent the primary area's basis when the source does not state
+    # whether it is carpet, built-up, or chargeable.
+    composite_area = re.search(
+        r"(?i)\b(?P<primary>\d[\d,]*(?:\.\d+)?)\s*"
+        r"(?:sq\.?\s*ft\.?|sqft)?\s*"
+        r"(?P<primary_basis>carpet|built[- ]?up|chargeable)?\s*\+\s*"
+        r"(?P<mezzanine>\d[\d,]*(?:\.\d+)?)\s*"
+        r"(?:sq\.?\s*ft\.?|sqft)?\s*(?P<label>loft|mezzanine)\b",
+        source,
+    )
+    if composite_area:
+        primary = float(composite_area.group("primary").replace(",", ""))
+        mezzanine = float(composite_area.group("mezzanine").replace(",", ""))
+        quote = composite_area.group(0).strip()
+        corrected["mezzanine_area_sqft"] = mezzanine
+        corrected["area_raw_text"] = quote
+        provenance.setdefault("mezzanine_area_sqft", quote)
+        field_confidence.setdefault("mezzanine_area_sqft", 0.99)
+        nearby_prefix = source[max(0, composite_area.start() - 24):composite_area.start()]
+        basis_text = composite_area.group("primary_basis") or ""
+        basis_is_explicit = bool(
+            basis_text or re.search(r"(?i)\b(?:carpet|built[- ]?up|chargeable)\b", nearby_prefix)
+        )
+        for field in ("carpet_area_sqft", "built_up_area_sqft", "chargeable_area_sqft"):
+            corrected[field] = None
+        if basis_is_explicit:
+            basis_match = re.search(
+                r"(?i)\b(carpet|built[- ]?up|chargeable)\b",
+                basis_text or nearby_prefix,
+            )
+            basis = basis_match.group(1).lower().replace("-", "_") if basis_match else ""
+            primary_field = {
+                "carpet": "carpet_area_sqft",
+                "built_up": "built_up_area_sqft",
+                "chargeable": "chargeable_area_sqft",
+            }.get(basis)
+            if primary_field:
+                corrected[primary_field] = primary
+                provenance.setdefault(primary_field, quote)
+                field_confidence.setdefault(primary_field, 0.99)
+        else:
+            flags = list(corrected.get("validation_flags") or [])
+            flags.append("composite_area_components_preserved")
+            corrected["validation_flags"] = list(dict.fromkeys(flags))
+
+    area_range = re.search(
+        r"(?i)(?P<minimum>\d[\d,]*)\s*/\s*(?P<maximum>\d[\d,]*)\s*"
+        r"(?:sq\.?\s*ft\.?\s*)?(?P<basis>carpet|built[- ]?up|chargeable|saleable)\b",
+        source,
+    )
+    if area_range:
+        minimum = float(area_range.group("minimum").replace(",", ""))
+        maximum = float(area_range.group("maximum").replace(",", ""))
+        corrected["area_min_sqft"] = minimum
+        corrected["area_max_sqft"] = maximum
+        corrected["area_raw_text"] = area_range.group(0).strip()
+        provenance.setdefault("area_min_sqft", area_range.group(0).strip())
+        provenance.setdefault("area_max_sqft", area_range.group(0).strip())
+        field_confidence.setdefault("area_min_sqft", 0.99)
+        field_confidence.setdefault("area_max_sqft", 0.99)
+
+    def remember(field: str, value: object, quote: str, confidence: float = 0.99) -> None:
+        if corrected.get(field) in (None, ""):
+            corrected[field] = value
+        if corrected.get(field) not in (None, ""):
+            provenance.setdefault(field, quote)
+            field_confidence.setdefault(field, confidence)
+
+    # Supports both common orders: "1000 sqft BU area" and "BU area 1000 sqft".
+    built_up = re.search(
+        r"(?i)\b(?P<value>\d[\d,]*(?:\.\d+)?)\s*(?:sq\.?\s*ft\.?|sqft)\s*"
+        r"(?:bu|bua|built[- ]?up|build[- ]?up)(?:\s+area)?\b",
+        source,
+    )
+    if not built_up:
+        built_up = re.search(
+            r"(?i)\b(?:bu|bua|built[- ]?up|build[- ]?up)(?:\s+area)?\s*[:\-]?\s*"
+            r"(?P<value>\d[\d,]*(?:\.\d+)?)\s*(?:sq\.?\s*ft\.?|sqft)\b",
+            source,
+        )
+    if built_up:
+        remember(
+            "built_up_area_sqft",
+            float(built_up.group("value").replace(",", "")),
+            built_up.group(0).strip(),
+        )
+        if not corrected.get("area_raw_text"):
+            corrected["area_raw_text"] = built_up.group(0).strip()
+
+    parking = re.search(
+        r"(?i)\b(?P<count>\d+)\s*(?:nos?\s*)?(?:car\s*)?(?:parking(?:s)?|parks?|cp)\b",
+        source,
+    )
+    existing_details = dict(corrected.get("parking_details") or {})
+    if set(existing_details).issubset({"key"}) and (
+        existing_details.get("key") == "explicit source-grounded value"
+        or re.fullmatch(r"\d+\s*cp", str(existing_details.get("key") or ""), re.IGNORECASE)
+    ):
+        # This is a legacy provider/schema artifact, not evidence. Remove it
+        # even when this source slice contains no parking mention.
+        corrected["parking_details"] = {}
+    if parking:
+        quote = parking.group(0).strip()
+        remember("car_parking_count", int(parking.group("count")), quote)
+        details = dict(corrected.get("parking_details") or {})
+        # Older model responses sometimes used the schema example literally
+        # (``{"key": "explicit source-grounded value"}``). Never retain that
+        # placeholder when the item slice contains the real parking quote.
+        details.setdefault("source_text", quote)
+        corrected["parking_details"] = details
+
+    deposit_months = re.search(
+        r"(?i)\bdeposit\s*[:=-]?\s*(?P<months>\d+(?:\.\d+)?)\s*(?:months?|mos?|mo\b)",
+        source,
+    )
+    if deposit_months:
+        remember(
+            "deposit_months",
+            float(deposit_months.group("months")),
+            deposit_months.group(0).strip(),
+        )
+
+    # Commercial use and suitable-for details are high-value searchable facts
+    # that providers occasionally omit even when the heading is explicit.
+    if not corrected.get("commercial_use_type"):
+        use_match = re.search(
+            r"(?i)\b(showroom|office|shop|retail|warehouse|godown|restaurant|cafe|"
+            r"industrial)\b",
+            source,
+        )
+        if use_match:
+            remember("commercial_use_type", use_match.group(1).lower(), use_match.group(0).strip())
+    suitable = re.search(r"(?im)\bideal\s+for\s*[:\-]?\s*(.+)$", source)
+    if suitable:
+        values = [part.strip(" .,/;") for part in re.split(r"/|,|\bor\b", suitable.group(1), flags=re.IGNORECASE)]
+        values = [value for value in values if value]
+        if values:
+            facts = dict(corrected.get("unstructured_facts") or {})
+            if not facts.get("suitable_for"):
+                facts["suitable_for"] = values
+                corrected["unstructured_facts"] = facts
+                provenance.setdefault("suitable_for", suitable.group(0).strip())
+                field_confidence.setdefault("suitable_for", 0.99)
+
+    balcony = re.search(r"(?i)\b(?:with\s+)?balcon(?:y|ies)\b", source)
+    if balcony:
+        remember("balcony_present", True, balcony.group(0).strip())
+
+    floor = re.search(
+        r"(?i)\b(?P<label>(?:higher|middle|lower|upper|top|ground|first|second|third|fourth|fifth)\s+floor|"
+        r"\d{1,3}(?:st|nd|rd|th)?\s+floor)\b",
+        source,
+    )
+    if floor:
+        quote = floor.group(0).strip().lower()
+        remember("floor_label", quote, floor.group(0).strip())
+        remember("floor_range", quote, floor.group(0).strip())
+
+    jodi = re.search(
+        r"(?i)\b(?P<left>\d+(?:\.\d+)?)\s*\+\s*"
+        r"(?P<right>\d+(?:\.\d+)?)\s*BHK(?:\s+[^\n|]*)?\b",
+        source,
+    )
+    if jodi:
+        quote = jodi.group(0).strip()
+        left = float(jodi.group("left"))
+        right = float(jodi.group("right"))
+        remember("configuration_details", quote, quote)
+        remember("original_bhk", left, quote)
+        remember("current_bhk", left + right, quote)
+        remember("is_combination_unit", True, quote)
+
+    if provenance:
+        corrected["provenance"] = provenance
+    if field_confidence:
+        corrected["field_confidence"] = field_confidence
+    return corrected
+
+
+def _ai_extraction_to_typed(
+    ai_extraction: dict,
+    raw_text: str,
+    sender_name: str = "",
+    push_name: str = "",
+    slice_text: str | None = None,
+    *,
+    raw_message_id: int | None = None,
+    tenant_id: str | None = None,
+    broker_id: int | None = None,
+    broker_phone: str | None = None,
+    listing_index: int = 0,
+) -> tuple[str, dict]:
+    """Convert one normalized LLM item into a row for a typed table.
+
+    This is deliberately pure: it does not perform I/O and therefore can be
+    tested before a worker is allowed to write to Supabase.  ``save_parsed``
+    remains a compatibility wrapper for the existing resolver flow, while new
+    callers can use this explicit table/row contract directly.
+    """
+    source_text = (slice_text or raw_text or "").strip()
+    ai = _clean_extraction_value(dict(ai_extraction or {}))
+    ai = _recover_explicit_source_fields(ai, source_text)
+    ai = _apply_source_grounded_bhk_fallback(ai, raw_text, slice_text)
+    source_slice_id = (
+        f"{raw_message_id}:{listing_index}"
+        if raw_message_id is not None
+        else None
+    )
+    authority_result = evaluate_extraction_authority(
+        ai,
+        source_text,
+        source_slice_id=source_slice_id,
+    )
+    ai = apply_authority_result(ai, authority_result)
+    ai = _apply_source_evidence_gates(ai, source_text)
+    ai = canonicalize_extraction_confidence(ai, force_review=bool(ai.get("needs_review")))
+    asset = str(ai.get("property_category") or "residential").lower()
+    if asset not in {"residential", "commercial"}:
+        asset = "residential"
+    # `listing_type` is the contract used by the extraction schema and is
+    # source-grounded for this item.  Some providers have historically
+    # emitted a conflicting classified_transaction_type (for example,
+    # listing_type=sale with classified_transaction_type=rent); routing on
+    # the latter sends the row into the wrong typed table.
+    listing_type = str(ai.get("routing_listing_type") or ai.get("listing_type") or "").strip().lower()
+    is_requirement = (
+        listing_type == "requirement"
+        or ai.get("classified_is_requirement") is True
+        or (ai.get("message_class") == "requirement" and listing_type not in {"sale", "rent"})
+    )
+    if is_requirement:
+        tx = str(ai.get("transaction_type") or ai.get("classified_transaction_type") or "sale").lower()
+    else:
+        tx = str(listing_type or ai.get("transaction_type") or ai.get("classified_transaction_type") or "sale").lower()
+    if tx not in {"sale", "rent"}:
+        tx = "sale"
+    # ``mixed`` describes the document, not every item in it. A mixed
+    # broadcast can contain both supply and demand; route each item from its
+    # own listing_type and only treat the item as demand when it is explicitly
+    # a requirement.
+    table_map = {
+        ("residential", "sale", False): "residential_sale_listings",
+        ("residential", "rent", False): "residential_rent_listings",
+        ("commercial", "sale", False): "commercial_sale_listings",
+        ("commercial", "rent", False): "commercial_rent_listings",
+        ("residential", "sale", True): "residential_sale_requirements",
+        ("residential", "rent", True): "residential_rent_requirements",
+        ("commercial", "sale", True): "commercial_sale_requirements",
+        ("commercial", "rent", True): "commercial_rent_requirements",
+    }
+    table = table_map[(asset, tx, is_requirement)]
+    flat = _ai_extraction_to_parsed(
+        ai,
+        raw_text,
+        sender_name,
+        push_name,
+        slice_text,
+        authority_result=authority_result,
+        source_slice_id=source_slice_id,
+    )
+    locality = ai.get("locality") if isinstance(ai.get("locality"), dict) else {}
+    raw_locality = locality.get("raw_mention") or flat.get("location_raw")
+    resolved_locality = locality.get("resolved_locality") or flat.get("micro_market")
+    fingerprint = hashlib.sha256(source_text.lower().encode("utf-8")).hexdigest()
+    # `_ai_extraction_to_parsed` is the single source-grounding authority.
+    # Do not fall back to the provider's raw building candidate here: that
+    # would reintroduce a broker footer name after the shared guard cleared it.
+    building_name = flat.get("building_name") or _infer_building_name_from_source(source_text, resolved_locality)
+    flat_flags = list(flat.get("validation_flags") or [])
+    if flat.get("_building_name_was_broker_signature"):
+        building_name = None
+        ai["building_name"] = None
+        ai["title"] = None
+        ai["needs_review"] = True
+        ai["validation_flags"] = list(dict.fromkeys(
+            list(ai.get("validation_flags") or []) + flat_flags
+        ))
+    bhk_str = flat.get("bhk")
+    summary_title = _source_grounded_title(
+        {**ai, "title": None} if flat.get("_building_name_was_broker_signature") else ai,
+        flat,
+        source_text,
+    )
+    public_metadata = _public_metadata(ai, source_text, summary_title, is_requirement)
+    row = {
+        "raw_message_id": raw_message_id,
+        "tenant_id": tenant_id,
+        "listing_index": listing_index,
+        # Do not persist a provider-invented quantity (for example, treating
+        # the ``5`` in ``5 BHK`` as five units).  The AI payload above remains
+        # intact for review; this typed structural field requires source
+        # backed multi-unit syntax.
+        "listing_count": (
+            int(multi_unit.group("count"))
+            if (multi_unit := _MULTI_UNIT_BHK_RE.search(source_text))
+            else None
+        ),
+        "asset_type": asset,
+        "transaction_type": tx,
+        "source_fingerprint": fingerprint,
+        "building_name": building_name,
+        "locality_raw": raw_locality,
+        "locality_resolved": resolved_locality,
+        "micro_market": resolved_locality,
+        "landmark_name": ai.get("landmark_name"),
+        "street_name": ai.get("street_name"),
+        "developer_name": ai.get("developer_name") or ai.get("developer"),
+        "broker_id": broker_id,
+        "broker_name": _clean_broker_name(ai.get("broker_name")),
+        "broker_phone": broker_phone,
+        "broker_rera_number": ai.get("broker_rera_number"),
+        "group_name": ai.get("group_name"),
+        # Rebuild the title when a source guard repaired/quarantined the
+        # building field; never publish the stale AI title containing the bad
+        # token. Otherwise retain the richer model-generated title.
+        "summary_title": summary_title,
+        "normalized_message": _lossless_normalized_message(raw_text, source_text),
+        "raw_payload": {
+            "full_text": raw_text,
+            "slice_text": slice_text or raw_text,
+            **public_metadata,
+        },
+        "ai_extraction": ai,
+        "deal_tags": ai.get("deal_tags") or [],
+        "additional_charges": ai.get("additional_charges") or [],
+        "broker_notes": _safe_broker_notes(ai.get("broker_notes")),
+        "validation_flags": list(dict.fromkeys(
+            list(ai.get("validation_flags") or []) + flat_flags
+        )),
+        "needs_review": bool(ai.get("needs_review") or flat.get("needs_review")),
+        "extraction_confidence": ai.get("extraction_confidence") or "medium",
+        "extraction_confidence_score": _confidence_score(
+            ai.get("extraction_confidence_score")
+            if ai.get("extraction_confidence_score") is not None
+            else ai.get("confidence")
+        ),
+        "model_confidence": _confidence_score(ai.get("model_confidence")),
+        "pipeline_review": bool(ai.get("pipeline_review", ai.get("needs_review"))),
+        "pipeline_review_reasons": list(ai.get("pipeline_review_reasons") or ai.get("validation_flags") or []),
+        "write_blocked": bool(ai.get("write_blocked")),
+    }
+    price_info = ai.get("price") if isinstance(ai.get("price"), dict) else {}
+    price_info = _source_ground_rental_period(
+        price_info, source_text, tx, ai.get("transaction_type")
+    )
+    ai["price"] = price_info
+    price_value, price_unit = _price_from_ai_and_raw(price_info, source_text)
+    price_max_value = _safe_float(price_info.get("amount_max")) if isinstance(price_info, dict) else None
+    if price_max_value is not None and price_value is not None and price_max_value < price_value:
+        price_max_value = price_value
+        ai["validation_flags"] = list(dict.fromkeys(
+            list(ai.get("validation_flags") or []) + ["price_range_reversed"]
+        ))
+    # Never replace a non-null AI price with a narrower source regex result.
+    # A missing value remains missing and can be reviewed without a silent
+    # reinterpretation of the source.
+    if tx == "rent" and price_unit != "per_sqft" and price_value is not None:
+        # If the model omitted price entirely, the helper already recovered
+        # the explicit quote from this exact source slice. Do not pass the
+        # model's null amount into the rental normalizer.
+        if price_info.get("amount") is not None or price_info.get("raw_price_text"):
+            normalizer = canonical_commercial_rental_price_rupees if asset == "commercial" else canonical_rental_price_rupees
+            price_value = normalizer(
+                price_info.get("amount"),
+                price_info.get("unit"),
+                price_info.get("raw_price_text") or source_text,
+            )
+    if tx == "rent" and price_unit != "per_sqft":
+        recovered_price = source_attached_price(source_text, "rent", commercial=asset == "commercial")
+        if recovered_price:
+            recovered_value, recovered_raw, recovered_unit = recovered_price
+            if price_value is None or (
+                recovered_value
+                and abs(float(price_value) - recovered_value) > max(1000.0, recovered_value * 0.05)
+            ):
+                price_value = recovered_value
+                price_unit = recovered_unit
+                price_info = dict(price_info)
+                price_info["raw_price_text"] = recovered_raw
+                ai["price"] = price_info
+    area = _safe_float(ai.get("carpet_area_sqft") or flat.get("area_sqft"))
+    # A residential 2 BHK with an 80,000 sqft "carpet area" is a malformed
+    # extraction, not usable inventory. Preserve the raw message and flag the
+    # row, but do not publish the impossible structured value.
+    if asset == "residential" and area is not None and area > 25_000:
+        area = None
+        ai_extraction["carpet_area_sqft"] = None
+        ai_extraction["area_raw_text"] = ai_extraction.get("area_raw_text") or "area value exceeded residential plausibility limit"
+        ai_extraction["needs_review"] = True
+        flags = list(ai_extraction.get("validation_flags") or [])
+        flags.append("implausible_residential_area")
+        ai_extraction["validation_flags"] = list(dict.fromkeys(flags))
+    bhk = _normalized_bhk(flat.get("bhk") or ai.get("bhk") or ai.get("bhk_options"))
+    if not is_requirement:
+        row.update({
+            "bhk": bhk,
+            "original_bhk": _safe_float(ai.get("original_bhk")),
+            "current_bhk": _safe_float(ai.get("current_bhk")),
+            "carpet_area_sqft": area,
+            "built_up_area_sqft": ai.get("built_up_area_sqft"),
+            "super_built_up_area_sqft": ai.get("super_built_up_area_sqft"),
+            "area_raw_text": ai.get("area_raw_text"),
+            "balcony_area_sqft": _safe_float(ai.get("balcony_area_sqft")),
+            "balcony_area_raw_text": ai.get("balcony_area_raw_text"),
+            "terrace_area_sqft": _safe_float(ai.get("terrace_area_sqft")),
+            "covered_terrace_area_sqft": _safe_float(ai.get("covered_terrace_area_sqft")),
+            "terrace_area_raw_text": ai.get("terrace_area_raw_text"),
+            "sellable_area_sqft": _safe_float(ai.get("sellable_area_sqft")),
+            "price_raw_text": price_info.get("raw_price_text"),
+            "price_basis": ai.get("price_basis"),
+            "computed_total_asking_price": _safe_float(ai.get("computed_total_asking_price")),
+            "computed_price_confidence": ai.get("computed_price_confidence"),
+            "price_math": ai.get("price_math") if isinstance(ai.get("price_math"), dict) else {},
+            "furnishing_status": ai.get("furnishing_status"),
+            "unit_condition": ai.get("unit_condition"),
+            "availability_status": ai.get("availability_status"),
+            "possession_status": ai.get("possession_status"),
+            "possession_date": ai.get("possession_date"),
+            "bathroom_count": ai.get("bathroom_count"),
+            "car_parking_count": ai.get("car_parking_count"),
+            "parking_type": ai.get("parking_type"),
+            "parking_details": ai.get("parking_details") if isinstance(ai.get("parking_details"), dict) else {},
+            "floor_range": ai.get("floor_range"),
+            "floor_min": _safe_int(ai.get("floor_min")),
+            "floor_max": _safe_int(ai.get("floor_max")),
+            "floor_label": ai.get("floor_label"),
+            "wing": ai.get("wing"),
+            "building_amenities": ai.get("building_amenities") or [],
+            "unit_amenities": ai.get("amenities") or [],
+            "amenities_unverified_claim": ai.get("amenities_unverified_claim"),
+            "brokerage_type": ai.get("brokerage_type"),
+            "brokerage_context": ai.get("brokerage_context"),
+            "co_brokered": ai.get("co_brokered"),
+            "plus_one_deal": ai.get("plus_one_deal"),
+            "fee_sharing_required": ai.get("fee_sharing_required"),
+            "brokerage_terms_raw": ai.get("brokerage_terms_raw"),
+            "client_profile_required": ai.get("client_profile_required"),
+            "availability_status": ai.get("availability_status"),
+            "availability_date_raw": ai.get("availability_date_raw"),
+            "has_lift": ai.get("has_lift"),
+            "balcony_present": ai.get("balcony_present"),
+            "sit_out_present": ai.get("sit_out_present"),
+            "lease_term_min_months": _safe_int(ai.get("lease_term_min_months")),
+            "lease_term_max_months": _safe_int(ai.get("lease_term_max_months")),
+            "lease_term_raw_text": ai.get("lease_term_raw_text"),
+            "broker_company": ai.get("broker_company"),
+            "contacts": ai.get("contacts")[:8] if isinstance(ai.get("contacts"), list) else [],
+            "showing_instructions": ai.get("showing_instructions"),
+            "contact_instructions": ai.get("contact_instructions"),
+            "unit_condition": ai.get("unit_condition"),
+            "view_description": ai.get("view_description"),
+            "parking_details": ai.get("parking_details") if isinstance(ai.get("parking_details"), dict) else {},
+            "society_restrictions_raw": ai.get("society_restrictions_raw"),
+            "unstructured_facts": {
+                **(ai.get("unstructured_facts") if isinstance(ai.get("unstructured_facts"), dict) else {}),
+                **({"property_intelligence": ai["property_intelligence"]}
+                   if isinstance(ai.get("property_intelligence"), dict)
+                   else {}),
+            },
+            "configuration_details": ai.get("configuration_details"),
+            "is_converted_unit": ai.get("is_converted_unit"),
+            "is_combination_unit": ai.get("is_combination_unit"),
+            "can_sell_separately": ai.get("can_sell_separately"),
+            "vastu_compliant": ai.get("vastu_compliant"),
+            "view_description": ai.get("view_description"),
+            "society_restrictions": ai.get("society_restrictions") if isinstance(ai.get("society_restrictions"), list) else [],
+            "society_restrictions_raw": ai.get("society_restrictions_raw"),
+            "broker_company": ai.get("broker_company"),
+            "contacts": ai.get("contacts")[:8] if isinstance(ai.get("contacts"), list) else [],
+            "showing_instructions": ai.get("showing_instructions"),
+            "contact_instructions": ai.get("contact_instructions"),
+            "source_notes": ai.get("source_notes"),
+            "unstructured_facts": {
+                **(ai.get("unstructured_facts") if isinstance(ai.get("unstructured_facts"), dict) else {}),
+                **({"property_intelligence": ai["property_intelligence"]}
+                   if isinstance(ai.get("property_intelligence"), dict)
+                   else {}),
+            },
+        })
+        if tx == "sale":
+            row["total_asking_price"] = price_value if price_unit != "per_sqft" else None
+            row["price_max"] = price_max_value if price_unit != "per_sqft" else None
+            row["price_per_sqft"] = price_value if price_unit == "per_sqft" else None
+            if price_unit == "per_sqft":
+                price_basis = str(ai.get("price_basis") or "").lower()
+                pricing_area = ai.get("chargeable_area_sqft") if asset == "commercial" and "chargeable" in price_basis else area
+                if pricing_area:
+                    row["total_asking_price"] = price_value * pricing_area
+                    row["price_max"] = price_max_value * pricing_area if price_max_value is not None else None
+                    row["price_math"] = {
+                        "rate": price_value,
+                        "basis": "chargeable_area_sqft" if asset == "commercial" and "chargeable" in price_basis else "carpet_area_sqft",
+                        "area_sqft": pricing_area,
+                        "formula": f"{price_value} * {pricing_area}",
+                        "computed_total_asking_price": row["total_asking_price"],
+                    }
+        else:
+            row["monthly_rent"] = price_value if price_unit != "per_sqft" else None
+            row["monthly_rent_max"] = price_max_value if price_unit != "per_sqft" else None
+            row["rent_per_sqft"] = price_value if price_unit == "per_sqft" else None
+            if price_unit == "per_sqft":
+                price_basis = str(ai.get("price_basis") or "").lower()
+                pricing_area = (
+                    ai.get("chargeable_area_sqft")
+                    if asset == "commercial" and "chargeable" in price_basis
+                    else area
+                )
+                if pricing_area:
+                    row["monthly_rent"] = price_value * pricing_area
+                    row["monthly_rent_max"] = price_max_value * pricing_area if price_max_value is not None else None
+                    row["price_math"] = {
+                        "rate": price_value,
+                        "basis": "chargeable_area_sqft" if asset == "commercial" and "chargeable" in price_basis else "carpet_area_sqft",
+                        "area_sqft": pricing_area,
+                        "formula": f"{price_value} * {pricing_area}",
+                        "computed_monthly_rent": row["monthly_rent"],
+                    }
+        if asset == "commercial":
+            # Unknown commercial use is not evidence of mixed use. Persist the
+            # subtype only when extraction found one in the source message.
+            row["commercial_use_type"] = ai.get("commercial_use_type")
+            row["fitout_status"] = ai.get("fitout_status")
+            row["ceiling_height"] = ai.get("ceiling_height")
+            row["power_load_kw"] = ai.get("power_load_kw")
+            row["cam_amount"] = ai.get("cam_amount")
+            row["cam_applicable"] = ai.get("cam_applicable")
+            row["cam_unit"] = ai.get("cam_unit")
+            for field in (
+                "broker_rera_number", "floor_level", "floor_count", "mezzanine_area_sqft", "possession_status",
+                "possession_date", "availability_status", "rent_inclusions", "license_type",
+                "short_term_allowed", "inspection_notice_minutes", "frontage_ft",
+                "entrance_count", "otla_area_sqft", "otla_area_raw_text", "terrace_area_sqft",
+                "covered_terrace_area_sqft", "terrace_area_raw_text", "heritage_space",
+                "permitted_use_types", "ideal_for", "automatic_shutter_count", "room_count",
+                "suite_count", "banquet_hall_count", "restaurant_count", "bar_facility",
+                "operational_status", "director_cabin_count", "ceo_cabin_present",
+                "cubicle_count", "conference_room_capacity", "meeting_room_capacity",
+                "training_room_capacity", "cafeteria_seat_count", "accounts_area", "lounge_area",
+                "developer_name", "super_built_up_area_sqft", "saleable_area_sqft",
+                "project_inventory", "area_min_sqft", "area_max_sqft", "floor_plate_sqft",
+                "project_status",
+            ):
+                if ai.get(field) is not None:
+                    row[field] = ai.get(field)
+            row["rent_inclusions"] = ai.get("rent_inclusions")
+        if tx == "rent":
+            rent = row.get("monthly_rent")
+            row.update(_parse_deposit(str(ai.get("deposit_raw_text") or raw_text), rent))
+            if rent_price_needs_review(rent, raw_text):
+                row["needs_review"] = True
+                row["extraction_confidence"] = "low"
+    else:
+        budget_min = _clean_budget_bound(ai.get("budget_min"))
+        budget_max = _clean_budget_bound(ai.get("budget_max") or price_value)
+        # A single stated requirement budget is a point budget, not a sale
+        # price. Keep both bounds populated for the UI/search contract unless
+        # the wording explicitly makes it an upper ceiling.
+        budget_text = f"{source_text} {slice_text or ''}".lower()
+        has_upper_ceiling = bool(re.search(r"\b(?:up\s*to|upto|max(?:imum)?|under|below|not\s+exceed(?:ing)?)\b", budget_text))
+        if budget_min is None and budget_max is not None and not has_upper_ceiling:
+            budget_min = budget_max
+        row.update({
+            # A requirement can be for rent or purchase. The old hard-coded
+            # BUY here made rental requirements render as "buy" cards even
+            # when the source/model clearly classified them as rent.
+            "intent": "RENT" if tx == "rent" else "BUY",
+            "budget_min": budget_min,
+            "budget_max": budget_max,
+            "budget_currency": "INR",
+            "area_min_sqft": ai.get("area_min_sqft") or area,
+            "area_max_sqft": ai.get("area_max_sqft") or area,
+            "locality_options": ai.get("locality_options") or ([resolved_locality] if resolved_locality else []),
+            "landmark_options": ai.get("landmark_options") or [],
+            "is_flexible": bool(ai.get("is_flexible")),
+            "urgency": ai.get("urgency") or "normal",
+            "status": "active",
+            "furnishing_preference": ai.get("furnishing_preference"),
+            "possession_preference": ai.get("possession_preference"),
+            "amenity_requirements": ai.get("amenity_requirements") or [],
+        })
+        # BHK is a residential-only requirement dimension. Do not put the
+        # generic field into commercial payloads and make storage discard it
+        # later with a warning.
+        if asset == "residential":
+            row["bhk_options"] = [bhk] if bhk is not None else []
+        if asset == "commercial":
+            row["commercial_use_type"] = ai.get("commercial_use_type") or []
+            for field in (
+                "intended_use_details", "area_basis_preference", "location_flexibility",
+                "floor_min", "floor_max", "floor_count_max", "floor_preference",
+                "consecutive_floors_required", "parking_required",
+                "needs_attached_washroom", "needs_washroom", "needs_pantry",
+                "needs_mezzanine", "needs_lift", "needs_power_backup", "needs_central_ac",
+                "power_requirements", "premium_building_required", "glass_facade_required",
+                "residential_cum_commercial_ok", "by_lanes_accepted", "media_requested",
+                "entrance_requirement", "signage_required", "loading_access_required",
+                "budget_includes_maintenance",
+                "min_cabin_count", "min_workstation_count", "needs_conference_room",
+                "brokerage_context", "brokerage_terms_raw", "contacts",
+            ):
+                if ai.get(field) is not None:
+                    row[field] = ai.get(field)
+            row["urgency"] = ai.get("urgency") or row.get("urgency")
+        elif tx == "rent":
+            row.update({
+                "tenant_type": ai.get("tenant_type"),
+                "nationality": ai.get("nationality"),
+                "has_pets": ai.get("has_pets"),
+                "sharing_acceptable": ai.get("sharing_acceptable"),
+                "food_preference": ai.get("food_preference"),
+                "floor_preference": ai.get("floor_preference"),
+                "view_preference": ai.get("view_preference"),
+                "building_preferences": ai.get("building_preferences") or [],
+                "age_preference": ai.get("age_preference"),
+                "car_parking_min": ai.get("car_parking_min"),
+                "amenity_requirements": ai.get("amenity_requirements") or [],
+                "lease_term_preference": ai.get("lease_term_preference"),
+                "deposit_budget_max": ai.get("deposit_budget_max"),
+                "brokerage_willingness": ai.get("brokerage_willingness"),
+            })
+    # A typed schema exists for terrace, but older/provider responses can still
+    # omit it. Preserve the explicit source fact instead of losing it between
+    # the AI response and the typed table.
+    _preserve_terrace_fact(ai, source_text, row)
+    row = _clean_extraction_value(row)
+    return table, {k: v for k, v in row.items() if v is not None}
+
+
+def _normalized_bhk(value) -> float | None:
+    """Return a comparable BHK value without guessing when none is present."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if "rk" in text:
+        return 0.5
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _deterministic_price_rupees(item: dict) -> float | None:
+    """Convert a deterministic boundary price to absolute rupees."""
+    return canonical_price_rupees(item.get("price"), item.get("price_unit"), item.get("price_raw_text"))
+
+
+def _meaningful_name_tokens(value) -> set[str]:
+    if not value:
+        return set()
+    generic = {
+        "apartment", "apartments", "building", "bungalow", "commercial",
+        "flat", "office", "project", "residential", "residency", "society",
+        "tower", "towers",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value).lower())
+        if len(token) >= 3 and token not in generic
+    }
+
+
+def _ai_item_matches_boundary(ai_item: dict, boundary: dict, source_text: str) -> tuple[bool, list[str]]:
+    """Reject explicit cross-unit conflicts between AI output and a split block.
+
+    Missing fields are allowed because AI may legitimately recover an anchor the
+    regex splitter missed. Explicitly conflicting BHK, area, price, or building
+    values are not allowed: those are the common signs that sibling properties
+    were merged or reordered.
+    """
+    parsed = _ai_extraction_to_parsed(ai_item, source_text, "", "")
+    conflicts: list[str] = []
+
+    boundary_bhk = _normalized_bhk(boundary.get("bhk"))
+    ai_bhk = _normalized_bhk(parsed.get("bhk"))
+    if boundary_bhk is not None and ai_bhk is not None and boundary_bhk != ai_bhk:
+        conflicts.append(f"bhk {ai_bhk:g}!={boundary_bhk:g}")
+
+    try:
+        boundary_area = float(boundary.get("area_sqft")) if boundary.get("area_sqft") not in (None, "") else None
+        ai_area = float(parsed.get("area_sqft")) if parsed.get("area_sqft") not in (None, "") else None
+    except (TypeError, ValueError):
+        boundary_area = ai_area = None
+    if boundary_area is not None and ai_area is not None:
+        tolerance = max(25.0, boundary_area * 0.03)
+        if abs(ai_area - boundary_area) > tolerance:
+            conflicts.append(f"area {ai_area:g}!={boundary_area:g}")
+
+    boundary_price = _deterministic_price_rupees(boundary)
+    try:
+        ai_price = float(parsed.get("price")) if parsed.get("price") not in (None, "") else None
+    except (TypeError, ValueError):
+        ai_price = None
+    if boundary_price is not None and ai_price is not None:
+        tolerance = max(25_000.0, boundary_price * 0.02)
+        if abs(ai_price - boundary_price) > tolerance:
+            conflicts.append(f"price {ai_price:g}!={boundary_price:g}")
+
+    boundary_building = _meaningful_name_tokens(
+        boundary.get("building_name") or boundary.get("project_name")
+    )
+    ai_building = _meaningful_name_tokens(parsed.get("building_name"))
+    if boundary_building and ai_building and boundary_building.isdisjoint(ai_building):
+        conflicts.append("building mismatch")
+
+    return not conflicts, conflicts
+
+
+def check_share_eligibility(parsed: dict, org_privacy: dict, conv_type: str = "unknown") -> tuple[bool, str]:
+    """Return whether a parsed item may participate in shared-market views.
+
+    Raw messages and tenant-owned observations are always retained. This flag
+    only controls cross-tenant sharing/materialized market surfaces.
+    """
+    mode = str(org_privacy.get("privacy_mode") or "private").lower()
+    if mode in {"private", "tenant_private"}:
+        return False, "organization_privacy_private"
+
+    intent = str(parsed.get("intent") or conv_type or "").upper()
+    is_requirement = intent in {"BUY", "REQUIREMENT", "RENTAL_SEEKER", "TENANT", "DEMAND"}
+    if is_requirement and not org_privacy.get("share_requirements", False):
+        return False, "requirements_sharing_disabled"
+    if not is_requirement and not org_privacy.get("share_listings", False):
+        return False, "listing_sharing_disabled"
+    return True, "eligible"
+
+
+_INDIAN_MOBILE_IN_TEXT = re.compile(r'(?<!\d)(?:\+?91[-.\s]?)?[6-9]\d{9}(?!\d)')
+
+_REDACTED_MARKER = "[Contact redacted — see agent]"
+_INDIAN_MOBILE_LOOSE = re.compile(r'(?<!\d)(?:\+?91[-.\s]?)?[6-9]\d{4}[-\s.]?\d{5}(?!\d)')
+# 11-digit bare phones (with optional '0' STD prefix) that real brokers paste
+# without separators. The strict LOOSE pattern misses them because its
+# 5-trailing-digit lookahead hits the leftover 11th digit. Lookbehind/lookahead
+# keep the digit boundary tight (no embedding in longer runs).
+_INDIAN_MOBILE_LONG = re.compile(r'(?<!\d)(?:0[6-9]\d{9}|[6-9]\d{10})(?!\d)')
+
+def _redact_indian_mobiles(text: str) -> str:
+    """Replace Indian mobile numbers with a redaction marker for display.
+
+    Catches standard 10-digit (9876543210, +91 9876543210, 98765-43210),
+    11-digit bare phones (90048427759, 84335469487) and 12-digit STD-prefixed
+    numbers (09004842775). The original digits still live in
+    raw_payload.full_text for audit and broker-resolution paths.
+
+    Note: 3+3+4 / 2+2+2+2+2 obfuscation is intentionally NOT covered —
+    a pre-cleaning regex would mangle prices like "Rs8.5L" into "Rs85L".
+    """
+    if not text:
+        return ""
+    cleaned = _INDIAN_MOBILE_LOOSE.sub(_REDACTED_MARKER, text)
+    cleaned = _INDIAN_MOBILE_LONG.sub(_REDACTED_MARKER, cleaned)
+    cleaned = _INDIAN_MOBILE_IN_TEXT.sub(_REDACTED_MARKER, cleaned)
+    while _REDACTED_MARKER + " " + _REDACTED_MARKER in cleaned:
+        cleaned = cleaned.replace(_REDACTED_MARKER + " " + _REDACTED_MARKER, _REDACTED_MARKER)
+    while "  " in cleaned:
+        cleaned = cleaned.replace("  ", " ")
+    return cleaned.strip()
+
+
+def _lossless_normalized_message(raw_text: str, fallback_text: str = "") -> str:
+    """Persist complete normalized evidence, never a shortened listing slice."""
+    from normalize import normalize_for_storage
+
+    source = raw_text or fallback_text
+    return _redact_indian_mobiles(normalize_for_storage(source or ""))
+
+
+def _llm_source_slices_are_grounded(msg_text: str, ai_items: list[dict]) -> list[str]:
+    """Accept model-provided slices only when they are exclusive raw evidence."""
+    if not ai_items:
+        return []
+
+    def compact(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    source = compact(msg_text)
+    slices = [str(item.get("source_slice") or "").strip() for item in ai_items]
+    compact_slices = [compact(value) for value in slices]
+    if not source or any(not value or value not in source for value in compact_slices):
+        return []
+
+    def compact_number(value: object) -> str:
+        return re.sub(r"[^0-9]", "", str(value or ""))
+
+    def item_anchors_are_present(item: dict, source_slice: str) -> bool:
+        """Require the slice to carry the item's own identity/value anchors.
+
+        A compact-substring check alone accepts fragments such as ``3 bhk
+        2.25`` cut out of an inline broadcast, even when the item's actual
+        quote is 2.5 lakh and its area is 2,250 sqft. Such a fragment is raw
+        text, but it is not exclusive evidence for that extracted item.
+        """
+        folded = compact(source_slice)
+        bhk = item.get("bhk")
+        if bhk is not None:
+            bhk_token = compact_number(bhk)
+            if bhk_token and f"{bhk_token}bhk" not in folded:
+                # ``4+1 BHK`` / ``3 BHK + 2 BHK (JODI)`` describe a combined
+                # unit; the provider may report the base or the summed BHK.
+                # The slice still carries this item's own configuration
+                # evidence, so do not force the weak block fallback here.
+                if not (
+                    re.search(r"\d\s*\+\s*\d+\s*(?:bhk|bhd|rk|bed|br)\b", source_slice, re.IGNORECASE)
+                    or _COMBINATION_BHK_RE.search(source_slice)
+                    or _JODI_BHK_RE.search(source_slice)
+                ):
+                    return False
+        price = item.get("price") if isinstance(item.get("price"), dict) else {}
+        raw_price = str(price.get("raw_price_text") or "")
+        raw_price_number = re.search(r"\d+(?:[,.]\d+)?", raw_price)
+        if raw_price_number and compact_number(raw_price_number.group()) not in folded:
+            return False
+        area = item.get("carpet_area_sqft") or item.get("area_sqft")
+        if area is not None:
+            area_raw = str(item.get("area_raw_text") or "")
+            area_number = re.search(r"\d[\d,]*(?:\.\d+)?", area_raw)
+            expected_area = compact_number(area_number.group() if area_number else area)
+            if expected_area and expected_area not in folded:
+                return False
+        building = item.get("building_name")
+        if building and compact(building) not in folded:
+            # A missing building heading can be valid for a locality-only
+            # listing; if the model supplied a building, however, the slice
+            # must prove that it belongs to this item.
+            return False
+        return True
+
+    if any(not item_anchors_are_present(item, source_slice) for item, source_slice in zip(ai_items, slices)):
+        return []
+    if len(set(compact_slices)) != len(compact_slices):
+        return []
+    # Reject nested slices: one item must not claim the complete broadcast or
+    # another item's block as its own evidence.
+    for index, value in enumerate(compact_slices):
+        if any(
+            index != other_index and (value in other or other in value)
+            for other_index, other in enumerate(compact_slices)
+        ):
+            return []
+    return slices
+
+
+_NUMBERED_ITEM_START_RE = re.compile(
+    # ``1)`` / ``(2)`` markers are unambiguous item headings even when the
+    # item text starts with a digit (``14) 4Bhk flat``). "." or "/" separators
+    # are only markers when a letter follows, so amount lines such as
+    # ``2. 5 LAC`` and decimals such as ``2.5 Cr`` are not mistaken for items.
+    r"^\s*(?:[*_~]{0,3}\s*)*(?:\(\s*\d{1,3}\s*\)\s*|\d{1,3}\s*\)\s*|\d{1,3}\s*[./]\s+(?=[^\d\s]))"
+)
+
+
+def _numbered_item_segments(msg_text: str) -> list[str]:
+    """Group a jammed numbered broadcast into one segment per numbered item.
+
+    The semantic segmenter deliberately returns no blocks for dense numbered
+    broadcasts. Per-line matching then cannot keep an item's heading, area and
+    price together, so a later item silently inherits a neighbour's building.
+    When the message carries two or more numbered markers, regroup the lines at
+    those markers so each listing owns one exclusive, multi-line slice.
+    """
+    lines = [line.strip() for line in str(msg_text or "").splitlines() if line.strip()]
+    starts: list[int] = []
+    for index, line in enumerate(lines):
+        if _NUMBERED_ITEM_START_RE.match(_strip_icons(line).strip()):
+            starts.append(index)
+    if len(starts) < 2:
+        return []
+    segments: list[str] = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        segment = "\n".join(lines[start:end]).strip()
+        if segment:
+            segments.append(segment)
+    return segments
+
+
+def _slice_blocks_for_ai_items(msg_text: str, ai_items: list) -> list[str]:
+    """Assign per-listing slice text from the document segmenter output.
+
+    Prefer semantic item-to-block matching when the model and segmenter
+    disagree on counts. Falling back to the whole broadcast makes every card
+    look like the original dump and defeats source-grounded extraction.
+    """
+    if not ai_items:
+        return []
+    try:
+        from ai_extraction import _segment_document
+        segments = _segment_document(msg_text or "")
+    except Exception:
+        return [msg_text] * len(ai_items)
+    blocks = (segments or {}).get("blocks") or []
+
+    # The segmenter intentionally returns no semantic blocks for dense,
+    # numbered one-line requirements. Those lines are still exclusive source
+    # blocks when their count can cover the AI items; falling back to the whole
+    # broadcast would cross-wire otherwise distinct BHK/budget evidence.
+    line_blocks = [
+        {"text": line.strip()}
+        for line in str(msg_text or "").splitlines()
+        if line.strip()
+    ]
+    numbered_grouped = False
+    if not blocks:
+        numbered = _numbered_item_segments(msg_text)
+        if len(numbered) >= 2:
+            blocks = [{"text": segment} for segment in numbered]
+            line_blocks = blocks
+            numbered_grouped = True
+        elif len(line_blocks) >= len(ai_items):
+            blocks = line_blocks
+        else:
+            return [msg_text] * len(ai_items)
+
+    def normalize(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    def item_phrases(item: dict) -> list[str]:
+        locality = item.get("locality") if isinstance(item.get("locality"), dict) else {}
+        values = [
+            item.get("building_name"),
+            item.get("title"),
+            item.get("summary_title"),
+            locality.get("raw_mention"),
+            locality.get("resolved_locality"),
+            item.get("locality_raw"),
+        ]
+        phrases = []
+        for value in values:
+            phrase = normalize(value)
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+        return phrases
+
+    def score(item: dict, block: dict) -> int:
+        block_text = normalize(block.get("text"))
+        if not block_text:
+            return 0
+        total = 0
+        for phrase in item_phrases(item):
+            if phrase in block_text:
+                total += 100 + len(phrase.split())
+            else:
+                words = [word for word in phrase.split() if len(word) >= 4]
+                total += sum(1 for word in words if word in block_text)
+        for key in ("bhk", "carpet_area_sqft", "area_sqft", "price", "monthly_rent"):
+            value = normalize(item.get(key))
+            if value and value in block_text:
+                total += 5
+        return total
+
+    # Dense broker broadcasts often encode one complete property per line.
+    # Treat those lines as candidate evidence blocks too; otherwise a section
+    # header or the next listing can be attached to the current AI item.
+    def property_anchor_count(value: str) -> int:
+        checks = (
+            r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b",
+            r"\b\d[\d,]*(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|sft|carpet|bup)\b",
+            r"(?:₹|\brs\.?\s*)?\d+(?:[,.]\d+)?\s*(?:cr|crore|l|lac|lakh|k)\b",
+        )
+        return sum(bool(re.search(pattern, value, re.IGNORECASE)) for pattern in checks)
+
+    signature_names = {
+        normalize(name) for name in _extract_broker_signature_names(msg_text) if name
+    }
+
+    def is_footer_segment(value: str) -> bool:
+        """Broker boilerplate, a contact line, or a signature is never evidence."""
+        text = _strip_icons(value or "").strip()
+        if not text:
+            return True
+        if not _is_actionable_property_slice(text):
+            return True
+        return normalize(text) in signature_names
+
+    footer_indices = {
+        index for index, block in enumerate(blocks)
+        if is_footer_segment(str(block.get("text") or ""))
+    }
+
+    selected: set[int] = set()
+    selected_line_indices: set[int] = set()
+    demand_blocks = _explicit_requirement_source_blocks(msg_text)
+    demand_index = 0
+    last_index: int | None = None
+    result: list[str] = []
+    for item_index, item in enumerate(ai_items):
+        if str(item.get("listing_type") or item.get("routing_listing_type") or "").casefold() == "requirement":
+            demand_block = demand_blocks[demand_index] if demand_index < len(demand_blocks) else ""
+            demand_index += 1
+            if demand_block:
+                result.append(demand_block)
+                last_index = None
+                continue
+        if not numbered_grouped:
+            ranked_lines = sorted(
+                ((score(item, block), line_index) for line_index, block in enumerate(line_blocks) if line_index not in selected_line_indices),
+                key=lambda pair: (pair[0], -pair[1]),
+                reverse=True,
+            )
+            if ranked_lines:
+                line_score, line_index = ranked_lines[0]
+                line_text = line_blocks[line_index]["text"]
+                # A semantic phrase match (100+) plus two independent property
+                # anchors is strong enough to isolate a one-line listing safely.
+                if line_score >= 100 and property_anchor_count(line_text) >= 2:
+                    selected_line_indices.add(line_index)
+                    result.append(line_text)
+                    last_index = line_index
+                    continue
+        ranked = sorted(
+            ((score(item, block), block_index) for block_index, block in enumerate(blocks)),
+            key=lambda pair: (pair[0], -pair[1]),
+            reverse=True,
+        )
+        best_score, best_index = ranked[0]
+        # A block may legitimately carry several AI items (a "TWO OPTIONS"
+        # listing split per unit). Plain re-selection by an adjacent item is
+        # reuse, not cross-wiring; only a non-adjacent re-selection is unsafe.
+        reuse = best_index == last_index
+        if best_score <= 0 or (best_index in selected and not reuse):
+            # The model preserves document order in normal operation. If no
+            # semantic anchor survives normalization, use the corresponding
+            # document block rather than leaking the complete broadcast.
+            best_index = min(item_index, len(blocks) - 1)
+        if best_index in footer_indices:
+            # Footer/boilerplate text is never a listing's own evidence. An
+            # item that only lines up with the footer IS the footer, so hand it
+            # the footer block and let the actionability gate drop it.
+            non_footer = [index for index in range(len(blocks)) if index not in footer_indices]
+            if best_score <= 0 and non_footer:
+                best_index = non_footer[min(item_index, len(non_footer) - 1)]
+            else:
+                start = last_index if last_index is not None else 0
+                footer_region = "\n".join(
+                    str(blocks[index].get("text") or "")
+                    for index in sorted(footer_indices)
+                    if index >= start
+                ).strip()
+                result.append(footer_region or msg_text)
+                last_index = None
+                continue
+        selected.add(best_index)
+        text = (blocks[best_index].get("text") or "").strip()
+        result.append(text or msg_text)
+        last_index = best_index
+    # A named project header before the first BHK/property anchor is shared
+    # evidence for every child block in this broadcast. Carry only that
+    # header—not sibling prices, areas, or amenities—into each slice so the
+    # model and the persistence guards can ground the building consistently.
+    shared_building = _infer_shared_building_name(msg_text)
+    if shared_building:
+        shared_norm = normalize(shared_building)
+        result = [
+            value
+            if str(ai_items[index].get("listing_type") or ai_items[index].get("routing_listing_type") or "").casefold() == "requirement"
+            or shared_norm in normalize(value)
+            else f"{shared_building}\n{value}"
+            for index, value in enumerate(result)
+        ]
+    return result
+
+
+def _is_actionable_property_slice(value: str) -> bool:
+    """Reject footer/header-only AI items before they become typed rows.
+
+    A text-only buyer requirement can be actionable, so absence of a numeric
+    property anchor is not sufficient for rejection. We reject only slices
+    that positively identify themselves as broker boilerplate.
+    """
+    text = str(value or "")
+    if _UNSUPPORTED_PG_RE.search(text):
+        return False
+    if re.fullmatch(
+        r"(?is)[\s*_~\W]*(?:(?:updated|new|latest|available)\s+)*"
+        r"(?:\d+(?:\.\d+)?\s*(?:bhk|rk)\s+)?"
+        r"(?:residential\s+)?(?:outright|sale|rent|lease)?\s*list(?:ings?)?"
+        r"[\s*_~\W]*",
+        text,
+    ):
+        return False
+    if re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b|"
+        r"\b\d[\d,]*(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|sft|carpet|bup)\b|"
+        r"(?:₹|\brs\.?\s*)?\d+(?:[,.]\d+)?\s*(?:cr|crore|l|lac|lakh|k)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if _INDIAN_MOBILE_IN_TEXT.search(text):
+        return False
+    if re.search(
+        r"(?i)\b(?:maha\s*rera|rera\s+regd|client\s+(?:business\s+)?profile|"
+        r"allow\s+\d+\s*hrs?|set\s+up\s+visits?|for\s+(?:further|more)\s+details)\b",
+        text,
+    ):
+        return False
+    if re.fullmatch(
+        r"(?is)[\s*_~\W]*(?:new\s+listings?(?:\s+added)?|residential\s+outright|"
+        r"commercial\s+(?:rent|sale|lease))[\s*_~\W]*",
+        text,
+    ):
+        return False
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def _extract_broker_contact_from_text(text: str) -> tuple[str | None, str | None]:
+    """Extract Indian mobile number and optional broker name from message body text.
+
+    Returns (phone, name) where phone is the 10-digit validated number (first
+    match), and name is any text on the same line immediately before the number
+    that doesn't look like another number.
+    """
+    if not text:
+        return None, None
+    # Do not remove newlines between separate phone numbers. Bulk broker
+    # footers commonly put one contact per line; collapsing those lines turns
+    # two valid 10-digit numbers into one invalid 20-digit number.
+    cleaned = re.sub(r'(?<=\d)[-. ]+(?=\d)', '', text)
+    phone = None
+    name = None
+    for m in _INDIAN_MOBILE_IN_TEXT.finditer(cleaned):
+        num = m.group()
+        num_clean = num[-10:] if re.match(r'^\+?91', num) else num
+        if not re.fullmatch(r'[6-9]\d{9}', num_clean):
+            continue
+        if phone is None:
+            phone = num_clean
+            line_start = cleaned.rfind('\n', 0, m.start()) + 1
+            preceding = cleaned[line_start:m.start()].strip().rstrip(':,').strip()
+            if not preceding or re.search(r'\d', preceding) or preceding.casefold().rstrip(":") in _BROKER_FIELD_LABELS:
+                lines_before = cleaned[:line_start].rstrip('\n').split('\n')
+                candidates = []
+                for candidate in reversed(lines_before[-4:]):
+                    candidate = candidate.strip().rstrip(':,').strip()
+                    if (
+                        candidate
+                        and candidate.casefold().rstrip(":") not in _BROKER_FIELD_LABELS
+                        and not re.search(r'\d', candidate)
+                        and 1 < len(candidate) <= 60
+                    ):
+                        candidates.append(candidate)
+                if candidates:
+                    # A location/company line often sits between the person's
+                    # name and `Mobile:`. Prefer the most name-like multi-word
+                    # candidate instead of the literal field label or city.
+                    preceding = max(candidates, key=lambda value: (len(value.split()), -len(value)))
+            if preceding and not re.search(r'\d', preceding) and len(preceding) > 1:
+                name = re.sub(r"[^\w.' &-]", " ", _strip_icons(preceding))
+                name = re.sub(r"\s+", " ", name).strip() or None
+        elif num_clean != phone:
+            break
+    return phone, name
+
+
+def _extract_broker_signature_names(text: str) -> set[str]:
+    """Return every name attached to a phone in a trailing broker signature.
+
+    Broadcasts can contain both the forwarding broker and the originating
+    broker.  The primary contact resolver intentionally chooses one identity,
+    but building validation must reject all footer identities so a second
+    signature cannot become a synthetic building/listing.
+    """
+    non_empty = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not non_empty:
+        return set()
+
+    # Signatures live at the end of broker broadcasts. Keeping this window
+    # bounded avoids treating a phone next to an actual inventory line near
+    # the beginning of a long message as proof that the property is a person.
+    footer_lines = non_empty[-8:]
+    property_anchor_re = re.compile(
+        r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b|"
+        r"\b\d[\d,]*(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|sft|carpet|bup)\b|"
+        r"(?:₹|\brs\.?\s*)?\d+(?:[,.]\d+)?\s*(?:cr|crore|l|lac|lakh|k)\b",
+        re.IGNORECASE,
+    )
+    last_property_index = max(
+        (idx for idx, value in enumerate(footer_lines) if property_anchor_re.search(value)),
+        default=-1,
+    )
+    names: set[str] = set()
+    for index, line in enumerate(footer_lines):
+        match = _INDIAN_MOBILE_IN_TEXT.search(line)
+        if not match:
+            continue
+        preceding = line[:match.start()].strip().rstrip(":,-").strip()
+        candidates = [preceding] if preceding else []
+        # A common footer is company, person, RERA label, then phone. Capture
+        # both company and person; skip the compliance label itself.
+        candidates.extend(footer_lines[max(last_property_index + 1, index - 3):index])
+        for candidate in candidates:
+            candidate = re.sub(r"[^\w.' &-]", " ", _strip_icons(candidate or ""))
+            candidate = re.sub(r"\s+", " ", candidate).strip(" -_:,.*")
+            if (
+                1 < len(candidate) <= 60
+                and not re.search(r"\d", candidate)
+                and not re.search(
+                    r"(?i)\b(?:bhk|rk|rent|sale|lease|carpet|area|floor|building|"
+                    r"apartment|flat|shop|office|plot|terrace|rera|details|visits?|"
+                    r"client|profile|required|regd)\b",
+                    candidate,
+                )
+            ):
+                names.add(candidate.casefold())
+    return names
+
+
+def _quarantine_broker_signature_building(
+    parsed_item: dict,
+    ai_item: dict,
+    signature_names: set[str],
+) -> bool:
+    """Clear an exact footer-identity match before typed-row persistence."""
+    building_name = str(parsed_item.get("building_name") or "").strip()
+    if not building_name or building_name.casefold() not in signature_names:
+        return False
+    parsed_item["building_name"] = None
+    flags = list(parsed_item.get("validation_flags") or [])
+    parsed_item["validation_flags"] = list(dict.fromkeys(
+        flags + ["building_name_is_broker_signature", "building_name_unresolved"]
+    ))
+    parsed_item["needs_review"] = True
+    ai_item["building_name"] = None
+    ai_item["validation_flags"] = parsed_item["validation_flags"]
+    ai_item["needs_review"] = True
+    return True
+
+
+def process_raw_message(raw_id: int, ctx: dict, storage=None):
+    """Process a single raw message through the full extraction pipeline.
+
+    This is the async workhorse — called from both webhook background threads
+    and the extraction worker.  It never touches the webhook request; all
+    context is passed explicitly via `ctx`.
+
+    ctx keys:
+      sender_name, push_name, sender_jid, sender_phone,
+      group, group_name, msg_text, instance, is_dm,
+      message_uid, message_id, msg (raw message dict with image/video flags)
+    """
+    if storage is None:
+        storage = get_storage()
+
+    # Ensure tenant context is set for this extraction run
+    if ctx.get("tenant_id"):
+        storage.tenant_id = ctx["tenant_id"]
+
+    from lab.config import load_excluded_groups
+
+    msg_text = ctx["msg_text"]
+    # Classify structure once at the pipeline boundary.  This metadata is
+    # guidance for later stages and observability; the raw WhatsApp body
+    # remains authoritative and semantic extraction remains provider-owned.
+    from preflight_classifier import classify_message
+    ctx["preflight"] = classify_message(msg_text).as_dict()
+    sender_name = ctx["sender_name"]
+    push_name = ctx["push_name"]
+    sender_jid = ctx["sender_jid"]
+    sender_phone = ctx["sender_phone"]
+    group = ctx["group"]
+    group_name = ctx["group_name"]
+    instance = ctx["instance"]
+    is_dm = ctx["is_dm"]
+    message_uid = ctx["message_uid"]
+    message_id = ctx["message_id"]
+    msg = ctx.get("msg", {})
+
+    # Webhook callers can invoke this workhorse directly, bypassing the
+    # polling worker. Keep WhatsApp transport/control events out of dedupe,
+    # extraction attempts, and model calls on that path as well.
+    if is_protocol_event(
+        message=msg_text,
+        message_type=ctx.get("message_type") or "",
+        raw_payload=ctx.get("raw_payload") or msg,
+    ):
+        marker = getattr(storage, "mark_raw_protocol_event", None)
+        if callable(marker):
+            marker(raw_id)
+        else:
+            storage.mark_raw_processed(raw_id)
+        return {
+            "raw_id": raw_id,
+            "parsed_ids": [],
+            "listing_ids": [],
+            "requirement_ids": [],
+            "storage_status": "skipped",
+            "extraction_source": "protocol_event",
+        }
+
+    pre_llm_skip = should_skip(msg_text)
+    if pre_llm_skip:
+        marker = getattr(storage, "mark_raw_pre_llm_skip", None)
+        if callable(marker):
+            marker(raw_id, pre_llm_skip)
+        else:
+            storage.mark_raw_processed(raw_id)
+        return {
+            "raw_id": raw_id,
+            "parsed_ids": [],
+            "listing_ids": [],
+            "requirement_ids": [],
+            "storage_status": "skipped",
+            "extraction_source": f"pre_llm:{pre_llm_skip}",
+        }
+
+    # Global source blocks are enforced here as well as in the polling worker
+    # because webhook callers can invoke this workhorse directly. Keep the raw
+    # event for audit, but do not allow blocked broker/source text to reach any
+    # parser or model call.
+    try:
+        blocked_source = storage.system_extraction_source_block(
+            message=msg_text,
+            sender=sender_name,
+            sender_phone=sender_phone,
+            push_name=push_name,
+            group_name=group_name,
+        )
+        if blocked_source:
+            suppress = getattr(storage, "suppress_raw_message_for_system_block", None)
+            if suppress:
+                suppress(raw_id, blocked_source)
+            else:
+                storage.mark_raw_processed(raw_id)
+            return {
+                "raw_id": raw_id,
+                "parsed_ids": [],
+                "listing_ids": [],
+                "requirement_ids": [],
+                "storage_status": "skipped",
+                "extraction_source": "system_source_block",
+                "blocked_source": blocked_source.get("display_name") or blocked_source.get("source_key"),
+            }
+    except Exception:
+        # A missing/unavailable control table must not take the extraction
+        # pipeline down. The worker still logs and retries ordinary failures.
+        _logger.debug("system source block check unavailable", exc_info=True)
+
+    # Re-import app-level helpers (they depend on app.py globals)
+    from app import (
+        generate_summary_title, compute_embedding,
+    )
+    # Share eligibility is deterministic and evaluated before persistence. It
+    # keeps private tenant output out of shared-market consumers while leaving
+    # the raw observation available to the owning tenant.
+
+    # Skip excluded groups
+    try:
+        excluded = load_excluded_groups()
+        if group in excluded:
+            storage.mark_raw_processed(raw_id)
+            return {
+                "raw_id": raw_id,
+                "parsed_ids": [],
+                "listing_ids": [],
+                "requirement_ids": [],
+                "storage_status": "skipped",
+                "extraction_source": "excluded_group",
+            }
+    except Exception:
+        pass
+
+    # ── Classify conversation for privacy filtering ──────────────────
+    conv_type = None
+    org_privacy = {"privacy_mode": "private"}
+    # classify_conversation removed (dead code) — skip privacy filtering
+    org_id = ctx.get("tenant_id") or storage._tenant_id or "00000000-0000-0000-0000-000000000010"
+    org = storage.get_organization(org_id)
+    if org:
+        org_privacy = {
+            "privacy_mode": org.get("privacy_mode", "private"),
+            "share_listings": org.get("share_listings", False),
+            "share_requirements": org.get("share_requirements", False),
+            "share_price_trends": org.get("share_price_trends", False),
+            "share_market_activity": org.get("share_market_activity", False),
+            "share_building_intelligence": org.get("share_building_intelligence", False),
+            "share_broker_network": org.get("share_broker_network", False),
+            "share_broker_reputation": org.get("share_broker_reputation", False),
+            "share_demand_signals": org.get("share_demand_signals", False),
+        }
+
+        # ── Parse (content-hash dedup, LLM source boundaries, then AI) ──
+    preparsed_input = ctx.get("preparsed_listings")
+    parsed_listings: list[dict] = (
+        [
+            _sanitize_parsed_listing(dict(item))
+            for item in preparsed_input
+            if isinstance(item, dict)
+        ]
+        if isinstance(preparsed_input, list)
+        else []
+    )
+    ai_extractions_raw: list[dict | None] = []
+    extraction_source: str | None = None
+    ai_result: dict | None = None
+    message_hash = (ctx.get("message_hash") or "").strip() or _message_hash(msg_text)
+    if message_hash:
+        try:
+            storage.set_raw_message_hash(raw_id, message_hash)
+        except Exception:
+            pass
+
+    # A broker commonly reposts the identical *root WhatsApp event* into many
+    # groups. The root event is retained as raw evidence and can be stopped as
+    # an observation before extraction. A repaired/split child is different: it
+    # is already an extraction unit derived from a root event that passed this
+    # gate. Running the gate again on the child would make the admin evidence
+    # show only e.g. "1 BHK..." instead of the complete broker dump, and could
+    # incorrectly suppress one property inside a multi-property broadcast.
+    # Explicit reparses must re-run the model against the current extraction
+    # contract. Reusing the repost/hash result here would simply copy a stale
+    # legacy parse back over the row being repaired.
+    if not ctx.get("parent_message_id") and not ctx.get("reprocessing"):
+        try:
+            from message_identity import author_content_fingerprint
+            repeat_fingerprint = (
+                ctx.get("author_content_fingerprint")
+                or author_content_fingerprint(
+                    sender_phone=sender_phone, sender_jid=sender_jid, message=msg_text
+                )
+            )
+            if repeat_fingerprint:
+                setter = getattr(storage, "set_raw_author_content_fingerprint", None)
+                if setter:
+                    setter(raw_id, repeat_fingerprint)
+                claimer = getattr(storage, "claim_author_content_fingerprint", None)
+                if claimer:
+                    claim = claimer(raw_id, repeat_fingerprint, tenant_id=org_id)
+                    first_raw_id = claim.get("first_raw_id")
+                    if first_raw_id and int(first_raw_id) != int(raw_id):
+                        repeat = storage.find_author_content_repeat(
+                            repeat_fingerprint,
+                            tenant_id=org_id,
+                            exclude_raw_id=raw_id,
+                            sender_phone=sender_phone,
+                            sender_jid=sender_jid,
+                            message=msg_text,
+                        )
+                        if repeat and repeat.get("raw") and repeat.get("parsed"):
+                            touched = storage.record_repeat_observation(
+                                raw_id,
+                                int(repeat["raw"]["id"]),
+                                repeat["parsed"],
+                                observed_at=ctx.get("timestamp"),
+                            )
+                            return {
+                                "raw_id": raw_id,
+                                "parsed_ids": touched,
+                                "listing_ids": [],
+                                "requirement_ids": [],
+                                "storage_status": "stored",
+                                "extraction_source": "repeat_observation",
+                            }
+                        # Do not fail open when another worker owns the exact
+                        # fingerprint. Leave this raw event auditable and let
+                        # the repair/retry lane resolve it after the baseline.
+                        storage.client.table("raw_messages").update({
+                            "processed": True,
+                            "processed_at": datetime.now(timezone.utc).isoformat(),
+                            "repeat_of_raw_message_id": int(first_raw_id),
+                            "extraction_outcome": "repeat_pending",
+                        }).eq("id", int(raw_id)).execute()
+                        return {
+                            "raw_id": raw_id,
+                            "parsed_ids": [],
+                            "listing_ids": [],
+                            "requirement_ids": [],
+                            "storage_status": "stored",
+                            "extraction_source": "repeat_pending",
+                        }
+                finder = getattr(storage, "find_author_content_repeat", None)
+                if finder:
+                    repeat = finder(
+                        repeat_fingerprint,
+                        tenant_id=org_id,
+                        exclude_raw_id=raw_id,
+                        sender_phone=sender_phone,
+                        sender_jid=sender_jid,
+                        message=msg_text,
+                    )
+                    if repeat and repeat.get("raw") and repeat.get("parsed"):
+                        touched = storage.record_repeat_observation(
+                            raw_id,
+                            int(repeat["raw"]["id"]),
+                            repeat["parsed"],
+                            observed_at=ctx.get("timestamp"),
+                        )
+                        return {
+                            "raw_id": raw_id,
+                            "parsed_ids": touched,
+                            "listing_ids": [],
+                            "requirement_ids": [],
+                            "storage_status": "stored",
+                            "extraction_source": "repeat_observation",
+                        }
+        except Exception as exc:
+            _logger.warning("repeat observation gate skipped for raw_id=%s: %s", raw_id, exc)
+            # Once the atomic claim implementation is available, a gate
+            # failure must stop extraction. Continuing here would recreate the
+            # exact fail-open path this gate exists to prevent.
+            if callable(getattr(storage, "claim_author_content_fingerprint", None)):
+                raise
+
+    # Semantic similarity is only a cheap candidate lookup.  The message is
+    # still sent through extraction; structured fields decide repost identity
+    # after the typed row has been written.
+    possible_duplicate = None
+    try:
+        possible_duplicate = storage.find_near_duplicate_candidate(
+            msg_text,
+            tenant_id=org_id,
+            broker_phone=sender_phone,
+            raw_timestamp=ctx.get("timestamp"),
+        )
+    except Exception as exc:
+        print(f"  [extract] near-duplicate lookup skipped: {exc}", flush=True)
+
+    if isinstance(preparsed_input, list):
+        extraction_source = "reviewed_reparse_preview"
+        ai_result = {"extraction_source": extraction_source, "extractions": []}
+    elif not parsed_listings and os.getenv("EXTRACTION_MODE", "model_first").strip().lower() != "model_first":
+        # Keep exact-copy reuse, but never split production messages with
+        # regex/template heuristics. LLM boundary discovery owns this decision.
+        duplicate_source = None
+        # Never clone a historical partial parse for a message whose source
+        # now proves it is a bulk broadcast. Older pipeline versions may have
+        # cached only the shared header as one listing.
+        if (
+            not ctx.get("parent_message_id")
+            and not ctx.get("reprocessing")
+            and message_hash
+        ):
+            try:
+                duplicate_source = storage.get_raw_message_by_hash(
+                    message_hash,
+                    tenant_id=org_id,
+                    processed=True,
+                    exclude_raw_id=raw_id,
+                    with_parsed=True,
+                )
+            except Exception:
+                duplicate_source = None
+            if duplicate_source and duplicate_source.get("raw") and duplicate_source.get("parsed"):
+                cloned = _clone_parsed_rows(storage, int(duplicate_source["raw"]["id"]), raw_id)
+                # Keep test/plugin callers that still return the old two-item
+                # tuple compatible while the clone path now reports demand IDs.
+                if len(cloned) == 2:
+                    parsed_ids, listing_ids = cloned
+                    requirement_ids = []
+                else:
+                    parsed_ids, listing_ids, requirement_ids = cloned
+                if parsed_ids:
+                    try:
+                        storage.mark_raw_processed(raw_id)
+                    except Exception:
+                        pass
+                    return {
+                        "raw_id": raw_id,
+                        "parsed_ids": parsed_ids,
+                        "listing_ids": listing_ids,
+                        "requirement_ids": requirement_ids,
+                        "storage_status": "stored",
+                        "extraction_source": "hash_duplicate",
+                    }
+
+
+    if not parsed_listings:
+        # AI receives one independent source unit: either the original message
+        # or one LLM-boundary materialized child block.
+        try:
+            from ai_extraction import ai_extract
+            from extraction_dedup import (
+                cache_lookup,
+                cache_store,
+                shared_cache_lookup,
+                shared_cache_store,
+            )
+
+            _tenant_for_cache = ctx.get("tenant_id") or getattr(storage, "_tenant_id", "") or ""
+            ai_result = cache_lookup(storage, _tenant_for_cache, msg_text)
+            cache_needs_store = ai_result is None
+            shared_cache_hit = False
+            shared_claimed = False
+            if ai_result is not None:
+                _logger.info("raw_id=%d extraction cache hit", raw_id)
+            else:
+                ai_result = shared_cache_lookup(
+                    storage,
+                    msg_text,
+                    raw_message_id=raw_id,
+                    tenant_id=_tenant_for_cache,
+                )
+                shared_cache_hit = ai_result is not None
+                if ai_result is not None:
+                    _logger.info("raw_id=%d shared extraction cache hit", raw_id)
+                else:
+                    claim_shared = getattr(storage, "claim_shared_extraction_hash", None)
+                    if callable(claim_shared):
+                        from extraction_dedup import _cache_hash
+                        claim = claim_shared(
+                            raw_id,
+                            _cache_hash(msg_text),
+                            tenant_id=_tenant_for_cache,
+                        )
+                        if claim.get("available") is False:
+                            _logger.warning(
+                                "raw_id=%d shared extraction claims unavailable; using non-atomic cache path",
+                                raw_id,
+                            )
+                        elif not claim.get("claimed"):
+                            # Another tenant/worker is paying for this exact
+                            # body. Give it a bounded chance to publish the
+                            # reusable result; never fail open into another
+                            # LLM call while the claim is active.
+                            for _ in range(4):
+                                time.sleep(0.2)
+                                ai_result = shared_cache_lookup(
+                                    storage,
+                                    msg_text,
+                                    raw_message_id=raw_id,
+                                    tenant_id=_tenant_for_cache,
+                                )
+                                if ai_result is not None:
+                                    shared_cache_hit = True
+                                    break
+                            if ai_result is None:
+                                raise RuntimeError("shared exact-copy extraction is still in progress")
+                        else:
+                            shared_claimed = True
+                    if ai_result is None:
+                        ai_result = ai_extract(msg_text, ctx, storage=storage)
+            extraction_source = ai_result.get("extraction_source")
+            raw_ai_items = ai_result.get("extractions") or ([ai_result["extraction"]] if ai_result.get("extraction") else [])
+            ai_items = [item for item in raw_ai_items if isinstance(item, dict)]
+            extraction_mode = os.getenv("EXTRACTION_MODE", "model_first").strip().lower()
+            # Model-first is the default: Sarvam sees the complete broadcast
+            # before any deterministic splitter can create isolated children.
+            # The splitter remains an explicit fallback when the model
+            # undercounts a document that preflight identifies as multi-item.
+            if (
+                extraction_mode == "model_first"
+                and len(ai_items) <= 1
+                and not ctx.get("parent_message_id")
+                and not ctx.get("reprocessing")
+                and (
+                    (ctx.get("preflight") or {}).get("block_count", 0) > 1
+                    or (ctx.get("preflight") or {}).get("document_type") == "Multi Listing"
+                )
+            ):
+                # Regex/template splitting is intentionally disabled. The
+                # blockwise AI path owns ambiguous boundaries.
+                fallback_pattern, fallback_items = None, []
+                if fallback_pattern and len(fallback_items) > 1:
+                    _logger.warning(
+                        "raw_id=%s model returned %d item(s) for multi-listing document; using deterministic fallback",
+                        raw_id, len(ai_items),
+                    )
+                    split_ctx = {**ctx, "split_pattern": fallback_pattern}
+                    child_ids = _materialize_split_raw_messages(storage, raw_id, split_ctx, fallback_items)
+                    if len(child_ids) != len(fallback_items):
+                        raise RuntimeError(
+                            f"deterministic fallback incomplete: expected {len(fallback_items)}, got {len(child_ids)}"
+                        )
+                    storage.mark_raw_processed(raw_id)
+                    return {
+                        "raw_id": raw_id,
+                        "parsed_ids": [],
+                        "listing_ids": [],
+                        "requirement_ids": [],
+                        "child_raw_ids": child_ids,
+                        "storage_status": "split_queued",
+                        "extraction_source": "deterministic_fallback",
+                    }
+            if ai_items:
+                from ai_extraction import _single_property_document
+                if len(ai_items) > 1 and _single_property_document(msg_text):
+                    def item_score(item: dict) -> int:
+                        price = item.get("price") if isinstance(item.get("price"), dict) else {}
+                        raw_price = str(price.get("raw_price_text") or "").lower()
+                        score = 0
+                        score += 10 if re.search(r"\b(?:asking|total)\s+price\b|\basking\s+price\b", raw_price) else 0
+                        score -= 10 if re.search(r"\b(?:monthly|rental|income|rent)\b", raw_price) else 0
+                        amount = price.get("amount")
+                        try:
+                            score += min(8, int(float(amount) / 10_000_000)) if amount is not None else 0
+                        except (TypeError, ValueError):
+                            pass
+                        return score
+                    chosen = max(enumerate(ai_items), key=lambda pair: (item_score(pair[1]), -pair[0]))[1]
+                    chosen = dict(chosen)
+                    chosen["needs_review"] = True
+                    chosen["validation_flags"] = list(dict.fromkeys(
+                        list(chosen.get("validation_flags") or []) + ["single_property_multiple_items_collapsed"]
+                    ))
+                    ai_items = [chosen]
+                if extraction_source == "ai" and ai_items:
+                    provenance = {
+                        "provider": ai_result.get("provider_used"),
+                        "model": ai_result.get("provider_model"),
+                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    for item in ai_items:
+                        item["extraction_provenance"] = provenance
+                    # AI owns semantic fields, while deterministic document
+                # segmentation supplies each item's evidence slice. This
+                # prevents a model from copying the first building into every
+                # later item in a broadcast.
+                slice_texts = _llm_source_slices_are_grounded(msg_text, ai_items)
+                if slice_texts:
+                    _logger.info("raw_id=%s using model-provided source slices", raw_id)
+                else:
+                    slice_texts = _slice_blocks_for_ai_items(msg_text, ai_items)
+                # A multi-item answer is publishable only when every item has
+                # exclusive source evidence. If segmentation failed, each item
+                # otherwise receives the complete broadcast and fields can be
+                # silently cross-wired (BHK/price/building from neighbours).
+                # Keep the raw message reviewable, but never manufacture cards
+                # from an unbounded multi-listing response.
+                ai_items, slice_texts = _dedupe_exact_source_items(ai_items, slice_texts)
+                distinct_slices = {
+                    re.sub(r"\s+", " ", str(slice_text or "").strip()).casefold()
+                    for slice_text in slice_texts
+                }
+                if len(ai_items) > 1 and len(distinct_slices) != len(ai_items):
+                    _logger.warning(
+                        "raw_id=%d rejected %d AI items without exclusive source slices",
+                        raw_id,
+                        len(ai_items),
+                    )
+                    ai_items = []
+                    slice_texts = []
+                    cache_needs_store = False
+                grounded_pairs = [
+                    (item, slice_text)
+                    for item, slice_text in zip(ai_items, slice_texts)
+                    if _is_actionable_property_slice(slice_text)
+                ]
+                if len(grounded_pairs) != len(ai_items):
+                    _logger.warning(
+                        "raw_id=%d dropped %d footer/header-only AI item(s)",
+                        raw_id,
+                        len(ai_items) - len(grounded_pairs),
+                    )
+                ai_items = [item for item, _slice in grounded_pairs]
+                slice_texts = [slice_text for _item, slice_text in grounded_pairs]
+                authoritative_items = []
+                for index, (item, slice_text) in enumerate(zip(ai_items, slice_texts)):
+                    authority = evaluate_extraction_authority(
+                        item,
+                        slice_text,
+                        source_slice_id=f"{raw_id}:{index}",
+                    )
+                    authoritative_items.append(apply_authority_result(item, authority))
+                ai_items = authoritative_items
+                document_preflight = ctx.get("preflight")
+                from preflight_classifier import classify_source_block
+                for item, slice_text in zip(ai_items, slice_texts):
+                    # The original preflight describes the complete WhatsApp
+                    # document.  It is useful for audit, but must never be
+                    # displayed as if its sale/furnishing/etc. cues belonged
+                    # to this individual listing.
+                    item["preflight_document"] = dict(document_preflight) if isinstance(document_preflight, dict) else None
+                    item["preflight"] = classify_source_block(slice_text).as_dict()
+                # `_ai_extraction_to_parsed` applies this guard immediately
+                # before creating the parsed representation. Persistence
+                # retains its boundary guard for direct/non-AI callers.
+                parsed_listings = [
+                    _ai_extraction_to_parsed(
+                        item,
+                        msg_text,
+                        sender_name,
+                        push_name,
+                        slice_text=sl,
+                        source_slice_id=f"{raw_id}:{idx}",
+                    )
+                    for idx, (item, sl) in enumerate(zip(ai_items, slice_texts))
+                ]
+                parsed_listings, ai_items, slice_texts = _expand_source_explicit_variants(
+                    parsed_listings, ai_items, slice_texts
+                )
+                signature_names = _extract_broker_signature_names(msg_text)
+                # The model may return a plausible field from a neighbouring
+                # line in a broadcast block (e.g. "3lacs" or "Fully
+                # Furnished" as building_name). Validate each item against its
+                # own source slice before any broker/building upsert occurs.
+                # A repair is conservative: a clearly named building is kept,
+                # a bad token is replaced only when a safe source line exists;
+                # otherwise the field stays NULL and is marked for review.
+                for idx, (parsed_item, ai_item, slice_text) in enumerate(
+                    zip(parsed_listings, ai_items, slice_texts)
+                ):
+                    before = parsed_item.get("building_name")
+                    if not _quarantine_broker_signature_building(
+                        parsed_item, ai_item, signature_names
+                    ):
+                        repair_building_assignment(parsed_item, slice_text, ai_item=ai_item)
+                    if parsed_item.get("building_name") != before:
+                        # Do not retain a model title whose property token was
+                        # proven to belong to price/spec text.
+                        ai_item["title"] = None
+                ai_extractions_raw = ai_items
+                _logger.info("raw_id=%d AI extraction: %d structured item(s) via %s", raw_id, len(ai_items), ai_result.get("provider_used"))
+            if cache_needs_store and not shared_cache_hit:
+                cache_store(
+                    storage,
+                    _tenant_for_cache,
+                    msg_text,
+                    ai_result,
+                    provider_used=ai_result.get("provider_used"),
+                )
+                shared_cache_store(
+                    storage,
+                    msg_text,
+                    ai_result,
+                    provider_used=ai_result.get("provider_used"),
+                    raw_message_id=raw_id,
+                    tenant_id=_tenant_for_cache,
+                )
+                if shared_claimed:
+                    try:
+                        storage.release_shared_extraction_hash(raw_id, _cache_hash(msg_text))
+                    except Exception:
+                        _logger.warning("raw_id=%d shared extraction claim release failed", raw_id)
+            elif shared_cache_hit:
+                # Keep the existing tenant-local fast path warm after a
+                # cross-tenant reuse, without making the tenant cache the
+                # source of truth for global reuse.
+                cache_store(
+                    storage,
+                    _tenant_for_cache,
+                    msg_text,
+                    ai_result,
+                    provider_used=ai_result.get("provider_used"),
+                )
+        except Exception as exc:
+            if "shared_claimed" in locals() and shared_claimed:
+                try:
+                    from extraction_dedup import _cache_hash
+                    storage.release_shared_extraction_hash(raw_id, _cache_hash(msg_text))
+                except Exception:
+                    pass
+            _logger.warning("raw_id=%d ai_extract error: %s", raw_id, exc)
+
+        # Provider failure is never a "no anchor". When every provider is down
+        # (or the AI call itself raised), the message must stay unprocessed so a
+        # later cycle retries it. Treating it as a non-listing here would mark a
+        # real listing as consumed with a NO_ANCHOR stub and lose it forever.
+        if ai_result is None or ai_result.get("extraction_source") == "ai_unavailable":
+            raise RuntimeError(
+                f"raw_id={raw_id} extraction unavailable — "
+                f"{ai_result.get('error') if ai_result else 'no provider response'}"
+            )
+
+    if not parsed_listings:
+        try:
+            get_bus().publish("extraction.skipped", {
+                "raw_id": raw_id, "reason": "no_real_estate_anchor", "message": msg_text[:200],
+            })
+        except Exception:
+            pass
+        # There is no typed destination for an unstructured/protocol message.
+        # Keep the raw WhatsApp evidence and outcome instead of attempting to
+        # route a fake observation through a residential/commercial table.
+        # This removes the misleading `AI asset_type` persistence errors for
+        # image-only, footer-only, and other non-listing messages.
+        try:
+            storage.mark_raw_processed(raw_id)
+        except Exception:
+            pass
+        return {
+            "raw_id": raw_id,
+            "parsed_ids": [],
+            "listing_ids": [],
+            "requirement_ids": [],
+            "storage_status": "skipped",
+            "extraction_source": "no_anchor",
+        }
+
+    # ── Listing validation (price / locality / general) ────────────
+    # Runs AFTER AI extraction + _ai_extraction_to_parsed() and BEFORE
+    # broker attribution + typed observation persistence. Flags are stored on
+    # each parsed dict so they flow through to the typed table's validation_flags.
+    try:
+        from listing_validation import validate_listing, apply_validation
+        for idx, pl in enumerate(parsed_listings):
+            vr = validate_listing(pl)
+            if vr.flags:
+                _logger.info(
+                    "raw_id=%d validation flags: %s",
+                    raw_id, ", ".join(vr.flags),
+                )
+            parsed_listings[idx] = apply_validation(pl, vr)
+    except Exception as vexc:
+        _logger.warning("raw_id=%d validation error: %s", raw_id, vexc)
+
+    # ── Broker attribution ──────────────────────────────────────
+    # Only store broker_phone from validated Indian mobile numbers (10-12 digits,
+    # starting with 6-9, optional +91/91 prefix).  WhatsApp LIDs (15 digits starting
+    # with 1-2) are never valid phone numbers — reject them silently.
+    # When sender_phone is empty (e.g. @lid senders), fall back to scanning the
+    # message body text for explicitly stated contact numbers — brokers routinely
+    # self-publish their number in posts.
+    sender_label = _clean_broker_name(sender_name or push_name) or ""
+    sender_label_is_name = bool(
+        sender_label
+        and sender_label.lower() not in {"unknown", "unknown sender", "whatsapp"}
+        and not re.fullmatch(r"[+\d\s().:@_-]+", sender_label)
+    )
+    sender_digits = re.sub(r"\D+", "", sender_phone or "")
+    if sender_digits.startswith("91") and len(sender_digits) >= 12:
+        sender_digits = sender_digits[-10:]
+    sender_phone_from_label = None
+    if sender_label_is_name:
+        # Bulk posters often append several inspection contacts. Prefer the
+        # number explicitly printed beside the WhatsApp sender's name rather
+        # than assigning every listing to the first unrelated contact.
+        lower_body = (msg_text or "").lower()
+        label_pos = lower_body.find(sender_label.lower())
+        if label_pos >= 0:
+            label_window = (msg_text or "")[label_pos:label_pos + 140]
+            sender_phone_from_label, _ = _extract_broker_contact_from_text(label_window)
+
+    # A broker broadcast often ends with a signature containing the contact
+    # name and phone. This is source evidence already present in WhatsMeow's
+    # captured message; attach it to every split item without another LLM call.
+    signature_phone, signature_name = _extract_broker_contact_from_text(msg_text or "")
+
+    for pl in parsed_listings:
+        is_valid_mobile = bool(re.fullmatch(r'^(\+?91)?[6-9]\d{9}$', sender_phone or ''))
+        if sender_label_is_name:
+            pl["broker_name"] = _clean_broker_name(sender_label)
+            pl["_broker_name_from_transport"] = True
+            if sender_phone_from_label:
+                pl["broker_phone"] = sender_phone_from_label
+            elif len(sender_digits) == 10 and sender_digits[0] in "6789":
+                pl["broker_phone"] = sender_digits
+        if not pl.get("broker_name") or not pl.get("broker_phone"):
+            if not pl.get("broker_phone"):
+                if is_valid_mobile:
+                    pl["broker_phone"] = sender_phone[-10:]
+
+        # Text-based fallback: if broker_phone is still missing, scan the message
+        # body for explicitly stated Indian mobile numbers.
+        if not pl.get("broker_phone"):
+            raw_text_body = ""
+            rp = pl.get("raw_payload")
+            if isinstance(rp, dict):
+                raw_text_body = rp.get("full_text") or ""
+            if not raw_text_body:
+                raw_text_body = msg_text if msg_text else ""
+            phone_from_text, name_from_text = _extract_broker_contact_from_text(raw_text_body)
+            if phone_from_text:
+                pl["broker_phone"] = phone_from_text
+                if name_from_text and not pl.get("broker_name"):
+                    pl["broker_name"] = _clean_broker_name(name_from_text)
+                existing_flags = list(pl.get("validation_flags") or [])
+                existing_flags.append("broker_phone_text_extracted")
+                pl["validation_flags"] = existing_flags
+        if signature_phone and not pl.get("broker_phone"):
+            pl["broker_phone"] = signature_phone
+        if signature_name and not pl.get("broker_name"):
+            pl["broker_name"] = _clean_broker_name(signature_name)
+
+        # Final boundary: older extraction branches can populate broker_name
+        # independently of the attribution logic above.
+        pl["broker_name"] = _clean_broker_name(pl.get("broker_name"))
+        grounded = apply_broker_field_grounding(
+            pl,
+            (pl.get("raw_payload") or {}).get("full_text")
+            if isinstance(pl.get("raw_payload"), dict)
+            else msg_text,
+        )
+        pl.clear()
+        pl.update(grounded)
+
+    if parsed_listings:
+        for pl in parsed_listings:
+            # _attribution_suffix removed (dead code) — skip suffix appending
+            pass
+            # suffix = _attribution_suffix(pl.get("broker_name"), pl.get("broker_phone"))
+            # if suffix:
+            #     rp = pl.get("raw_payload")
+            #     if isinstance(rp, dict) and isinstance(rp.get("full_text"), str):
+            #         rp["full_text"] = rp["full_text"].rstrip() + suffix
+
+    # Preview mode deliberately stops before save_parsed, listing upserts,
+    # graph writes, processed flags, or any deletion. The caller can validate
+    # the exact proposed cards and later pass them back as preparsed_listings.
+    if ctx.get("preview_only"):
+        return {
+            "raw_id": raw_id,
+            "parsed_listings": parsed_listings,
+            "proposed_count": len(parsed_listings),
+            "storage_status": "preview",
+            "message_class": "ai_structured" if parsed_listings else "unstructured",
+            "extraction_source": extraction_source or "ai_unavailable",
+        }
+
+    # ── Save parsed observations ────────────────────────────────
+    parsed_ids: list[int] = []
+    listing_ids: list[int] = []
+    requirement_ids: list[int] = []
+    for idx, parsed in enumerate(parsed_listings):
+        ai_item = ai_extractions_raw[idx] if idx < len(ai_extractions_raw) else None
+        share_eligible, share_reason = check_share_eligibility(
+            parsed, org_privacy, conv_type or parsed.get("intent") or "unknown"
+        )
+        if not share_eligible:
+            parsed["_can_share_to_market"] = False
+            parsed["_share_reason"] = share_reason
+        else:
+            parsed["_can_share_to_market"] = True
+            parsed["_share_reason"] = share_reason
+
+        # Durable embeddings are queued by the typed-table DB trigger and
+        # generated asynchronously by semantic_embedding_worker.py.
+        embedding_blob = None
+        block_text = None
+        if isinstance(parsed.get("raw_payload"), dict):
+            block_text = parsed["raw_payload"].get("full_text")
+        source_text = block_text or msg_text
+
+        # Building identity is an AI extraction field. Deterministic code only
+        # validates tenant ownership and persists/discovers the entity.
+        resolver_result = {
+            "building_id": ai_item.get("building_id") if ai_item else None,
+            "building_name": parsed.get("building_name"),
+            "resolver_confidence": ai_item.get("building_resolution_confidence", 0.0) if ai_item else 0.0,
+            "final_confidence": float(parsed.get("confidence") or 0.0),
+            "method": "ai_context" if ai_item and ai_item.get("building_id") else "unresolved",
+        }
+
+        # Resolve broker identity for this observation
+        try:
+            broker_id = storage.resolve_broker(
+                broker_phone=parsed.get("broker_phone") or "",
+                sender_phone=sender_phone or "",
+                sender_jid=sender_jid or "",
+                broker_name=parsed.get("broker_name") or "",
+                profile_name=sender_name or push_name or "",
+                sender=sender_name or push_name or "",
+            )
+            # The broker directory is keyed from the source-backed phone/JID
+            # or transport name. Rehydrate its canonical display name so the
+            # typed observation always has a usable broker identity even when
+            # the LLM omitted the sender name from an item-scoped slice.
+            if not parsed.get("broker_name") and broker_id:
+                canonical_name_getter = getattr(storage, "_canonical_broker_name", None)
+                if callable(canonical_name_getter):
+                    canonical_name = canonical_name_getter(broker_id)
+                    if canonical_name:
+                        parsed["broker_name"] = canonical_name
+        except Exception as exc:
+            print(f"  [extract] resolve_broker error: {exc}", flush=True)
+            broker_id = None
+
+        obs = ParsedObservation(
+            raw_message_id=raw_id,
+            tenant_id=org_id,
+            listing_index=idx,
+            message_type=parsed.get("message_type"),
+            intent=parsed.get("intent"),
+            principal=parsed.get("principal"),
+            bhk=parsed.get("bhk"),
+            configuration=parsed.get("configuration"),
+            configuration_type=parsed.get("configuration_type"),
+            configuration_details=parsed.get("configuration_details"),
+            is_combination_unit=parsed.get("is_combination_unit"),
+            can_sell_separately=parsed.get("can_sell_separately"),
+            price=parsed.get("price"),
+            price_unit=parsed.get("price_unit"),
+            price_model=parsed.get("price_model"),
+            price_per_sqft=parsed.get("price_per_sqft"),
+            monthly_rent=parsed.get("monthly_rent"),
+            total_asking_price=parsed.get("total_asking_price"),
+            area_sqft=parsed.get("area_sqft"),
+            furnishing=parsed.get("furnishing"),
+            furnishing_canonical=parsed.get("furnishing_canonical"),
+            location_raw=parsed.get("location_raw"),
+            location=json.dumps(parsed.get("location")) if parsed.get("location") else None,
+            building_name=parsed.get("building_name"),
+            landmark_name=parsed.get("landmark_name"),
+            street_name=parsed.get("street_name"),
+            area=parsed.get("area"),
+            micro_market=parsed.get("micro_market"),
+            developer=parsed.get("developer"),
+            asset_type=parsed.get("asset_type"),
+            property_type=parsed.get("property_type"),
+            transaction_type=parsed.get("transaction_type"),
+            commercial_use_type=parsed.get("commercial_use_type"),
+            fitout_status=parsed.get("fitout_status"),
+            occupancy_type=parsed.get("occupancy_type"),
+            floor_range=parsed.get("floor_range"),
+            rent_per_sqft=parsed.get("rent_per_sqft"),
+            availability_status=parsed.get("availability_status"),
+            possession_status=parsed.get("possession_status"),
+            possession_date=parsed.get("possession_date"),
+            available_from=parsed.get("available_from"),
+            ready_by=parsed.get("ready_by"),
+            construction_stage=parsed.get("construction_stage"),
+            launch_timeline=parsed.get("launch_timeline"),
+            expected_possession=parsed.get("expected_possession"),
+            broker_name=parsed.get("broker_name"),
+            _broker_name_from_transport=bool(parsed.get("_broker_name_from_transport")),
+            broker_phone=parsed.get("broker_phone"),
+            profile_name=sender_name or push_name,
+            car_parking_count=parsed.get("car_parking_count"),
+            parking_type=parsed.get("parking_type"),
+            has_lift=parsed.get("has_lift"),
+            has_power_backup=parsed.get("has_power_backup"),
+            power_load_kw=parsed.get("power_load_kw"),
+            forwarded=parsed.get("forwarded", 0),
+            confidence=parsed.get("confidence", 0.0),
+            extraction_confidence_score=parsed.get("confidence", 0.0),
+            raw_payload=json.dumps(parsed.get("raw_payload", {})),
+            embedding=embedding_blob,
+            summary_title=parsed.get("summary_title") or generate_summary_title(parsed, source_text),
+            normalized_message=parsed.get("normalized_message"),
+            ai_extraction=ai_item,
+            # deal_tags + additional_charges are AI-only signals (regex parser
+            # doesn't know about them). When AI extraction fails/times out we
+            # fall back to an empty list so the row still saves. We also
+            # re-run the whitelist/dict-shape validator here so a junk value
+            # from any code path (LLM drift, future schema changes, mocked
+            # ai_extract in tests) can't poison the row.
+            deal_tags=_safe_deal_tags(
+                ai_item.get("deal_tags") if ai_item else parsed.get("deal_tags")
+            ),
+            additional_charges=_safe_additional_charges(
+                ai_item.get("additional_charges") if ai_item else parsed.get("additional_charges")
+            ),
+            broker_notes=_safe_broker_notes(
+                ai_item.get("broker_notes") if ai_item else parsed.get("broker_notes")
+            ),
+            broker_id=broker_id,
+            group_name=group_name,
+            validation_flags=parsed.get("validation_flags", []),
+            needs_review=bool(parsed.get("needs_review")),
+            write_blocked=bool(parsed.get("write_blocked")),
+        )
+        try:
+            parsed_id = storage.save_typed_observation(obs)
+            parsed_ids.append(parsed_id)
+            if parsed.get("message_type") not in {"REQUIREMENT", "BUY"} and str(parsed.get("intent") or "").upper() not in {"BUY", "BUYER", "REQUIREMENT", "RENTAL_SEEKER", "TENANT", "DEMAND"}:
+                try:
+                    storage.record_listing_repost(
+                        parsed_id,
+                        possible_duplicate,
+                        raw_timestamp=ctx.get("timestamp"),
+                        broker_id=broker_id,
+                    )
+                except Exception as exc:
+                    print(f"  [extract] repost classification skipped: {exc}", flush=True)
+            else:
+                # Demand repeats need the same explicit review workflow as
+                # listing reposts. Keep both source records and only flag a
+                # conservative structured match; never auto-merge.
+                try:
+                    from storage.supabase import _typed_route
+                    duplicate_reviewer = getattr(storage, "record_requirement_duplicate", None)
+                    if duplicate_reviewer:
+                        requirement_table, _, _ = _typed_route(parsed)
+                        duplicate_reviewer(
+                            parsed_id,
+                            table=requirement_table,
+                            tenant_id=org_id,
+                        )
+                except Exception as exc:
+                    print(f"  [extract] requirement duplicate review skipped: {exc}", flush=True)
+        except Exception as exc:
+            print(f"  [extract] save_parsed error: {exc}", flush=True)
+            continue
+
+        # Persist AI-selected buildings when the ID belongs to this tenant;
+        # otherwise discover the named building and attach a new alias.
+        if parsed.get("building_name"):
+            try:
+                discovered_building = None
+                ai_building_id = (
+                    ai_item.get("building_id")
+                    if ai_item and ai_item.get("building_context_allowed")
+                    else None
+                )
+                if ai_building_id:
+                    try:
+                        candidate = storage.get_building(building_db_id=int(ai_building_id))
+                        if candidate and (not org_id or not candidate.get("tenant_id") or candidate.get("tenant_id") == org_id):
+                            discovered_building = candidate
+                    except Exception:
+                        discovered_building = None
+                if not discovered_building:
+                    discovered_building = storage.ensure_building_from_observation(
+                        parsed["building_name"], parsed.get("micro_market"), tenant_id=org_id
+                    )
+                if discovered_building:
+                    if ai_building_id:
+                        storage.create_building_alias_for_building(
+                            int(discovered_building["id"]), parsed["building_name"],
+                            discovered_building.get("canonical_name") or parsed["building_name"],
+                            confidence=float(resolver_result.get("resolver_confidence") or 0.0),
+                            source="ai",
+                        )
+                    resolver_result["building_id"] = discovered_building.get("id")
+                    resolver_result["building_name"] = discovered_building.get(
+                        "canonical_name", parsed["building_name"]
+                    )
+                    storage.link_typed_observation_to_building(
+                        parsed_id, int(discovered_building["id"]), parsed
+                    )
+            except Exception as exc:
+                # Building discovery is additive and must never make a valid
+                # typed listing disappear; keep the listing while surfacing
+                # the resolver failure in worker logs.
+                print(f"  [extract] ensure building error: {exc}", flush=True)
+
+        # New typed observations retain AI building resolution in ai_extraction;
+        # the legacy resolver_decisions table is not written from this path.
+
+        # Bridge the fully enriched observation to its correct market
+        # destination only after the resolver pass. Supply and demand are
+        # separate projections; a requirement must never become a listing.
+        try:
+            observation = dict(parsed)
+            observation["id"] = parsed_id
+            if str(observation.get("message_type") or "").upper() in {"REQUIREMENT", "BUY"} or str(observation.get("intent") or "").upper() in {"BUY", "BUYER", "REQUIREMENT", "RENTAL_SEEKER", "TENANT", "DEMAND"}:
+                requirement_id = storage.upsert_market_requirement_from_parsed(parsed_id)
+                if requirement_id:
+                    requirement_ids.append(requirement_id)
+            else:
+                listing_id = storage.upsert_listing_from_parsed(parsed_id)
+                if listing_id:
+                    listing_ids.append(listing_id)
+        except Exception as lexc:
+            print(f"  [extract] market destination upsert error: {lexc}", flush=True)
+
+        # ── Merge building amenities into buildings table ───────────
+        # building_amenities are building-shared (gym, pool, etc.) and go
+        # to buildings.amenities, not listings.amenities.
+        bldg_amenities = parsed.get("building_amenities") or []
+        if bldg_amenities and parsed.get("building_name"):
+            try:
+                storage.merge_building_amenities(
+                    parsed["building_name"],
+                    bldg_amenities,
+                    parsed.get("micro_market"),
+                )
+            except Exception as bexc:
+                print(f"  [extract] merge_building_amenities error: {bexc}", flush=True)
+
+    # ── Publish events ─────────────────────────────────────────────
+    try:
+        get_bus().publish("extraction.completed", {
+            "parsed_ids": parsed_ids, "raw_id": raw_id, "count": len(parsed_ids),
+            "intent": parsed_listings[0].get("intent") if parsed_listings else None,
+            "broker": parsed_listings[0].get("broker_name") if parsed_listings else None,
+        })
+    except Exception:
+        pass
+    if parsed_ids:
+        try:
+            get_bus().publish("resolution.completed", {
+                "parsed_ids": parsed_ids, "raw_id": raw_id,
+                "building": resolver_result.get("building_name"),
+                "method": resolver_result.get("method", "unresolved"),
+                "confidence": resolver_result.get("final_confidence", 0),
+            })
+        except Exception:
+            pass
+
+    # ── Extract implicit observations ─────────────────────────────
+    # _process_observations removed (dead code) — skip
+    if msg_text and len(msg_text) > 30 and parsed_listings:
+        pass
+        # try:
+        #     _process_observations(
+        #         msg_text,
+        #         parsed_listings[0].get("broker_name", ""),
+        #         parsed_listings[0].get("broker_phone", ""),
+        #         parsed_ids,
+        #         raw_id,
+        #     )
+        # except Exception as exc:
+        #     print(f"  [extract] _process_observations error: {exc}", flush=True)
+
+    # ── Mark processed ──────────────────────────────────────────────
+    if parsed_listings and not parsed_ids:
+        print(
+            f"  [extract] leaving raw message {raw_id} unprocessed: "
+            "all typed parsed-row inserts failed",
+            flush=True,
+        )
+        return {"raw_id": raw_id, "parsed_ids": [], "listing_ids": [], "requirement_ids": [], "storage_status": "failed", "extraction_source": extraction_source or "no_anchor"}
+    try:
+        storage.mark_raw_processed(raw_id)
+    except Exception as exc:
+        print(f"  [extract] mark_raw_processed error: {exc}", flush=True)
+    return {
+        "raw_id": raw_id,
+        "parsed_ids": parsed_ids,
+        "listing_ids": listing_ids,
+        "requirement_ids": requirement_ids,
+        "storage_status": "stored",
+        "extraction_source": extraction_source or "ai",
+    }

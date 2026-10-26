@@ -1,0 +1,254 @@
+"""Regression tests for the extraction worker's recent/backlog lanes."""
+
+from datetime import datetime, timezone
+
+import extraction_worker
+
+
+def test_stale_extraction_claim_is_not_a_retryable_failure():
+    assert extraction_worker._is_stale_extraction_claim(
+        RuntimeError("raw message is not available for extraction")
+    )
+    assert not extraction_worker._is_stale_extraction_claim(
+        RuntimeError("provider timeout")
+    )
+
+
+class _Storage:
+    def __init__(self):
+        self.calls = []
+        self.processed = []
+
+    def get_unprocessed_raw_messages_since(self, cutoff, limit=100):
+        self.calls.append(("fast", cutoff, limit))
+        return [{"id": 1, "message": "3 BHK for rent in Bandra West, carpet 900 sqft", "timestamp": cutoff}]
+
+    def get_unprocessed_raw_messages_before(self, cutoff, limit=100):
+        self.calls.append(("backlog", cutoff, limit))
+        return [{"id": 2, "message": "3 BHK for sale in Andheri West, carpet 1100 sqft", "timestamp": "2026-01-01T00:00:00+00:00"}]
+
+    def mark_raw_processed(self, raw_id):
+        self.processed.append(raw_id)
+
+
+def test_run_cycle_fetches_and_processes_both_lanes(monkeypatch):
+    storage = _Storage()
+    seen = []
+
+    monkeypatch.setattr(extraction_worker, "CONCURRENCY", 5)
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 3)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 2)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 7)
+    monkeypatch.setattr(extraction_worker, "LIVE_ONLY", False)
+    monkeypatch.setattr(
+        extraction_worker,
+        "process_raw_message",
+        lambda raw_id, _ctx, storage=None: seen.append(raw_id),
+    )
+
+    result = extraction_worker.run_cycle(storage, {})
+
+    assert result == (2, 2, 0, 0, 0)
+    assert [call[0] for call in storage.calls] == ["fast", "backlog"]
+    assert all(call[2] == 7 for call in storage.calls)
+    assert set(seen) == {1, 2}
+
+
+def test_pre_llm_batches_group_exact_copies_but_preserves_each_observation():
+    rows = [
+        {"id": 2, "message": "2 BHK rent Bandra West 85000", "timestamp": "2026-09-03T01:00:00+00:00"},
+        {"id": 1, "message": " 2   BHK rent Bandra West 85000 ", "timestamp": "2026-09-03T00:00:00+00:00"},
+        {"id": 3, "message": "3 BHK rent Bandra West 120000", "timestamp": "2026-09-03T02:00:00+00:00"},
+    ]
+
+    batches = extraction_worker.group_pre_llm_rows(rows)
+
+    assert sorted(len(batch) for batch in batches) == [1, 2]
+    duplicate_batch = next(batch for batch in batches if len(batch) == 2)
+    assert [row["id"] for row in duplicate_batch] == [1, 2]
+
+
+def test_run_cycle_skips_pending_reconciliation_by_default(monkeypatch):
+    class _ReconciliationStorage(_Storage):
+        def reconcile_pending_repeat_observations(self, **_kwargs):
+            raise AssertionError("maintenance reconciliation must not run in the hot loop")
+
+    storage = _ReconciliationStorage()
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 1)
+    monkeypatch.setattr(extraction_worker, "RECONCILE_PENDING_ON_CYCLE", False)
+    monkeypatch.setattr(
+        extraction_worker,
+        "process_raw_message",
+        lambda _raw_id, _ctx, storage=None: None,
+    )
+
+    assert extraction_worker.run_cycle(storage, {}) == (1, 1, 0, 0, 0)
+
+
+def test_run_cycle_expires_messages_after_the_retry_window(monkeypatch):
+    class _ExpiryStorage(_Storage):
+        def __init__(self):
+            super().__init__()
+            self.expiry_calls = []
+
+        def skip_expired_raw_extraction(self, *, age_hours, limit):
+            self.expiry_calls.append((age_hours, limit))
+            return 3
+
+    storage = _ExpiryStorage()
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 7)
+    monkeypatch.setattr(extraction_worker, "_last_expiry_cleanup_monotonic", 0.0)
+
+    assert extraction_worker.run_cycle(storage, {}) == (0, 0, 0, 0, 0)
+    assert storage.expiry_calls == [(24, 500)]
+
+
+def test_expiry_cleanup_is_throttled_between_hot_polls(monkeypatch):
+    class _ExpiryStorage(_Storage):
+        def __init__(self):
+            super().__init__()
+            self.expiry_calls = 0
+
+        def skip_expired_raw_extraction(self, *, age_hours, limit):
+            self.expiry_calls += 1
+            return 0
+
+    storage = _ExpiryStorage()
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 1)
+    monkeypatch.setattr(extraction_worker, "_last_expiry_cleanup_monotonic", 0.0)
+    monkeypatch.setattr(extraction_worker, "EXPIRY_CLEANUP_INTERVAL_SECONDS", 300.0)
+
+    extraction_worker.run_cycle(storage, {})
+    extraction_worker.run_cycle(storage, {})
+
+    assert storage.expiry_calls == 1
+
+
+def test_recent_cutoff_is_utc_and_configurable(monkeypatch):
+    monkeypatch.setattr(extraction_worker, "RECENT_WINDOW_HOURS", 24.0)
+    now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+
+    assert extraction_worker.recent_cutoff(now) == "2026-08-01T12:00:00+00:00"
+
+
+def test_live_only_uses_fixed_cutover_and_skips_backlog(monkeypatch):
+    storage = _Storage()
+    seen = []
+    monkeypatch.setattr(extraction_worker, "LIVE_ONLY", True)
+    monkeypatch.setattr(
+        extraction_worker,
+        "LIVE_CUTOFF_AT",
+        datetime(2026, 8, 16, 8, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 7)
+    monkeypatch.setattr(
+        extraction_worker,
+        "process_raw_message",
+        lambda raw_id, _ctx, storage=None: seen.append(raw_id),
+    )
+
+    result = extraction_worker.run_cycle(storage, {})
+
+    assert result == (1, 1, 0, 0, 0)
+    assert [call[0] for call in storage.calls] == ["fast"]
+    assert extraction_worker.recent_cutoff() == "2026-08-16T08:00:00+00:00"
+    assert seen == [1]
+
+
+def test_context_uses_numeric_raw_id_for_usage_attribution():
+    context = extraction_worker.context_from_raw({"id": 77, "message": "office for rent"})
+
+    assert context["raw_id"] == 77
+
+
+def test_group_consent_requires_positive_selection_for_broker_accounts():
+    policy = {
+        "unlimited_orgs": set(),
+        "connections": {("org-1", "phone-1"): 31},
+        "selected": {("org-1", 31, "selected@g.us")},
+    }
+    selected = {"tenant_id": "org-1", "group_name": "selected@g.us", "raw_payload": {"data": {"broker_id": "phone-1"}}}
+    unselected = {"tenant_id": "org-1", "group_name": "other@g.us", "raw_payload": {"data": {"broker_id": "phone-1"}}}
+    no_consent_row = {"tenant_id": "org-1", "group_name": "new@g.us", "raw_payload": {"data": {"broker_id": "phone-1"}}}
+
+    assert extraction_worker._row_has_group_consent(selected, policy)
+    assert not extraction_worker._row_has_group_consent(unselected, policy)
+    assert not extraction_worker._row_has_group_consent(no_consent_row, policy)
+
+
+def test_super_admin_group_consent_still_requires_explicit_selection():
+    policy = {
+        "unlimited_orgs": {"admin-org"},
+        "connections": {},
+        "selected": set(),
+    }
+    row = {"tenant_id": "admin-org", "group_name": "any@g.us", "raw_payload": {"data": {"broker_id": "phone-1"}}}
+
+    assert not extraction_worker._row_has_group_consent(row, policy)
+
+
+def test_failed_fast_lane_does_not_block_backlog(monkeypatch):
+    class _FastLaneUnavailable(_Storage):
+        def get_unprocessed_raw_messages_since(self, cutoff, limit=100):
+            self.calls.append(("fast", cutoff, limit))
+            raise RuntimeError("temporary fast-lane failure")
+
+    storage = _FastLaneUnavailable()
+    seen = []
+
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 7)
+    monkeypatch.setattr(
+        extraction_worker,
+        "process_raw_message",
+        lambda raw_id, _ctx, storage=None: seen.append(raw_id),
+    )
+
+    result = extraction_worker.run_cycle(storage, {})
+
+    assert result == (1, 1, 0, 0, 0)
+    assert [call[0] for call in storage.calls] == ["fast", "backlog"]
+    assert seen == [2]
+
+
+def test_storage_failure_is_counted_as_failed_and_not_cleared(monkeypatch):
+    storage = _Storage()
+    monkeypatch.setattr(extraction_worker, "FAST_LANE_SLOTS", 1)
+    monkeypatch.setattr(extraction_worker, "BACKLOG_LANE_SLOTS", 0)
+    monkeypatch.setattr(extraction_worker, "BATCH_SIZE", 7)
+    monkeypatch.setattr(
+        extraction_worker,
+        "process_raw_message",
+        lambda _raw_id, _ctx, storage=None: {"storage_status": "failed"},
+    )
+
+    retry_counts = {}
+    result = extraction_worker.run_cycle(storage, retry_counts)
+
+    assert result == (1, 0, 1, 0, 0)
+    assert retry_counts == {1: 1}
+
+
+def test_run_cycle_does_not_process_when_all_tenants_are_stopped(monkeypatch):
+    class _StoppedStorage(_Storage):
+        def get_running_extraction_tenant_ids(self):
+            return []
+
+    storage = _StoppedStorage()
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("stopped tenants must not be processed")
+
+    monkeypatch.setattr(extraction_worker, "process_raw_message", fail_if_called)
+
+    assert extraction_worker.run_cycle(storage, {}) == (0, 0, 0, 0, 0)
+    assert storage.calls == []

@@ -1,0 +1,868 @@
+import { slugify } from "./supabase";
+import { canonicalLocality, extractLocalityFromText } from "./locality-canon";
+
+export type ListingCardFields = {
+  id: number;
+  card_type?: string | null;
+  bhk: string | number | null;
+  price: number | null;
+  price_unit: string | null;
+  price_raw_text?: string | null;
+  price_model?: string | null;
+  price_per_sqft?: number | null;
+  area_sqft: number | null;
+  furnishing: string | null;
+  intent: string | null;
+  asset_type: string | null;
+  property_type: string | null;
+  micro_market: string | null;
+  locality_raw?: string | null;
+  locality_resolved?: string | null;
+  building_name: string | null;
+  landmark_name?: string | null;
+  location_label?: string | null;
+  floor_description?: string | null;
+  view?: string | null;
+  title?: string | null;
+  source_notes?: string | null;
+  representative_raw_message_id?: number | null;
+  latest_raw_message_id?: number | null;
+  broker_name: string | null;
+  broker_phone: string | null;
+  broker_id?: number | null;
+  last_seen: string | null;
+  first_seen?: string | null;
+  times_seen?: number | null;
+  deal_tags?: string[] | null;
+  additional_charges?: AdditionalCharge[] | null;
+  /** Internal explanation used by contextual recommendation surfaces. */
+  recommendation_reason?: string | null;
+};
+
+type DedupableListing = Pick<
+  ListingCardFields,
+  | "id"
+  | "price"
+  | "price_unit"
+  | "property_type"
+  | "building_name"
+  | "micro_market"
+  | "locality_raw"
+  | "locality_resolved"
+  | "bhk"
+  | "intent"
+  | "area_sqft"
+  | "floor_description"
+  | "landmark_name"
+  | "broker_name"
+  | "broker_phone"
+  | "last_seen"
+> & Partial<Pick<ListingCardFields, "asset_type" | "furnishing" | "title">>;
+
+function dedupPart(value: unknown): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
+}
+
+// A repeated WhatsApp observation is not new inventory. For a high-information
+// row, keep the newest public representative for the same structured property
+// identity, even when it was reposted by a different broker or on a later day.
+// This is deliberately query-time safe: source rows remain available for audit
+// and are never merged or deleted.
+//
+// Rows missing one of the strong identity fields remain broker-scoped. That
+// avoids collapsing low-information records merely because they share a
+// building or locality.
+export function dedupeRecentListings<T extends DedupableListing>(rows: T[], options?: { incompleteWindowMs?: number }): T[] {
+  const incompleteWindowMs = options?.incompleteWindowMs ?? 24 * 60 * 60 * 1000;
+  const ordered = [...rows].sort((a, b) => {
+    const at = a.last_seen ? new Date(a.last_seen).getTime() : 0;
+    const bt = b.last_seen ? new Date(b.last_seen).getTime() : 0;
+    return bt - at || Number(b.id) - Number(a.id);
+  });
+  const kept: T[] = [];
+  const seen = new Map<string, number>();
+
+  for (const row of ordered) {
+    const broker = dedupPart(row.broker_phone) || dedupPart(row.broker_name) || "unknown-broker";
+    const place = dedupPart(row.building_name) || dedupPart(row.landmark_name) || dedupPart(row.micro_market) || "unknown-place";
+    const locality = dedupPart(row.micro_market || row.locality_resolved || row.locality_raw);
+    const bhk = dedupPart(row.bhk);
+    const intent = dedupPart(row.intent);
+    const area = row.area_sqft == null ? "" : String(Math.round(Number(row.area_sqft)));
+    const price = row.price == null || !Number.isFinite(Number(row.price))
+      ? ""
+      : `${Math.round(Number(row.price))}:${dedupPart(row.price_unit)}`;
+    const title = dedupPart(row.title);
+    // BHK is a residential signal only. Requiring it for commercial inventory
+    // makes every commercial repost broker-scoped and leaks duplicates.
+    const commercial = dedupPart(row.asset_type) === "commercial" ||
+      /commercial|office|shop|warehouse|showroom/i.test(String(row.property_type ?? ""));
+    const strongIdentity = Boolean(
+      place !== "unknown-place" && locality && intent && area && price && (bhk || commercial),
+    );
+    const key = [
+      strongIdentity ? "shared" : title ? "title-shared" : broker,
+      place,
+      locality,
+      dedupPart(row.asset_type),
+      dedupPart(row.property_type),
+      bhk,
+      intent,
+      price,
+      area,
+      dedupPart(row.floor_description),
+      dedupPart(row.furnishing),
+      // A title is presentation copy and can differ between reposts. It must
+      // not prevent rows with the same complete property identity collapsing.
+      strongIdentity ? "" : title,
+    ].join("|");
+    const time = row.last_seen ? new Date(row.last_seen).getTime() : 0;
+    const previous = seen.get(key);
+    // Strong identities are stable inventory identities, not observations.
+    // Collapse them regardless of age; otherwise a property reposted after the
+    // old 24-hour window reappears as a duplicate card. Incomplete rows remain
+    // broker-scoped and retain the original recent-observation behavior.
+    if (previous != null && (strongIdentity || (time > 0 && previous - time <= incompleteWindowMs))) continue;
+    seen.set(key, time);
+    kept.push(row);
+  }
+  return kept;
+}
+
+export function formatBhkNumber(value: string | number | null | undefined): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const match = raw.match(/^(\d+(?:\.\d+)?)(?:\s*BHK)?$/i);
+  if (!match) return raw;
+  const numeric = Number(match[1]);
+  return Number.isInteger(numeric)
+    ? String(numeric)
+    : match[1].replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/** Extract a BHK label only when the broker evidence states it explicitly. */
+export function inferBhkFromText(value: string | null | undefined): string | null {
+  const match = String(value ?? "").match(/\b(\d+(?:\.\d+)?)\s*(?:bhk|bhd|bed\s*rooms?|bedrooms?|br)\b/i);
+  if (!match) return null;
+  const number = formatBhkNumber(match[1]);
+  return number ? `${number} BHK` : null;
+}
+
+/** Prefer an explicit BHK marker from the source message over a stale typed value. */
+export function normalizeBhkFromEvidence(
+  value: string | number | null | undefined,
+  evidence: string | null | undefined,
+): string | null {
+  const match = String(evidence ?? "").match(/\b(\d+(?:\.\d+)?)\s*(?:bhk|bhd|rk|bed\s*rooms?|bedrooms?|br)\b/i);
+  if (!match) return value == null ? null : String(value);
+  const numeric = Number(match[1]);
+  return Number.isFinite(numeric) ? String(numeric) : value == null ? null : String(value);
+}
+
+export function formatBhkLabel(value: string | number | null | undefined): string {
+  const number = formatBhkNumber(value);
+  return number ? `${number} BHK` : "";
+}
+
+export type AdditionalCharge = {
+  label: string;
+  amount: number | null;
+  amount_type: "fixed" | "percent_of_price";
+};
+
+// Structured spec entries so callers can render an icon per spec (bed count,
+// area, furnishing, floor...) instead of one flat "3 BHK · 850 sqft" string.
+export type ListingSpecItem = {
+  kind: "bhk" | "area" | "furnishing" | "floor" | "view" | "type";
+  label: string;
+};
+
+export type ListingCardViewModel = {
+  title: string;
+  locality: string | null;
+  localitySlug: string | null;
+  isBuilding: boolean;
+  priceLabel: string;
+  dealType: "For Rent" | "For Sale" | null;
+  specRow: string;
+  specItems: ListingSpecItem[];
+  statusLabel: string;
+  statusTone: "listed" | "unconfirmed";
+  updatedLabel: string;
+  freshnessLabel: string;
+  freshnessBadge: string | null;
+  assetTypeLabel: string | null;
+  waLink: string | null;
+  href: string | null;
+  slug: string | null;
+  waAvailable: boolean;
+  brokerName: string | null;
+  priceModel: string | null;
+  pricePerSqft: number | null;
+  dealTags: Array<{ tag: string; label: string; tone: string }>;
+  additionalCharges: Array<{ label: string; amountLabel: string }>;
+  publicNote: string | null;
+};
+
+/** Keep non-canonical context useful without leaking broker contact workflow. */
+export function safePublicSourceNote(value: string | null | undefined): string | null {
+  const lines = String(value || "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const safe = lines.filter((line) => !/(?:\+?\d[\d\s().-]{7,}\d|whats?app|contact|call|office|inspection|visit|broker|agent|client)/i.test(line));
+  const note = safe.join(" · ").replace(/\s+/g, " ").trim();
+  return note ? note.slice(0, 160) : null;
+}
+
+function normalizeUnit(value: string | null): string | null {
+  if (!value) return null;
+  const u = value.trim().toLowerCase();
+  if (u === "cr" || u === "crore" || u === "crores") return "cr";
+  if (u === "lac" || u === "lakh" || u === "lakhs") return "lac";
+  if (u === "k" || u === "thousand") return "k";
+  if (u === "abs") return "abs";
+  return null;
+}
+
+function intentValue(intent: string | null): "rent" | "sale" | "commercial" | null {
+  const i = (intent || "").toLowerCase();
+  if (i === "rent" || i === "rental" || i === "lease") return "rent";
+  if (i === "sell" || i === "sale" || i === "resale" || i === "buy" || i === "purchase") return "sale";
+  if (i === "commercial") return "commercial";
+  return null;
+}
+
+// Human-readable residential/commercial label for a listing card. Prefers the
+// parsed asset_type (residential | commercial); falls back to the intent when
+// asset_type is missing so historical rows still get a sensible badge.
+export function assetTypeLabel(
+  assetType: string | null,
+  intent: string | null,
+): string | null {
+  const a = (assetType || "").trim().toLowerCase();
+  if (a === "commercial") return "Commercial";
+  if (a === "residential") return "Residential";
+  const i = intentValue(intent);
+  if (i === "commercial") return "Commercial";
+  if (i === "rent" || i === "sale") return "Residential";
+  return null;
+}
+
+// Renders an explicit, buyer-readable price with a unit. Never a bare number.
+//
+// Ingestion stores prices inconsistently by unit:
+//   - "cr" / "k": the number is ABSOLUTE rupees with a leftover unit
+//     (e.g. 26600000 with unit "cr" => ₹2.66 Cr; 85000 "k" rent => ₹85,000/mo).
+//   - "lac": the number is already in lakh-scale (e.g. 110000 => ₹110,000 Lakh).
+//   - "abs": absolute rupees.
+//   - "psf": price is per-sqft; total = price_per_sqft * area_sqft (unit = abs).
+// We normalise each to a readable, grouped amount in the appropriate unit.
+export function formatCardPrice(
+  price: number | null,
+  priceUnit: string | null,
+  intent: string | null,
+  priceModel: string | null = null,
+  pricePerSqft: number | null = null,
+  areaSqft: number | null = null,
+  priceRawText: string | null = null,
+): string {
+  const unit = normalizeUnit(priceUnit);
+  const intentKind = intentValue(intent);
+  const perMonth = intentKind === "rent";
+  const grouped = (n: number) => Math.round(n).toLocaleString("en-IN");
+  const formatScaled = (amount: number, suffix: string) => {
+    if (amount >= 1_00_00_000) {
+      const cr = amount / 1_00_00_000;
+      return `₹${cr % 1 === 0 ? cr : cr.toFixed(2)} Cr${suffix}`;
+    }
+    if (amount >= 1_00_000) {
+      const lac = amount / 1_00_000;
+      return `₹${lac % 1 === 0 ? lac : lac.toFixed(1)} Lakh${suffix}`;
+    }
+    return `₹${grouped(amount)}${suffix}`;
+  };
+
+  // Historical provider output occasionally duplicated the scale in text,
+  // e.g. `₹85,00,000 Lakhs`. The grouped Indian amount is already rupees.
+  const redundantLakh = priceRawText?.match(/(?<!\d)(\d{1,3}(?:,\d{2,3})+)\s*(?:lakh|lac)s?\b/i);
+  if (redundantLakh) {
+    const groupedAmount = Number(redundantLakh[1].replace(/,/g, ""));
+    if (Number.isFinite(groupedAmount) && groupedAmount >= 100_000 && price != null && price > groupedAmount * 1000) {
+      return formatScaled(groupedAmount, perMonth ? "/month" : "");
+    }
+  }
+
+  // If price model is per-sqft and we have area, compute total price
+  if (priceModel === "psf" && pricePerSqft != null && areaSqft != null && areaSqft > 0) {
+    const totalPrice = pricePerSqft * areaSqft;
+    // For sale, render as absolute rupees with appropriate unit
+    if (totalPrice >= 1_00_00_000) {
+      const cr = totalPrice / 1_00_00_000;
+      return `₹${cr % 1 === 0 ? cr : cr.toFixed(2)} Cr`;
+    }
+    if (totalPrice >= 1_00_000) {
+      const lac = totalPrice / 1_00_000;
+      return `₹${lac % 1 === 0 ? lac : lac.toFixed(1)} Lakh`;
+    }
+    return `₹${Math.round(totalPrice).toLocaleString("en-IN")}`;
+  }
+
+  if (price == null) return "Price on request";
+
+  // Reject parser corruption before it reaches public cards. A Mumbai sale
+  // below ₹1 lakh or a monthly rent below ₹1,000 is not a credible listing
+  // price; showing it would turn bad extraction into fake market data.
+  const absolutePrice = unit == null || unit === "abs";
+  if (absolutePrice && (perMonth ? price < 1_000 : price < 1_00_000)) return "Price on request";
+
+  if (perMonth) {
+    // Rentals are quoted per month. Stored numbers use the natural unit:
+    // "cr" = crores/month, "lac" = lakhs/month, "k" = thousands/month,
+    // "abs" = absolute rupees/month. Multiply up to rupees.
+    const rawRent = priceRawText?.match(
+      /(?:rent|lease|monthly|price|asking)\s*[:=-]?[^\d₹]{0,20}(?:₹|rs\.?|inr\s*)?\s*([\d,]+(?:\.\d+)?)\s*(crore|cr|lakh|lac|l|k|thousand)?/i,
+    ) ?? priceRawText?.match(
+      /(?:₹|rs\.?|inr\s*)\s*([\d,]+(?:\.\d+)?)\s*(crore|cr|lakh|lac|l|k|thousand)?/i,
+    );
+    if (rawRent) {
+      const rawAmount = Number(rawRent[1].replace(/,/g, ""));
+      const rawUnit = (rawRent[2] || "").toLowerCase();
+      const rawMultiplier = rawUnit === "crore" || rawUnit === "cr"
+        ? 1_00_00_000
+        : rawUnit === "lakh" || rawUnit === "lac" || rawUnit === "l"
+          ? 1_00_000
+          : rawUnit === "k" || rawUnit === "thousand" ? 1_000 : 1;
+      const rentalAmount = rawUnit === "k" && rawRent[1].includes(".") && rawAmount < 5
+        ? rawAmount * 1_00_000
+        : rawAmount * rawMultiplier;
+      if (Number.isFinite(rentalAmount) && rentalAmount > 0) return formatScaled(rentalAmount, "/month");
+    }
+
+    let abs = price;
+    if (unit === "cr") abs = price * 1_00_00_000;
+    else if (unit === "lac") abs = price * 1_00_000;
+    else if (unit === "k") abs = price * 1_000;
+    else if (unit === "abs" && abs > 0 && abs < 1_000) return "Price on request";
+    // Guard against implausible monthly rents (e.g. mis-stored "abs" values
+    // like 12 or 185 rupees). Anything under ₹1,000/month is not a real Mumbai
+    // rent — fall back rather than show a clearly-wrong number.
+    if (abs < 1000) return "Price on request";
+    return formatScaled(abs, "/month");
+  }
+
+  // Sale / commercial
+  if (unit === "cr") {
+    // Most "cr" values are native-scale (2.5 => ₹2.5 Cr); large values are
+    // absolute rupees mis-tagged as crore (85000000 => ₹8.5 Cr).
+    const cr = price > 1000 ? price / 1_00_00_000 : price;
+    return `₹${cr % 1 === 0 ? cr : cr.toFixed(2)} Cr`;
+  }
+  if (unit === "lac") {
+    const v = price % 1 === 0 ? price : price.toFixed(1);
+    return `₹${v} Lakh`;
+  }
+  if (unit === "k") {
+    const abs = price > 1000 ? price : price * 1_000;
+    return `₹${grouped(abs)}`;
+  }
+  // "abs" or unknown — render the grouped whole amount, but scale obvious
+  // outliers into Cr/Lakh so we do not surface raw comma-dumped parser junk.
+  return formatScaled(price, "");
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/\bfullyfurnished\b/gi, "fully furnished")
+    .replace(/\bsemifurnished\b/gi, "semi furnished")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+// WhatsApp markdown is useful in the private source message, but its control
+// characters must never leak into public titles, labels, or broker names.
+export function cleanPublicText(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const cleaned = String(value)
+    .replace(/[*_`~]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return cleaned || null;
+}
+
+/** Missing-value markers are data absence, never public property descriptors. */
+export function cleanPublicFact(value: string | null | undefined): string | null {
+  const cleaned = cleanPublicText(value);
+  if (!cleaned) return null;
+  const compact = cleaned.toLowerCase().replace(/[\s_-]+/g, "");
+  if (["none", "null", "unknown", "unspecified", "notspecified", "na", "notavailable"].includes(compact)) return null;
+  return cleaned;
+}
+
+/** Stored title copy is not a building name. Reject parser placeholders and
+ * transaction-only headings before they reach public pages. */
+export function cleanStoredListingTitle(value: string | null | undefined): string | null {
+  const cleaned = cleanPublicText(value);
+  if (!cleaned) return null;
+  if (/^(?:listing|property|property listing|fresh property|unknown|unstructured)$/i.test(cleaned)) return null;
+  if (/^(?:not\s*specified|unspecified|null|unknown)\b/i.test(cleaned)) return null;
+  if (/^(?:for|available for)?\s*(?:rent|sale|lease)$/i.test(cleaned)) return null;
+  // These are parser/SEO scaffolds, not useful property identity. Let the
+  // deterministic title builder use the actual typed facts instead.
+  if (/^property\s+with\b.*\bfor\s+(?:rent|sale|lease)\b/i.test(cleaned)) return null;
+  if (/^(?:residential|commercial)\s+for\s+(?:rent|sale|lease)\b/i.test(cleaned)) return null;
+  if (/\bfor\s+(?:rent|sale)\b[\s—-]+.*\bfor\s+(?:rent|sale)\b/i.test(cleaned)) return null;
+  // Older extraction titles embedded card facts. Rebuild these from the
+  // typed fields so the public title remains a concise search phrase.
+  if (/\bwith\s+\d[\d,]*(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|sft)\b/i.test(cleaned)) return null;
+  if (/\bfor\s+[₹$]?\s*\d[\d,.]*\s*(?:cr|crore|lakh|lac|k)?(?:\s*\/\s*(?:month|mo))?\s*$/i.test(cleaned)) return null;
+  // Broker marketing headers are not property identity. They commonly arrive
+  // as the stored title when the message starts with copy such as
+  // "Direct Deal Very Good Flat". Rebuild these from typed facts instead of
+  // publishing the poster's sales pitch as the listing title.
+  if (/^(?:direct\s+deal|very\s+good|good\s+flat|excellent|prime\s+deal|urgent\s+deal)\b/i.test(cleaned)) return null;
+  return cleaned;
+}
+
+function cleanEntityName(value: string | null | undefined): string | null {
+  const cleaned = cleanPublicText(value);
+  if (!cleaned) return null;
+  if (cleaned.includes("@") || /^\[?unstructured\]?$/i.test(cleaned)) return null;
+  if (/^(listing|property listing|fresh property|unknown|not specified|immediately position)$/i.test(cleaned)) return null;
+  return cleaned;
+}
+
+function normalizePropertyType(value: string | null): string | null {
+  const raw = cleanPublicFact(value) || "";
+  if (!raw) return null;
+  const lower = raw.toLowerCase().replace(/[_-]+/g, " ");
+  if (
+    lower === "other" ||
+    lower === "unknown" ||
+    lower === "misc" ||
+    lower === "miscellaneous" ||
+    lower === "na" ||
+    lower === "n a" ||
+    lower === "n/a" ||
+    lower === "none" ||
+    lower === "unspecified" ||
+    lower === "not specified"
+  ) {
+    return null;
+  }
+  return titleCase(raw);
+}
+
+function buildTitle(row: ListingCardFields): string {
+  const storedTitle = cleanStoredListingTitle(row.title);
+  const asset = String(row.asset_type ?? "").trim().toLowerCase();
+  const propertyTypeRaw = String(row.property_type ?? "").trim().toLowerCase().replace(/[_-]+/g, " ");
+  const isResidential = asset === "residential" || propertyTypeRaw === "residential";
+  const isCommercial = asset === "commercial" || /\b(?:commercial|office|shop|showroom|warehouse|retail|industrial)\b/.test(propertyTypeRaw);
+  if (storedTitle && !(isCommercial && /\bbhk\b/i.test(storedTitle))) return storedTitle;
+
+  // Older rows sometimes contain only a transaction heading. Build a useful
+  // deterministic fallback from typed facts without inventing a property.
+  const furnishing = cleanPublicFact(row.furnishing) || "";
+  // BHK is a residential configuration, never the identity of a commercial
+  // or other typed property. The asset/type route must earn this label.
+  const bhk = isResidential ? formatBhkNumber(row.bhk) : "";
+  const propertyType = normalizePropertyType(row.property_type);
+  // Extract first segment before comma — real building names are short and
+  // appear at the start (e.g. "Wallfort Tower" from "Wallfort Tower, 2bhk...").
+  const rawBuilding = cleanEntityName(row.building_name) ?? "";
+  const building = rawBuilding
+    ? (rawBuilding.includes(",") ? rawBuilding.split(",")[0].trim() : rawBuilding)
+    : null;
+  const locality = listingLocality(row);
+  const intent = intentValue(row.intent);
+  const transaction = intent === "rent" ? "for Rent" : intent === "sale" ? "for Sale" : "";
+
+  const baseDescriptor = bhk
+    ? `${bhk} BHK`
+    : propertyType && !/^(?:residential|commercial)$/i.test(propertyType)
+      ? propertyType
+      : isCommercial || assetTypeLabel(row.asset_type, row.intent) === "Commercial"
+        ? "Commercial space"
+        : isResidential
+          ? "Residential property"
+          : "Property";
+  const descriptor = [
+    furnishing ? titleCase(furnishing) : "",
+    baseDescriptor,
+  ].filter(Boolean).join(" ");
+  const place = building || locality || cleanEntityName(row.landmark_name);
+
+  if (place && transaction) return `${descriptor} ${transaction} at ${place}`;
+  if (place) return `${descriptor} at ${place}`;
+  if (transaction) return `${descriptor} ${transaction}`;
+  return descriptor;
+}
+
+function listingLocality(row: ListingCardFields): string | null {
+  const candidates = [row.micro_market, row.location_label, row.locality_raw, row.locality_resolved];
+  for (const candidate of candidates) {
+    const canonical = canonicalLocality(candidate);
+    if (canonical.public && canonical.label) return canonical.label;
+  }
+  return cleanEntityName(extractLocalityFromText(row.building_name)) || null;
+}
+
+function buildSpecItems(row: ListingCardFields): ListingSpecItem[] {
+  const items: ListingSpecItem[] = [];
+  const ptype = normalizePropertyType(row.property_type);
+  if (ptype) {
+    items.push({ kind: "type", label: ptype });
+  }
+  if (row.bhk != null && String(row.bhk).trim()) {
+    items.push({ kind: "bhk", label: formatBhkLabel(row.bhk) });
+  }
+  if (typeof row.area_sqft === "number" && row.area_sqft > 0) {
+    items.push({ kind: "area", label: `${row.area_sqft.toLocaleString("en-IN")} sqft` });
+  }
+  const furnishing = cleanPublicFact(row.furnishing);
+  if (furnishing) {
+    items.push({ kind: "furnishing", label: titleCase(furnishing) });
+  }
+  const floor = cleanPublicText(row.floor_description);
+  if (floor) {
+    items.push({ kind: "floor", label: floor });
+  }
+  const view = cleanPublicText(row.view);
+  if (view) {
+    items.push({ kind: "view", label: view });
+  }
+  return items;
+}
+
+function buildSpecRow(items: ListingSpecItem[]): string {
+  return items.map((i) => i.label).join(" · ");
+}
+
+function formatUpdated(iso: string | null): string {
+  if (!iso) return "Update time unavailable";
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return "Update time unavailable";
+  return date.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+}
+
+// Relative freshness for the card ("Today 2:30 PM", "Yesterday", "3d ago",
+// or an absolute date for older listings). Backs the "freshness" claim with a
+// real timestamp instead of a vague label.
+function formatFreshness(iso: string | null): string {
+  if (!iso) return "Update time unavailable";
+  const date = new Date(iso);
+  const ms = date.getTime();
+  if (!Number.isFinite(ms)) return "Update time unavailable";
+  const now = Date.now();
+  const diffMs = now - ms;
+  const dayMs = 24 * 60 * 60 * 1000;
+  if (diffMs < 0) return "Just now";
+  if (diffMs < dayMs) {
+    const time = date.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true });
+    return diffMs < 60 * 60 * 1000 ? "Just now" : `Today ${time}`;
+  }
+  if (diffMs < 2 * dayMs) return "Yesterday";
+  if (diffMs < 7 * dayMs) return `${Math.floor(diffMs / dayMs)}d ago`;
+  return date.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+}
+
+// Short, SEO-friendly freshness badge for cards: emphasizes that Opsivio's
+// inventory changes continuously ("Just Landed", "Active today").
+function formatFreshnessBadge(iso: string | null, firstSeen?: string | null, timesSeen?: number | null): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  const ms = date.getTime();
+  if (!Number.isFinite(ms)) return null;
+  const now = Date.now();
+  const diffMs = now - ms;
+  const firstMs = firstSeen ? new Date(firstSeen).getTime() : Number.NaN;
+  const isRepost = Number.isFinite(firstMs) && (timesSeen ?? 0) > 1 && firstMs < now - 24 * 60 * 60 * 1000;
+  if (isRepost) return `Reposted · ${formatFreshness(firstSeen ?? iso)} old`;
+  if (diffMs < 0) return "Just Landed";
+  if (diffMs < 60 * 60 * 1000) return "Just Landed";
+  if (diffMs < 24 * 60 * 60 * 1000) return "Active today";
+  return null;
+}
+
+// Broker contact must NEVER embed the phone number in public HTML (DPDP Act
+// 2023 — phone is sensitive personal data). Instead we link to a server route
+// that resolves the phone server-side and 302-redirects to wa.me, so the raw
+// digits are never crawlable / exposed in the public DOM.
+export function waLinkFor(listingId: number | null, listingSlug?: string | null, cardType?: string | null): string | null {
+  if (listingId == null) return null;
+  const params = new URLSearchParams();
+  if (listingSlug) params.set("slug", listingSlug);
+  if (cardType) params.set("card_type", cardType);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return `/api/contact-broker/${listingId}${suffix}`;
+}
+
+// Strips decorative emoji / pictographs from display strings (broker names
+// pulled from WhatsApp display names often contain ✨ ⚔️ 🕉️ etc.). Display-only
+// cleanup — stored data is untouched.
+const EMOJI_RE =
+  /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u200d]/gu;
+export function stripEmoji(value: string | null): string | null {
+  if (!value) return value;
+  return cleanPublicText(value.replace(EMOJI_RE, ""));
+}
+
+// Broker names are sometimes stored as raw phone numbers (e.g. "+91 9920993025"
+// or "9930079206"). Never surface those in the public card DOM — mask them so
+// the number is not crawlable / exposed (DPDP Act 2023). The real contact path
+// is the /api/contact-broker/{id} redirect, which the server controls.
+const PHONEISH = /[0-9]/;
+export function safeBrokerName(raw: string | null): string | null {
+  if (!raw || !raw.trim()) return null;
+  const cleaned = stripEmoji(raw);
+  if (!cleaned) return null;
+  const v = cleaned.trim();
+  // WhatsApp display-name masking/garbage such as ``#$!#$@m`` is not a
+  // human-readable broker identity. Treat it as absent instead of exposing
+  // the transport placeholder on public listing cards.
+  const letters = (v.match(/[A-Za-z]/g) || []).length;
+  if (letters < 2 || letters / Math.max(v.replace(/\s/g, "").length, 1) < 0.5) return null;
+  // Email addresses are contact data, not public broker display names. Keep
+  // broker contact resolution behind the WhatsApp action instead.
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return null;
+  // If it's mostly digits / a phone-shaped string, don't show it.
+  const digitRatio = (v.match(/[0-9]/g) || []).length / Math.max(v.replace(/\s/g, "").length, 1);
+  if (digitRatio > 0.5 || /^\+?\d[\d\s().-]{6,}$/.test(v)) return null;
+  if (/wa\.me|whatsapp/i.test(v)) return null;
+  // Reject garbage text that the LLM sometimes extracts as broker names.
+  const low = v.toLowerCase();
+  const GARBAGE = (
+    "stamp duty|furnished|carpet|bhk|sqft|sq ft|ready to move|negotiable|"
+    + "balcon|sea view|amenities|parking|deposit|possession|available|"
+    + "options|benefit|family|bachelor|veg|non-veg|near|opp|opposite|"
+    + "behind|floor|tower|residency|heights|apartment|regards|thank|"
+    + "hello|dear|rent|sale|commercial|office|shop|lift|backup|"
+    + "security|power|gym|swimming|landmark|station|price|asking|"
+    + "location|coverage|capacity|reception|entrance|ground|first|"
+    + "second|third|fourth|fifth|upper|lower|basement|dedicated|"
+    + "visitor|ample|separate|exclusive|ready|restaurant|central|"
+    + "suburb|mumbai"
+  );
+  if (new RegExp(GARBAGE).test(low)) return null;
+  // Too short or too long to be a real name.
+  if (v.length < 2 || v.length > 50) return null;
+  // All-caps single word is usually not a name (e.g. "FURNISHED").
+  if (v === v.toUpperCase() && !v.includes(" ")) return null;
+  return v;
+}
+
+// True when the stored broker_phone can be coerced to a 10-digit Indian mobile
+// (with or without the +91 prefix). Mirrors the server-side check in the
+// /api/contact-broker/[id] route so the public card never shows a "Contact on
+// WhatsApp" button that would just 302 back to the listing page.
+export function isBrokerContactable(raw: string | null | undefined): boolean {
+  if (!raw) return false;
+  const digits = String(raw).replace(/\D/g, "");
+  if (digits.length < 10) return false;
+  const local = digits.length > 10 ? digits.slice(-10) : digits;
+  return local.length === 10;
+}
+
+// SEO-friendly slug for the public /listings/[slug]/[id] route. Format:
+//   `{bhk}-{for-sale|for-rent}-{building}-{locality}-{id}`
+// The id is always appended so the URL is unique even when the prefix is empty
+// or repeats. Examples:
+//   bhk="3 BHK", building="Lodha Bellissimo", micro_market="Andheri West"
+//     → "3-bhk-lodha-bellissimo-andheri-west-319236"
+//   bhk=null, micro_market=null, id=319236              → "319236"
+//   bhk="2.5 BHK", micro_market="Powai", id=999         → "2-5-bhk-powai-999"
+// Use this from listing-card.ts, sitemap.ts, and contact-broker route so all
+// three surfaces point at the same canonical URL.
+export type SlugInput = {
+  id: number;
+  bhk?: string | number | null;
+  micro_market?: string | null;
+  building_name?: string | null;
+  property_type?: string | null;
+  intent?: string | null;
+  title?: string | null;
+};
+
+export function buildListingSlug(input: SlugInput): string | null {
+  if (!Number.isFinite(input.id)) return null;
+  const id = String(input.id);
+  const parts: string[] = [];
+  const intent = String(input.intent ?? "").trim().toLowerCase();
+  const transaction = intent === "rent" || intent === "rental" || intent === "lease"
+    ? "for-rent"
+    : intent === "sale" || intent === "sell" || intent === "resale" || intent === "buy" || intent === "purchase"
+      ? "for-sale"
+      : "";
+  const bhk = String(input.bhk ?? "").trim();
+  if (bhk) {
+    const bhkNumber = bhk.match(/^(\d+(?:\.\d+)?)/)?.[1];
+    const normalizedBhk = bhkNumber ? formatBhkNumber(bhkNumber) : "";
+    parts.push(normalizedBhk ? `${slugify(normalizedBhk)}-bhk` : slugify(bhk));
+  }
+  if (transaction) parts.push(transaction);
+  // Include the building before locality so a listing URL identifies the
+  // actual property, not just its neighbourhood.
+  const raw = (input.building_name ?? "").trim();
+  const bldg = raw.includes(",") ? raw.split(",")[0].trim() : raw;
+  if (bldg && bldg.length <= 50 && !/^(sq\.?\s*ft|multiple options|carpet|na\b|\d+\s*bhk|for sale|for rent|available|new listing|video|pics|car park|residential listing)/i.test(bldg)) {
+    parts.push(slugify(bldg));
+  }
+  const micro = (input.micro_market ?? "").trim();
+  if (micro) parts.push(slugify(micro));
+  // Sparse historical rows still need a useful, source-grounded URL instead
+  // of collapsing to a bare numeric path such as /listings/15599/15599.
+  if (parts.length === 0) {
+    const propertyType = String(input.property_type ?? "").trim();
+    const title = String(input.title ?? "").trim();
+    if (propertyType) parts.push(slugify(propertyType));
+    if (transaction) parts.push(transaction);
+    if (title && !/^(?:residential|commercial)?\s*(?:for\s+)?(?:sale|rent|lease)?$/i.test(title)) {
+      parts.push(slugify(title).split("-").slice(0, 5).join("-"));
+    }
+  }
+  // If both bhk and locality/building are missing, the slug is just the id.
+  // Otherwise join with hyphens, then suffix the id for uniqueness.
+  if (parts.length === 0) return id;
+  // Filter out empty parts (e.g. if bhk was just whitespace), then join.
+  const filtered = parts.filter((p) => p.length > 0);
+  if (filtered.length === 0) return id;
+  return `${filtered.join("-")}-${id}`;
+}
+
+// Deal-tag taxonomy — mirrors the whitelist enforced server-side in
+// ai_extraction._VALID_DEAL_TAGS. Tone buckets are public-site Tailwind class
+// fragments (border + bg + text). Kept in this file so the card + detail
+// page stay in sync without prop drilling.
+const DEAL_TAG_LABELS: Record<string, string> = {
+  distress_sale: "Distress sale",
+  urgent_sale: "Urgent sale",
+  negotiable: "Negotiable",
+  bank_auction: "Bank auction",
+  resale: "Resale",
+  exclusive_mandate: "Exclusive mandate",
+  price_drop: "Price drop",
+};
+
+const DEAL_TAG_TONES: Record<string, string> = {
+  distress_sale: "border-red-400/30 bg-red-400/10 text-red-300",
+  urgent_sale: "border-orange-400/30 bg-orange-400/10 text-orange-300",
+  negotiable: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
+  bank_auction: "border-blue-400/30 bg-blue-400/10 text-blue-300",
+  resale: "border-zinc-400/30 bg-zinc-400/10 text-zinc-300",
+  exclusive_mandate: "border-purple-400/30 bg-purple-400/10 text-purple-300",
+  price_drop: "border-cyan-400/30 bg-cyan-400/10 text-cyan-300",
+};
+
+export function buildDealTags(raw: string[] | null | undefined): ListingCardViewModel["dealTags"] {
+  if (!raw || raw.length === 0) return [];
+  const out: ListingCardViewModel["dealTags"] = [];
+  for (const tag of raw) {
+    if (typeof tag !== "string") continue;
+    const key = tag.trim().toLowerCase();
+    if (!key) continue;
+    const label = DEAL_TAG_LABELS[key];
+    const tone = DEAL_TAG_TONES[key];
+    if (!label || !tone) continue; // whitelist — drop anything we don't recognise
+    out.push({ tag: key, label, tone });
+  }
+  return out;
+}
+
+// Compact Indian-currency formatter for additional charge lines: 1000000 → "₹10 Lakh",
+// 3500000 → "₹35 Lakh", 15000000 → "₹1.5 Cr". Mirrors formatCardPrice units but is
+// purely display-side; server stores `amount` as raw INR.
+function formatChargeAmount(amount: number): string {
+  if (!Number.isFinite(amount) || amount <= 0) return "₹—";
+  if (amount >= 1_00_00_000) {
+    const cr = amount / 1_00_00_000;
+    return `₹${cr % 1 === 0 ? cr.toFixed(0) : cr.toFixed(1)}Cr`;
+  }
+  if (amount >= 1_00_000) {
+    const lac = amount / 1_00_000;
+    return `₹${lac % 1 === 0 ? lac.toFixed(0) : lac.toFixed(1)} Lakh`;
+  }
+  if (amount >= 1_000) {
+    const k = amount / 1_000;
+    return `₹${k % 1 === 0 ? k.toFixed(0) : k.toFixed(1)}K`;
+  }
+  return `₹${amount.toLocaleString("en-IN")}`;
+}
+
+export function buildAdditionalCharges(
+  raw: AdditionalCharge[] | null | undefined,
+): ListingCardViewModel["additionalCharges"] {
+  if (!raw || raw.length === 0) return [];
+  const out: ListingCardViewModel["additionalCharges"] = [];
+  for (const c of raw) {
+    if (!c || typeof c !== "object") continue;
+    const label = typeof c.label === "string" ? c.label.trim() : "";
+    if (!label) continue;
+    if (c.amount_type === "percent_of_price" && typeof c.amount === "number" && Number.isFinite(c.amount)) {
+      const pct = c.amount;
+      out.push({ label, amountLabel: `${pct % 1 === 0 ? pct.toFixed(0) : pct.toFixed(2)}% of price` });
+      continue;
+    }
+    if (c.amount_type === "fixed" && typeof c.amount === "number" && Number.isFinite(c.amount) && c.amount > 0) {
+      out.push({ label, amountLabel: `+ ${formatChargeAmount(c.amount)}` });
+      continue;
+    }
+    // Malformed entry — drop silently rather than render "undefined%".
+  }
+  return out;
+}
+
+export function toListingCardViewModel(
+  row: ListingCardFields,
+  isBuilding: boolean,
+  fallbackLocality?: string | null,
+): ListingCardViewModel {
+  // On a building page, inherit the building's confirmed locality when the
+  // individual listing failed to resolve its own micro_market.
+  const ownLocality = listingLocality(row);
+  const locality = ownLocality ?? (fallbackLocality && fallbackLocality.trim() ? fallbackLocality.trim() : null);
+  const hasLocality = Boolean(locality);
+  const specItems = buildSpecItems(row);
+  // Compute the SEO slug once so card href, JSON-LD, sitemap, and the
+  // back-compat redirect all agree on the canonical URL.
+  const slug = row.id != null
+    ? buildListingSlug({
+        id: row.id,
+        bhk: row.bhk,
+        micro_market: row.micro_market,
+        building_name: row.building_name,
+        property_type: row.property_type,
+        intent: row.intent,
+        title: row.title,
+      })
+    : null;
+  return {
+    title: buildTitle(row),
+    locality,
+    localitySlug: locality ? slugify(locality) : null,
+    isBuilding,
+    priceLabel: formatCardPrice(row.price, row.price_unit, row.intent, row.price_model, row.price_per_sqft, row.area_sqft, row.price_raw_text),
+    dealType: intentValue(row.intent) === "rent" ? "For Rent" : intentValue(row.intent) === "sale" ? "For Sale" : null,
+    specRow: buildSpecRow(specItems),
+    specItems,
+    statusLabel: hasLocality ? "Listed" : "Locality unconfirmed",
+    statusTone: hasLocality ? "listed" : "unconfirmed",
+    updatedLabel: formatUpdated(row.last_seen),
+    freshnessLabel: formatFreshness(row.last_seen),
+    freshnessBadge: formatFreshnessBadge(row.last_seen, row.first_seen, row.times_seen),
+    assetTypeLabel: assetTypeLabel(row.asset_type, row.intent),
+    waLink: waLinkFor(row.id, slug, row.card_type),
+    // The public route is /listings/[slug]/[id].  Keeping both segments here
+    // prevents every card click/prefetch from requesting a one-segment 404.
+    slug,
+    href: row.id != null && Number.isFinite(row.id)
+      ? `/listings/${slug ?? "listing"}/${row.id}`
+      : null,
+    waAvailable: isBrokerContactable(row.broker_phone),
+    brokerName: safeBrokerName(row.broker_name),
+    priceModel: row.price_model ?? null,
+    pricePerSqft: row.price_per_sqft ?? null,
+    dealTags: buildDealTags(row.deal_tags),
+    additionalCharges: buildAdditionalCharges(row.additional_charges),
+    publicNote: safePublicSourceNote(row.source_notes),
+  };
+}

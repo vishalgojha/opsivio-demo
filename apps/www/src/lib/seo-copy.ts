@@ -1,0 +1,348 @@
+// Centralized, intent-driven SEO copy generation for Opsivio.
+// All titles/descriptions are produced here so every route stays consistent
+// with the editorial rules:
+//   - primary keyword first, human readable
+//   - brand ("Opsivio") always at the very end
+//   - never start with "Opsivio"
+//   - under ~60 chars for titles where possible
+//   - descriptions 140-160 chars, natural language, no broken numbers
+
+export type Txn = "sale" | "rent";
+
+function titleCase(s: string): string {
+  return s
+    .split(/\s+/)
+    .map((w) => (w.length > 2 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w))
+    .join(" ");
+}
+
+// ---- Locality titles -------------------------------------------------------
+
+export function localityTitle(locality: string): string {
+  return `${locality} Properties for Sale and Rent — Opsivio`;
+}
+
+export function localityTxnTitle(locality: string, txn: Txn): string {
+  const verb = txn === "rent" ? "for Rent" : "for Sale";
+  return `${locality} Properties ${verb} — Opsivio`;
+}
+
+export function localityBhkTitle(locality: string, bhk: string): string {
+  return `${bhk} Flats for Sale and Rent in ${locality} — Opsivio`;
+}
+
+export function localityBudgetTitle(
+  locality: string,
+  bhk: string | null,
+  txn: Txn,
+  budgetLabel: string,
+): string {
+  const subject = bhk ? `${bhk} in ${locality}` : `${titleCase(locality)} property`;
+  const verb = txn === "rent" ? "for Rent" : "for Sale";
+  return `${subject} ${budgetLabel} ${verb} — Opsivio`;
+}
+
+export function localityCommercialTitle(locality: string, kind: string): string {
+  return `${titleCase(kind)} for Sale and Rent in ${locality} — Opsivio`;
+}
+
+// ---- Building titles -------------------------------------------------------
+
+export function buildingTitle(name: string): string {
+  return `${name} — Live Property Listings — Opsivio`;
+}
+
+export function buildingTxnTitle(name: string, txn: Txn): string {
+  const verb = txn === "rent" ? "for Rent" : "for Sale";
+  return `${name} ${verb} — Live Property Listings — Opsivio`;
+}
+
+// ---- Listing / 3BHK / budget generic --------------------------------------
+
+export function listingTitle(card: {
+  title: string;
+  locality: string | null;
+  priceLabel: string;
+}): string {
+  const where = card.locality ? ` in ${card.locality}` : "";
+  const base = card.title || "Property";
+  if (card.priceLabel && card.priceLabel !== "Price on request") {
+    return `${base}${where} — ${card.priceLabel} — Opsivio`;
+  }
+  return `${base}${where} — Opsivio`;
+}
+
+export function searchTitle(query: string): string {
+  const q = query.trim();
+  if (!q) return "Search Property Listings — Opsivio";
+  return `${q} — Live Property Search — Opsivio`;
+}
+
+// ---- Programmatic sub-page titles (locality x txn / bhk / budget / commercial) ----
+
+export function localitySegmentTitle(
+  locality: string,
+  segment: "sale" | "rent" | "commercial",
+): string {
+  if (segment === "commercial") return `${titleCase(locality)} Commercial Properties for Sale and Rent — Opsivio`;
+  const verb = segment === "rent" ? "for Rent" : "for Sale";
+  return `${locality} Properties ${verb} — Opsivio`;
+}
+
+export function localityBhkSegmentTitle(locality: string, bhk: number): string {
+  const label = bhk >= 5 ? "5+ BHK" : `${bhk} BHK`;
+  return `${label} Flats for Sale and Rent in ${locality} — Opsivio`;
+}
+
+export function localityBudgetSegmentTitle(
+  locality: string,
+  budgetLabel: string,
+  txn: Txn,
+): string {
+  const subject = `${titleCase(locality)} property`;
+  const verb = txn === "rent" ? "for Rent" : "for Sale";
+  return `${subject} ${budgetLabel} ${verb} — Opsivio`;
+}
+
+export function localitySegmentDescription(opts: {
+  locality: string;
+  segmentLabel: string;
+  listingCount: number;
+  txn: Txn;
+}): string {
+  const { locality, segmentLabel, listingCount, txn } = opts;
+  const verb = txn === "rent" ? "for rent" : "for sale";
+  const parts: string[] = [];
+  parts.push(
+    `Explore ${listingCount.toLocaleString("en-IN")} live ${segmentLabel} listings in ${locality} ${verb}.`,
+  );
+  parts.push("Filter by budget, furnishing and building, then contact the listing broker instantly on WhatsApp.");
+  return clip(parts.join(" "), 155);
+}
+
+// ---- Descriptions (natural language, 140-160 chars) -----------------------
+
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max - 1).replace(/\s+\S*$/, "");
+  return `${cut}.`;
+}
+
+function sourceDescription(message: string | null | undefined): string | null {
+  const cleaned = String(message ?? "")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/(?:\+?91[\s-]?)?(?:[6-9]\d[\s-]?){5}[6-9]\d/g, "")
+    .replace(/[ *_`~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned || cleaned.length < 12) return null;
+  return cleaned;
+}
+
+export function localityDescription(opts: {
+  locality: string;
+  totalListings: number;
+  buildingCount: number;
+  saleCount: number;
+  rentCount: number;
+  topBhk: string | null;
+}): string {
+  const { locality, totalListings, buildingCount, saleCount, rentCount, topBhk } = opts;
+  const parts: string[] = [];
+  parts.push(
+    `Browse ${totalListings.toLocaleString("en-IN")} live ${locality} property listings across ${buildingCount} buildings.`,
+  );
+  if (saleCount > 0 && rentCount > 0) {
+    parts.push(`Includes ${saleCount} for sale and ${rentCount} for rent.`);
+  } else if (saleCount > 0) {
+    parts.push(`Includes ${saleCount} for sale.`);
+  } else if (rentCount > 0) {
+    parts.push(`Includes ${rentCount} for rent.`);
+  }
+  if (topBhk) parts.push(`${topBhk} homes are most common.`);
+  parts.push("Connect directly with verified brokers. Updated in real time.");
+  return clip(parts.join(" "), 155);
+}
+
+export function buildingDescription(opts: {
+  name: string;
+  locality: string | null;
+  listingCount: number;
+  saleCount: number;
+  rentCount: number;
+}): string {
+  const { name, locality, listingCount, saleCount, rentCount } = opts;
+  const where = locality ? ` in ${locality}` : "";
+  const parts: string[] = [];
+  parts.push(
+    `Explore ${listingCount.toLocaleString("en-IN")} live listings at ${name}${where}.`,
+  );
+  if (saleCount > 0 && rentCount > 0) {
+    parts.push(`${saleCount} for sale, ${rentCount} for rent.`);
+  } else if (saleCount > 0) {
+    parts.push(`${saleCount} available for sale.`);
+  } else if (rentCount > 0) {
+    parts.push(`${rentCount} available for rent.`);
+  }
+  parts.push("Contact the posting broker instantly on WhatsApp.");
+  return clip(parts.join(" "), 155);
+}
+
+export type ListingSourceFacts = {
+  bhk: string | null;
+  landmark: string | null;
+  view: string | null;
+  parking: string | null;
+  pets: boolean;
+  possession: string | null;
+};
+
+/** Extract only high-signal, allow-listed facts from the private source slice.
+ * The source text itself is never rendered; these facts are safe display copy.
+ */
+export function extractListingSourceFacts(
+  message: string | null | undefined,
+  building: string | null | undefined,
+  locality: string | null | undefined,
+): ListingSourceFacts {
+  const text = message || "";
+  const lower = text.toLowerCase();
+  const bhk = text.match(/\b(\d+(?:\.\d+)?)\s*bhk\b/i)?.[1] ?? null;
+  const view = text.match(/\b(partial\s+sea\s+view|sea\s+view|garden\s+view|city\s+view|pool\s+view)\b/i)?.[1] ?? null;
+  const parkingCount = text.match(/\b(\d+)\s+car\s+(?:parks?|parking)\b/i)?.[1];
+  const parking = parkingCount
+    ? `${parkingCount} car parking`
+    : (/\bcar\s+parking\s+(?:available|provided|included)\b/i.test(text) ? "car parking" : null);
+  const possession = text.match(/\bpossession\s+([\w\s]+?)(?=[.!\n]|$)/i)?.[0]?.trim() ?? null;
+
+  let landmark: string | null = text.match(/\b(?:near|opposite|opp\.?|next\s+to|behind)\s+([A-Za-z][A-Za-z .&'-]{2,45})/i)?.[1]?.trim() ?? null;
+  if (!landmark && building && locality) {
+    const lines = text.split(/\r?\n|,/).map((line) => line.replace(/[\*_]/g, "").trim()).filter(Boolean);
+    const buildingIndex = lines.findIndex((line) => line.toLowerCase().includes(building.toLowerCase()));
+    const localityIndex = lines.findIndex((line, index) => index > buildingIndex && line.toLowerCase().includes(locality.toLowerCase()));
+    if (buildingIndex >= 0 && localityIndex > buildingIndex) {
+      const candidate = lines.slice(buildingIndex + 1, localityIndex).find((line) =>
+        line.length >= 3 && line.length <= 50 && /[A-Za-z]/.test(line) &&
+        !/^(building|flat|floor|rent|sale|price|available|furnished|residential|commercial|open|pets|possession|video|brokerage|kindly|call|contact)/i.test(line) &&
+        !/\d{5,}|\b(?:bhk|parking|lakhs?|lakh|cr|sq\.?\s*ft)\b/i.test(line),
+      );
+      landmark = candidate || null;
+    }
+  }
+
+  return {
+    bhk,
+    landmark,
+    view,
+    parking,
+    pets: /\bpets?\s+(?:allowed|permitted|okay|ok)\b/i.test(lower),
+    possession,
+  };
+}
+
+export function listingDescription(opts: {
+  dealType: "For rent" | "For sale";
+  title: string;
+  locality: string | null;
+  buildingAddress?: string | null;
+  specRow: string;
+  sourceMessage?: string | null;
+  building?: string | null;
+  landmark?: string | null;
+  propertyType?: string | null;
+  areaSqft?: number | null;
+  priceLabel?: string | null;
+}, maxLength = 320): string {
+  const {
+    title,
+    locality,
+    buildingAddress,
+    specRow,
+    sourceMessage,
+    building,
+    propertyType,
+    areaSqft,
+  } = opts;
+  const facts = extractListingSourceFacts(sourceMessage, building, locality);
+  const parking = facts.parking;
+  const brokerBrief = sourceDescription(sourceMessage);
+  const where = locality ? ` in ${locality}` : "";
+  const parts: string[] = [];
+  const factBhk = facts.bhk ? `${facts.bhk} BHK ` : "";
+  const landmark = opts.landmark || facts.landmark;
+  const furnishing = specRow.match(/\b(fully furnished|semi[- ]furnished|unfurnished)\b/i)?.[1]?.toLowerCase() ?? "";
+  const area = typeof areaSqft === "number" && Number.isFinite(areaSqft) && areaSqft > 0
+    ? `${Math.round(areaSqft).toLocaleString("en-IN")} sqft `
+    : "";
+  const type = propertyType && !/^(property|listing|unknown)$/i.test(propertyType.trim())
+    ? propertyType.trim().toLowerCase()
+    : "property";
+  const usableTitle = title && !/^(?:for|available for)?\s*(?:rent|sale|lease)$/i.test(title.trim())
+    ? title.trim()
+    : "";
+  const subject = usableTitle || `${factBhk}${furnishing ? `${furnishing} ` : ""}${area}${type}`.trim();
+  const verifiedAddress = buildingAddress?.trim() || "";
+  const titleIncludesBuilding = Boolean(
+    building && subject.toLocaleLowerCase().includes(building.trim().toLocaleLowerCase()),
+  );
+  const verifiedPlace = verifiedAddress
+    ? titleIncludesBuilding
+      ? `, ${verifiedAddress}`
+      : ` at ${building && !/^(asking|price|rent|sale)\b/i.test(building.trim()) ? `${building.trim()}, ` : ""}${verifiedAddress}`
+    : null;
+  const place = verifiedPlace || (landmark ? `${where}, near ${landmark}` : where);
+  // Use typed facts extracted from the broker message, while ensuring a
+  // trusted enriched address is included whenever one is available.
+  const subjectMentionsPlace = [locality, building, verifiedAddress]
+    .filter(Boolean)
+    .some((value) => subject.toLocaleLowerCase().includes(String(value).trim().toLocaleLowerCase()));
+  const subjectWithFacts = usableTitle
+    ? subject
+    : `${furnishing ? `${furnishing.charAt(0).toUpperCase()}${furnishing.slice(1)} ` : ""}${factBhk}${type}`.trim();
+  const locationSuffix = place && !subjectMentionsPlace ? ` ${place}` : "";
+  parts.push(`${subjectWithFacts}${locationSuffix}`.replace(/\s+/g, " ").trim() + ".");
+  if (area) parts.push(`${area.trim()} carpet area` + (parking ? ` with ${parking}` : "") + ".");
+  else if (parking) parts.push(`${parking.charAt(0).toUpperCase()}${parking.slice(1)} included.`);
+  // The detail page already presents the asking price in its dedicated price
+  // block. Repeating it here made older descriptions read like parser output:
+  // “... ₹8.75 Cr. ... For sale at ₹8.75 Cr.”
+  const extras = [facts.view, facts.parking, facts.pets ? "pets allowed" : null, facts.possession]
+    .filter(Boolean)
+    .join("; ");
+  if (extras) parts.push(`${extras.charAt(0).toUpperCase()}${extras.slice(1)}.`);
+  if (!brokerBrief && !usableTitle && !facts.bhk && !furnishing && !area && !extras) {
+    parts.push("The broker's source post does not include additional public property details yet.");
+  }
+  return clip(parts.join(" "), maxLength);
+}
+
+/**
+ * Keep stored source-grounded copy, but make a verified street address
+ * unavoidable on the public listing page when the description predates
+ * building enrichment or was generated without the address field.
+ */
+export function ensureVerifiedAddressInDescription(
+  description: string | null | undefined,
+  address: string | null | undefined,
+  building?: string | null,
+): string | null {
+  const text = description?.trim() || "";
+  const verifiedAddress = address?.trim() || "";
+  if (!text) return null;
+  if (!verifiedAddress || text.toLocaleLowerCase().includes(verifiedAddress.toLocaleLowerCase())) return text;
+  const cleanBuilding = building?.trim() && !/^(asking|price|rent|sale)\b/i.test(building.trim())
+    ? `${building.trim()}, `
+    : "";
+  const locationPrefix = cleanBuilding && !text.toLocaleLowerCase().includes(building!.trim().toLocaleLowerCase())
+    ? cleanBuilding
+    : "";
+  return `${locationPrefix}${verifiedAddress}. ${text}`;
+}
+
+export function searchDescription(query: string): string {
+  const q = query.trim() || "India";
+  return clip(
+    `Explore live ${q} property listings from active WhatsApp broker networks. Filter by budget, furnishing and building, then contact the listing broker instantly.`,
+    158,
+  );
+}

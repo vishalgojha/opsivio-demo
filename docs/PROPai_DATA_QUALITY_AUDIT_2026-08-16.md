@@ -1,0 +1,269 @@
+# PropAI Data Quality and Identity Audit
+
+Date: 2026-08-16; follow-up updated 2026-08-20
+Status: Audit baseline with implementation follow-up. The exact broker-copy
+dedupe gate described below is now committed and its database migration has
+been applied in production. The broader canonical-opportunity audit remains
+open.
+
+## Executive finding
+
+PropAI currently has no single canonical opportunity-identity path. Three different mechanisms are being treated as dedupe, but they solve different problems:
+
+1. `source_fingerprint` prevents retrying the same raw WhatsApp message.
+2. `record_listing_repost()` classifies a saved row as `merged`, `flagged`, or `distinct`, but does not remove or canonicalize rows.
+3. `_merge_observation_rows()` merges rows only in selected feed paths and is not used by every market/search consumer.
+
+As a result, reposts remain physically stored and different screens expose different projections of the same data. More parsing or more semantic search will not solve this until canonical identity is shared by ingestion, storage, and every feed.
+
+The first narrow identity boundary is now implemented: an identical message
+from the same resolved author phone is treated as a repeat observation before
+LLM extraction. This materially reduces repeated broker broadcasts and LLM
+spend, while preserving every raw WhatsApp event for evidence and audit.
+
+## Confirmed root causes
+
+### 1. Typed-table uniqueness is source-level, not listing-level
+
+The typed tables have a unique `source_fingerprint`. The application generates it from the raw message and listing index. A repost in a new WhatsApp message therefore receives a new fingerprint and a new typed row.
+
+Relevant files:
+
+- `storage/supabase.py` (`save_typed_observation`, typed save paths)
+- `supabase/migrations/20260803020000_typed_extraction_schemas.sql`
+
+This is ingestion idempotency, not property dedupe.
+
+### 2. Repost classification does not produce one canonical row
+
+`storage/supabase.py::record_listing_repost()` uses semantic candidates and structured comparisons, then writes duplicate metadata. For a `merged` result, both the old and new rows remain in the database. The function does not create a canonical opportunity record, redirect the new row, or remove it from all consumers.
+
+Its rules are also too restrictive for reposts: same broker, exact normalized building text, same day for exact matches, and matching price/area/BHK. It fails on building aliases, missing fields, changed posting days, missing phones, and semantically equivalent wording.
+
+### 3. Different screens use different feed implementations
+
+`/api/inbox/items` uses `_get_recent_market_observations()` and `_merge_observation_rows()`.
+
+`get_market_listings()` reads typed rows directly. It does not apply the same merge function and does not filter `duplicate_status = 'merged'`. It also reports `observation_count: 1` and `group_count: 1` per physical row.
+
+Relevant files:
+
+- `routers/workspace.py`
+- `storage/supabase.py::get_market_items_feed`
+- `storage/supabase.py::get_market_listings`
+- `routers/search.py`
+
+The old SQL dedupe migration targets the pre-typed `parsed_output` model and is not the canonical implementation for the current typed feeds.
+
+### 4. The old in-memory fingerprint omitted broker identity
+
+`storage/supabase.py::_observation_fingerprint()` is described as broker-scoped but does not include `broker_id`, broker phone, or broker name. This causes two opposite risks:
+
+- real reposts fail to merge when other fields vary;
+- different brokers advertising the same physical property can be merged incorrectly in paths that use this function.
+
+The fingerprint also lacks a complete unit identity. Floor is partial; wing, flat/unit number, and configuration details are not consistently represented. The product rule is that building + unit + broker + transaction distinguish an opportunity; the implementation does not enforce that consistently.
+
+This is separate from the new exact-copy gate. The new
+`author_content_fingerprint` is deliberately scoped to the resolved sender
+identity plus normalized raw message content. It prevents identical broadcasts
+from re-entering extraction; it does not claim that two edited messages are
+the same flat.
+
+### 5. Broker canonical identity and broker display name disagree
+
+`storage/supabase.py::_resolve_whatsapp_display_name()` is preferred over extracted broker name, profile name, and sender name. The same preference is repeated while saving typed rows.
+
+Therefore one phone can appear as different names such as `Kapil Gopal Ojha`, `Kapsy`, or another WhatsApp push name. A canonical `broker_id` may exist, but consumers still display the row-level `broker_name` instead of resolving the canonical broker name from `broker_id`.
+
+Required model:
+
+- normalized phone is the identity key;
+- `broker_id` is the authoritative identity;
+- push names and extracted signatures are aliases/evidence;
+- display name comes from the canonical broker record;
+- conflicting names are reviewable, not silently substituted.
+
+### 6. Broker field validation allows body/CTA contamination
+
+`extraction.py::_clean_broker_name()` rejects phones, WhatsApp links, and some contact/instruction phrases, but it does not reject arbitrary CTA or body text such as `Please share suitable options`.
+
+The extraction schema does not make broker identity a strongly source-grounded field. Later fallbacks populate broker name from `sender_name` or `push_name`, so transport metadata can override the actual source signature.
+
+Broker name must be accepted only when it is supported by a sender profile or an explicit source signature/contact block. CTA, property description, requirement text, and generic instruction phrases must be rejected or marked for review.
+
+### 7. Source redaction is route-dependent
+
+Market feed detail paths redact phone numbers through `_redact_market_source_text()`. The authenticated listing detail endpoint intentionally returns raw workspace evidence without redaction. This explains inconsistent source rendering across pages.
+
+The product must explicitly separate:
+
+- private evidence available to authorized internal users;
+- public/source-safe text;
+- broker contact action resolved server-side.
+
+No page should accidentally render a raw payload as a public source slice.
+
+### 8. WhatsApp ingestion/control plane can starve extraction
+
+Production evidence previously showed webhook timeouts and 502 responses. The extraction worker also observed zero selected groups across three organizations: 356 groups existed, zero were selected, and all were opted out. This is an upstream control-plane problem, not merely an extraction-worker performance problem.
+
+The group UI also showed `502` and “no directory available”. It must distinguish an unavailable directory from a genuinely empty directory and must not present fake empty-success states.
+
+No consent rows should be changed automatically.
+
+### 9. Building enrichment is functionally incomplete
+
+The worker can run while producing no useful enrichment:
+
+- Crawl4AI fails when the package is absent in the production image.
+- Crawl4AI has a daily budget and defers jobs after exhaustion.
+- Google Places requires a configured API key and quota.
+- IGR, RERA, and OpenStreetMap providers contain explicit not-implemented paths.
+
+Observed dashboard failures (`web_search_budget_exhausted`, missing Crawl4AI, 0% confidence) match the implementation.
+
+### 10. Semantic retrieval is below the level required for dedupe
+
+The observed golden-set results were recall@5 21.4%, recall@10 21.4%, MRR 0.161, building alias recall@5 12.5%, and broker alias recall@5 33.3%.
+
+Near-duplicate discovery uses semantic search with a similarity threshold and then filters by broker phone and a seven-day window. At this recall level it cannot be the correctness-critical dedupe mechanism.
+
+Semantic search should rank uncertain candidates only. Deterministic canonical identity must decide exact matches.
+
+## Upstream reliability findings
+
+- WhatsApp webhook requests have timed out while messages continued arriving.
+- History-sync/reconnect spikes created a large raw backlog.
+- Group consent selection is currently capable of suppressing all extraction while leaving raw evidence queued.
+- Extraction worker health must report fetched, consent-suppressed, processed, failed, and remaining counts separately.
+
+## Required repair order
+
+### P0: canonical broker identity
+
+Make `broker_id` authoritative for display. Store push names and source signatures as aliases/evidence. Add tests for the same phone appearing as multiple names and for CTA text being rejected as a broker.
+
+### P0: one canonical market feed
+
+All inbox, map, search, broker, and chat consumers must use one projection that:
+
+- excludes merged physical rows;
+- groups repost evidence under one canonical opportunity;
+- retains first-seen, last-seen, and source evidence;
+- keeps different floors/units separate;
+- separates sale and rent;
+- uses canonical broker and building identities.
+
+### P0: deterministic opportunity identity
+
+Identity should include transaction, asset type, canonical broker, canonical building where verified, unit/floor/wing/flat, BHK/configuration, area, price, and relevant furnishing/occupancy fields. Semantic retrieval may propose candidates but cannot be the final merge authority.
+
+### P0: control-plane truthfulness
+
+Fix group-directory refresh and 502 handling. Never display “empty” when the directory request failed. Keep all consent changes explicit and reviewable.
+
+### P1: webhook durability
+
+Use durable acknowledgement/outbox/retry behavior so API timeouts do not cause ingestion gaps, duplicate delivery confusion, or uncontrolled history-sync backlog.
+
+### P1: enrichment gating
+
+Do not queue unavailable providers. Make missing dependencies, keys, quotas, and stub providers visible as configuration state rather than endless enrichment failures.
+
+### P1: semantic quality
+
+Repair tenant scope, alias indexing, stale/orphan vectors, model consistency, and benchmark coverage before using semantic results in repost decisions.
+
+### P1: retention
+
+Review both `raw_messages.raw_payload` and typed-row payload copies before applying retention. Trimming only raw messages does not remove typed payload duplication.
+
+## Acceptance criteria before calling the broader audit fixed
+
+1. Same phone + identical message posted multiple times produces one canonical typed observation with multiple raw evidence messages; edited messages remain subject to reviewed opportunity identity.
+2. Same building but different floor/unit remains separate.
+3. Sale and rent remain separate.
+4. Broker display name is stable across all screens for the same canonical phone.
+5. CTA/body text cannot become broker name.
+6. Every market/search UI uses the same deduped projection.
+7. `duplicate_status = merged` rows never appear as independent inventory.
+8. Group directory failure is shown as failure, not zero groups.
+9. Extraction metrics distinguish fetched, suppressed, processed, failed, and remaining.
+10. Semantic retrieval is not required for deterministic exact identity.
+
+## Audit execution notes
+
+No production writes, consent updates, migrations, deployments, or destructive cleanup were performed during this audit.
+
+Dependency-independent focused tests passed: 20 tests. Broader extraction/storage tests could not be collected in the current environment because project dependencies such as `pandas` were unavailable and the default Python module path was not configured. Existing dirty worktree files were preserved.
+
+## Exact broker-copy dedupe implementation — 2026-08-20
+
+Completed in commit `5fa4a601` and pushed to `main`:
+
+- Added `author_content_fingerprint` to `raw_messages`, with an index scoped
+  by tenant, fingerprint, processed state, and row ID.
+- The fingerprint uses the resolved sender phone JID when WhatsMeow provides
+  it, with the original sender JID as fallback. Group JID, connected PropAI
+  account/session, and WhatsApp event message ID are not used as broker identity.
+- The webhook records the fingerprint at ingestion. The worker also computes
+  it defensively, so non-webhook and older rows can converge.
+- Before deterministic splitting or DeepSeek extraction, the worker looks for
+  an earlier processed row with the same author/content fingerprint.
+- On a match, the new raw event stays stored, is marked
+  `repeat_observation`, points to the earlier raw message, and does not call
+  the extraction model. Existing typed rows have their freshness timestamps
+  updated using the repost's message timestamp.
+- Historical processed rows without the new column are checked through a
+  bounded same-author fallback and backfilled when they match.
+- A content edit creates a new fingerprint and continues through the normal
+  extraction path. This is intentional: the system must not silently merge a
+  changed property message.
+- Migration applied: `20260820010000_author_content_repeat_gate.sql`.
+
+Operational follow-up: redeploy both the API/backend and extraction-worker
+services so live ingestion and polling run the new code. Existing duplicate
+typed rows are not destructively deleted by this change; the raw evidence is
+preserved and the broader feed-level canonicalization remains a separate audit
+item.
+
+## Current execution status — 2026-08-20
+
+This section records follow-up work performed after the original audit snapshot.
+
+### Completed or deployed
+
+- Exact same-author, same-content broker reposts now use the raw observation
+  gate described in the 2026-08-20 section above. This is the first production
+  dedupe path that prevents repeat messages from consuming LLM extraction.
+
+- Canonical `opportunity_key` schema and indexes were added to all eight typed opportunity tables and applied to production. Historical requirement rows remain unkeyed and still require a reviewed deterministic backfill; no automatic merging was performed.
+- WhatsApp history-sync prevention was configured with `PROPAI_DISABLE_HISTORY_SYNC=true` and redeployed. Production reconnect behavior still needs verification.
+- WhatsApp group selection was changed to explicit positive consent. Super Admin has no hard group-count cap.
+- Group selection UI now supports participant-count sorting, a two-column desktop layout, branded confirmation/stop dialogs, and changed-selection detection.
+- The group-selection API timeout was fixed in commit `f6c4f599`: confirmation no longer scans or updates `raw_messages` once per directory group. It persists the control-plane selection and leaves worker-side consent filtering responsible for queued rows. API redeploy completed from that commit.
+- The raw message table was destructively cleared by explicit operator approval. Future retention and ingestion controls are still required.
+- A bounded historical replay tool was added at `scripts/reprocess_extractions.py`. It is dry-run by default, caps plans at 30 raw IDs, requires an exact reviewed plan plus `--confirm REPROCESS` to apply, validates tenant/source hashes, resets only those rows, and routes them through the existing extraction pipeline. It does not replay the backlog automatically.
+
+### Current verified blockers
+
+- Extraction selection/start now succeeds and the UI shows selected groups and `Running`, but runtime worker proof is still missing. The only supplied worker output is the startup line for build `typed-persistence-v4`; no `lane=... fetched=... stored=...` cycle has yet been verified.
+- `/api/extraction/progress` repeatedly returns HTTP 503 and related dashboard/stats requests return HTTP 502. Counters are therefore unavailable and must not be represented as zero or fabricated values.
+- The extraction worker emits detailed lane summaries only when it finds eligible queue rows. A startup line alone proves container launch, not polling, fetching, consent eligibility, or persistence.
+- The current worker fetches candidate rows before applying positive group consent, then suppresses unselected rows individually. This preserves consent safety but still wastes queue/database I/O. The next extraction change should enforce consent before loading large row payloads.
+- The group-selection fix removes the synchronous `raw_messages` rewrite, but selected rows previously marked `extraction_suppressed=true` need a safe, bounded re-enable path. Do not solve this with an unbounded synchronous table update.
+
+### Remaining execution order
+
+1. Obtain extraction-worker runtime logs and heartbeat state; verify selected-group rows have non-zero fetched, attempted, stored, failed, and remaining counts.
+2. Diagnose and fix the progress RPC/API 503 without reintroducing exact-count REST scans or fake counters.
+3. Make the extraction queue consent-aware before wide payload fetches; retain all unselected raw evidence without repeatedly rewriting it.
+4. Verify `PROPAI_DISABLE_HISTORY_SYNC=true` across reconnect/history-sync behavior and confirm no new bulk dump occurs.
+5. Implement raw-message retention and payload trimming with a reviewed migration/job; preserve message text, source metadata, and reprocessing pointers.
+6. Repair deterministic broker identity and display consistency, including CTA/body contamination and Kapil/Kapsy-style aliases.
+7. Backfill/review canonical opportunity keys for historical typed rows without auto-merging uncertain listings.
+8. Repair building enrichment dependency/configuration failures and stop budget-exhausted retry churn.
+9. Validate semantic worker enablement, embedding writes, tenant scope, and golden-set retrieval before using semantics for candidate ranking.
+
+No new consent rows were changed automatically during this follow-up. The three selected groups were chosen explicitly through the UI.

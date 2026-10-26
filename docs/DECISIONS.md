@@ -1,0 +1,168 @@
+# Decision Log
+
+Record significant technical and product decisions. Format: date, decision, context, outcome.
+
+## 2026-08-25 — Market Inbox search scope and tenant-owned shortlist
+
+**Decision:** Explicit sale/rent queries default to listings, while buyer
+requirements are included only through a visible opt-in control. Listing price
+filters and requirement budget-range overlap remain separate. Market Inbox
+shortlists are tenant-owned references to shared typed evidence, and saved
+searches track a source-time cursor; outbound WABA alerts remain deferred.
+
+**Context:** The Inbox previously mixed listing and requirement records when a
+query used the same transaction word, and compared requirement budgets through
+a listing-style single price. Brokers also had no safe way to organize selected
+shared opportunities or return to a query without rescanning it.
+
+**Outcome:** Search exposes its scope, locality matching uses structured
+locality fields only, shortlist/pipeline state is stored in
+`workspace_market_candidates`, and saved search definitions/cursors are stored
+in `saved_market_searches`. Bulk WhatsApp action is a controlled,
+user-confirmed sequence rather than an automated blast.
+
+## 2026-08-20 — Exact broker broadcasts are observations, not new extractions
+
+**Decision:** Identify a WhatsApp message repeat using the resolved sender
+phone JID plus a normalized raw-content fingerprint. Keep every incoming raw
+event, but skip LLM extraction for an exact same-author copy and refresh the
+canonical typed row's freshness timestamps.
+
+**Context:** Brokers routinely copy the same listing broadcast into many groups
+and resend it daily. Group JID and WhatsApp event message ID identify delivery
+events, not the broker or the property opportunity. Re-running DeepSeek for
+each delivery inflated cost and created repeated typed rows.
+
+**Outcome:** The webhook records `author_content_fingerprint`; the worker gates
+before splitting/LLM extraction and stores a `repeat_observation` pointer for
+the raw event. Content edits intentionally receive a new fingerprint and are
+re-extracted. This does not auto-merge different property messages or delete
+raw evidence. Migration: `20260820010000_author_content_repeat_gate.sql`.
+
+## 2026-08-12 — Embeddings shortlist; deterministic evidence decides
+
+**Decision:** Semantic vectors index fresh typed inventory, requirements,
+buildings, localities, brokers, and their aliases asynchronously. Vector
+similarity may retrieve or rank candidates, but it never creates inventory,
+auto-merges identities, or overwrites canonical fields.
+
+**Context:** Exact aliases miss spelling, abbreviation, Hinglish, and semantic
+variants. Process-local TF-IDF vectors were generated but discarded and were
+not stable across workers. Exact identifiers, source locality, broker history,
+price context, and external place evidence remain stronger signals.
+
+**Outcome:** One versioned external embedding model feeds tenant-aware pgvector
+search. Extraction only queues work; a separate worker performs batched
+embedding calls. Ambiguous entity matches remain unresolved or reviewable.
+
+## 2026-07-29 — Workspace-owned AI keys only for tenant chat
+
+**Decision:** WhatsApp self-chat and workspace AI chat use only active keys saved for that workspace. They never fall back to deployment/Coolify environment keys.
+
+**Context:** A linked WhatsApp connection is authenticated to one organization. Falling back to a platform credential would cross the tenant boundary for billing, rate limits, and data handling.
+
+**Outcome:** Each workspace controls its own provider usage. If it has no active provider key, chat returns a clear setup message instead of silently using a platform key.
+
+## 2026-07-22 — Removed deterministic AI chat responses
+
+**Decision:** All AI chat replies come from the LLM. No canned/fallback responses.
+
+**Context:** The conversational path had deterministic responses for greetings and common queries. This created inconsistency — some replies felt robotic while others were natural.
+
+**Outcome:** LLM handles all messages. Empty or failed responses show an explicit error to the user ("AI chat failed: {error}") instead of silent fallback. More consistent, more honest.
+
+## 2026-07-22 — Provider Health: one card per llm_providers row
+
+**Decision:** Provider health page shows one card per database row, not per provider name.
+
+**Context:** Multiple rows can share the same provider name (e.g., two Groq API keys). Each row is an independent credential with its own health status.
+
+**Outcome:** Per-key outage tracking. A compromised key doesn't hide other keys' health.
+
+## 2026-07-22 — AI Usage cost keyed by provider name, not model name
+
+**Decision:** MODEL_PRICING dict uses provider names (e.g., "groq", "cerebras") as keys, not model names.
+
+**Context:** Model names are configured via environment variables and change at deploy time. Provider names are stable identifiers in the database.
+
+**Outcome:** Pricing calculations survive model upgrades without code changes.
+
+## 2026-07-22 — Listing slug always includes ID
+
+**Decision:** All listing slugs end with the numeric ID: `{bhk}-{locality}-{id}`.
+
+**Context:** Without the ID, two listings in the same locality with the same BHK would produce identical slugs, causing conflicts.
+
+**Outcome:** Every listing URL is unique. Slugs are under 80 characters. Deterministic from listing fields.
+
+## 2026-07-22 — Middleware for legacy bare-ID redirects
+
+**Decision:** `/listings/12345` redirects via Next.js middleware (308) to `/listings/12345/12345`, then the page component 301s to the canonical slug.
+
+**Context:** Next.js 16 dynamic segments at the same URL-tree position must use the same slug name. Coexisting `/listings/[id]` and `/listings/[slug]` is impossible.
+
+**Outcome:** Clean redirect chain. Bare IDs work. Canonical URLs are slug-based.
+
+## 2026-07-22 — Remove image pipeline (for now)
+
+**Decision:** No image download/storage pipeline. Listing pages don't show property photos.
+
+**Context:** WhatsApp images are ephemeral (media URLs expire). Building a full image pipeline (download, store, serve) is a significant undertaking with unclear ROI at this stage.
+
+**Outcome:** Simpler system. Listings show text data only. Photos can be added later without migration pain.
+
+## 2026-07-21 — DPDP Act: phone numbers never in public HTML
+
+**Decision:** Broker phone numbers are resolved server-side via `/api/contact-broker/[id]` redirect, never embedded in page HTML.
+
+**Context:** India's DPDP Act 2023 requires consent for personal data display. Phone numbers in HTML are crawlable and indexable.
+
+**Outcome:** Compliant. Phone numbers only appear after user-initiated action (click "Enquire").
+
+## 2026-07-20 — Self-chat prefers fastest healthy provider
+
+**Decision:** Self-chat model chain order: Cerebras > Gemini > Groq > default chain.
+
+**Context:** Self-chat is for quick commands and casual conversation. Latency matters more than capability for most messages.
+
+**Outcome:** Sub-second responses for common queries. Complex requests fall through to the full chain.
+
+## 2026-07-18 — Rejected: auto-merge listings
+
+**Decision:** Do not automatically merge listings that appear to be the same property.
+
+**Context:** Two messages about "3 BHK in Lodha Sea View" from the same broker might be the same unit or different floors. Without floor/wing data, merging risks losing distinct inventory.
+
+**Outcome:** Duplicate listings stay separate. Users see slight duplicates rather than missing inventory. Manual dedup is preferred over algorithmic merging.
+
+## 2026-07-15 — Supabase over raw Postgres
+
+**Decision:** Use Supabase (managed Postgres + REST API + auth) instead of self-hosted Postgres.
+
+**Context:** Small team needs fast iteration. Supabase provides auth, storage, real-time, and a dashboard without building infrastructure.
+
+**Outcome:** Faster development. Trade-off: vendor dependency and REST API overhead for complex queries (mitigated by `propai_query_sql` RPC).
+
+## 2026-09-12 — Mobile workspace navigation is task-first
+
+**Decision:** Mobile navigation exposes Home, Search, Inbox, Connect, and Menu. The workspace copilot remains desktop-only until it has a touch-appropriate interaction surface.
+
+**Context:** The mobile bar advertised Copilot even though the rendered copilot was hidden below the desktop breakpoint, and Home mixed secondary chart detail with actions that reused unrelated live counts.
+
+**Outcome:** Phones get a reliable first-level path to live search, inbox, and WhatsApp setup; Search & Chat gets its own mobile header and composer context; Home prioritizes live essentials and hides secondary intelligence charts on narrow screens. Manage Groups no longer displays the review count as if it were a group count.
+
+## 2026-10-07 — WhatsApp pairing offers QR and linking code
+
+**Decision:** Let the operator choose either QR scan or phone-link code for an unpaired WhatsApp connection. Keep reconnect as a distinct action for a saved session that is merely offline.
+
+**Context:** Brokers found the pairing flow unclear, and phone-link code generation does not succeed for every account. The ingestor already exposes QR state, but the dashboard only offered code-based pairing.
+
+**Outcome:** The connection card clearly presents both pairing methods and the modal explains the matching WhatsApp steps. Starting either method switches the existing unpaired session into that mode; the session is not run as competing QR/code flows.
+
+## 2026-10-07 — Separate raw WhatsApp messages from extracted market records
+
+**Decision:** Market Inbox presents raw messages and extracted records as separate views. Raw messages show original WhatsApp text and source metadata only; listing/requirement attributes and market actions belong to extracted records.
+
+**Context:** A mixed feed rendered unparsed WhatsApp broadcasts as listing cards and allowed a missing excerpt to claim the original post was shown when the evidence API returned it under `raw.message`.
+
+**Outcome:** Brokers can move between distinct views, compare independently scoped counts, and inspect the original message. When a message-specific excerpt is unavailable, the UI clearly labels and displays the complete original text when present, otherwise states that the evidence is unavailable.

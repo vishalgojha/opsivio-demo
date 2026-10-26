@@ -1,0 +1,154 @@
+from storage.supabase import (
+    SupabaseStorage,
+    _ALL_TYPED_TABLES,
+    _market_card_columns,
+    _matches_market_locality,
+)
+
+
+def _columns(table: str) -> set[str]:
+    return set(_market_card_columns(table).split(","))
+
+
+def test_market_card_projection_is_table_specific():
+    commercial = _columns("commercial_sale_listings")
+    requirement = _columns("residential_sale_requirements")
+
+    assert "commercial_use_type" in commercial
+    assert "fitout_status" in commercial
+    assert "project_status" in commercial
+    assert "building_amenities" in commercial
+    assert "bhk" not in commercial
+
+    assert "bhk_options" in requirement
+    assert "budget_max" in requirement
+    assert "price_raw_text" not in requirement
+    assert "total_asking_price" not in requirement
+
+
+def test_every_typed_table_has_the_initial_card_identity_fields():
+    required = {
+        "id", "raw_message_id", "source_fingerprint", "asset_type",
+        "transaction_type", "broker_name", "broker_phone", "summary_title",
+        "created_at",
+    }
+
+    for table in _ALL_TYPED_TABLES:
+        assert required <= _columns(table), table
+
+
+def test_market_card_projection_carries_relational_locality_identity():
+    for table in _ALL_TYPED_TABLES:
+        columns = _columns(table)
+        assert {"locality_id", "locality_match_status"} <= columns
+
+
+def test_market_locality_filter_matches_parent_area_from_reference():
+    row = {
+        "locality_id": 3,
+        "locality_sub_locality": "Pali Hill",
+        "locality_parent_locality": "Bandra West",
+        "locality_canonical_locality": "Bandra West",
+    }
+
+    assert _matches_market_locality(row, ["Bandra West"])
+    assert _matches_market_locality(row, ["Pali Hill"])
+    assert not _matches_market_locality(row, ["Malabar Hill"])
+
+
+def test_commercial_fitout_is_used_for_initial_card_furnishing():
+    row = SupabaseStorage._typed_row_to_legacy(
+        {
+            "_typed_table": "commercial_rent_listings",
+            "transaction_type": "rent",
+            "asset_type": "commercial",
+            "fitout_status": "warm shell",
+        },
+    )
+
+    assert row["furnishing"] == "warm shell"
+
+
+def test_commercial_psf_rent_preserves_persisted_total_and_title():
+    row = SupabaseStorage._typed_row_to_legacy(
+        {
+            "_typed_table": "commercial_rent_listings",
+            "transaction_type": "rent",
+            "asset_type": "commercial",
+            "commercial_use_type": "office",
+            "micro_market": "Khar West",
+            "carpet_area_sqft": 1755,
+            "rent_per_sqft": 425,
+            "monthly_rent": 745875000,
+            "summary_title": "Office for ₹74.59 Cr per month",
+        },
+    )
+
+    assert row["price"] == 745875000
+    assert row["monthly_rent"] == 745875000
+    assert row["summary_title"] == "Office for ₹74.59 Cr per month"
+
+
+def test_projection_repairs_old_commercial_lakh_total_misread_as_psf():
+    row = SupabaseStorage._typed_row_to_legacy(
+        {
+            "_typed_table": "commercial_rent_listings",
+            "transaction_type": "rent",
+            "asset_type": "commercial",
+            "carpet_area_sqft": 2300,
+            "price_raw_text": "5.50Lacs + gst",
+            "rent_per_sqft": 550000,
+            "monthly_rent": 1265000000,
+        },
+    )
+
+    assert row["price"] == 550000
+    assert row["monthly_rent"] == 550000
+    assert row["price_per_sqft"] is None
+
+
+def test_building_name_must_exist_in_its_source_slice():
+    row = SupabaseStorage._typed_row_to_legacy(
+        {
+            "_typed_table": "commercial_rent_listings",
+            "asset_type": "commercial",
+            "transaction_type": "rent",
+            "building_name": "Example Towers",
+            "micro_market": "Khar West",
+            "raw_payload": {"slice_text": "Premium commercial spaces at 16th Road, Khar West"},
+        },
+    )
+
+    assert row["building_name"] is None
+
+
+def test_relevant_slice_handles_bullet_separator_and_typoed_building_anchor():
+    from storage.supabase import _relevant_market_source_slice
+
+    source = """*Available Commercial office on Lease*
+460 sqft · semi-furnished · Khar West
+••••••••••
+*Available S.E Comm office on Lease*
+1000 sqft · terrace 400 sqft · Singage Borde
+"""
+
+    excerpt = _relevant_market_source_slice(source, "Singapore Borde")
+
+    assert "1000 sqft" in excerpt
+    assert "terrace 400 sqft" in excerpt
+    assert "460 sqft" not in excerpt
+
+
+def test_relevant_slice_does_not_include_preceding_office_after_building_anchor():
+    from storage.supabase import _relevant_market_source_slice
+
+    source = """*Area-2300cpt @ 5.50Lacs + gst Deposit neg*
+*Ideal for Media/Advt/Events Company Prod Hse Architect office*
+*Available S.F Comm office on Lease- water field Rd Bandra(w) Lwr flr- lift- 2cp-
+washrm/pantry Attached Area-1000cpt+ terrace 400cpt @5.25Lacs + gst 6months
+Deposit neg* *Singage Borde*"""
+
+    excerpt = _relevant_market_source_slice(source, "Singapore Borde")
+
+    assert "Area-1000cpt" in excerpt
+    assert "Area-2300cpt" not in excerpt

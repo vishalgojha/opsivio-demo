@@ -1,0 +1,363 @@
+import Image from "next/image";
+import Link from "next/link";
+import { ArrowRight, MessageSquare, Search, Database, Lock, Bell, Brain, Layers } from "lucide-react";
+
+const steps = [
+  {
+    num: "01",
+    icon: MessageSquare,
+    title: "Connect your existing WhatsApp",
+    description:
+      "No new CRM. No migration. No behaviour change. Opsivio connects to the WhatsApp groups you're already in — whether you're a broker, landlord, or investor. Once connected, it starts listening without disrupting your workflow.",
+    detail: "Use WhatsApp's Linked Devices pairing-code flow. The connection is encrypted and stays active as long as your phone is online.",
+  },
+  {
+    num: "02",
+    icon: Layers,
+    title: "Opsivio watches the groups you're already in",
+    description:
+      "Broker WhatsApp groups are noisy. Fragmented language, abbreviations, mixed Hindi and English, voice notes, and screenshots. Opsivio understands this language natively.",
+    examples: [
+      "SF — Semi-furnished",
+      "FF — Fully furnished",
+      "SBS — Side by side transaction",
+      "+1 / Plus 1 — Indirect deal via another broker",
+    ],
+    detail: "Messages are cleaned, de-duplicated, and structured automatically. Voice notes are transcribed. Images are analysed for property details. Nothing is lost.",
+  },
+  {
+    num: "03",
+    icon: Database,
+    title: "AI extracts structured market intelligence",
+    description:
+      "Raw WhatsApp messages are transformed into structured property cards — listings, requirements, buildings, brokers — all extracted automatically by Opsivio's extraction engine.",
+    beforeAfter: true,
+    detail:
+      "Every message is parsed for price, BHK, location, furnishing, possession, area, broker name, and more. The extraction engine handles inconsistent formatting, mixed languages, and abbreviations across thousands of groups.",
+  },
+  {
+    num: "04",
+    icon: Search,
+    title: "Everything becomes searchable",
+    description:
+      "Stop scrolling through thousands of messages. Search the entire market inbox in natural language.",
+    queries: [
+      "3 bhk bandra under 3L",
+      "Need office BKC",
+      "1 BHK Andheri West semi-furnished",
+      "Commercial shop Kamala Mills",
+    ],
+    detail:
+      "Search across listings, requirements, buildings, and brokers. Results are ranked by relevance and freshness. Filter by location, budget, property type, and more — all without leaving the inbox.",
+  },
+{
+      num: "05",
+      icon: Brain,
+      title: "Every broker gets a unified profile — across all your groups",
+      description:
+        "This is Opsivio's core differentiator. The same broker appears under different names, numbers, and handles across 50+ groups. Opsivio extracts their entity, deduplicates them, and surfaces everything as a single DM-like profile.",
+      capabilities: [
+        "Broker entity extraction — one canonical profile per person, not per handle",
+        "Cross-group deduplication — messages from 'Rajesh', 'Rajesh Sharma', '98xxx5432' in 12 groups become one thread",
+        "Unified DM view — open a broker's profile to see every listing, requirement, building, and conversation across all groups",
+        "Alias learning — Opsivio continuously merges names, phones, and display names as new evidence arrives",
+        "Activity timeline — listings posted, requirements shared, buildings mentioned, markets active in",
+        "Deal context — which listings matched which requirements, when, and at what price",
+      ],
+      detail:
+        "Instead of scrolling 50 groups to find what Rajesh posted, open his profile. Every message, every property, every market — unified. This is how Opsivio turns group chaos into actionable broker intelligence.",
+    },
+{
+      num: "06",
+      icon: Lock,
+      title: "Shared market by default",
+      description:
+        "Opsivio is built as a broker network. Real-estate group intelligence contributes by default, while DMs, personal chats, client groups, friends and family groups, and opted-out groups stay out of extraction.",
+      modes: [
+        {
+          label: "Shared Market (Default)",
+          tag: "Default",
+          description: "Real-estate group listings, requirements, price signals, building intelligence, broker network, and demand signals contribute to the shared broker network.",
+          features: [
+            "Listings",
+            "Requirements",
+            "Price trends",
+            "Building intelligence",
+            "Broker network",
+            "Demand signals",
+          ],
+          neverShared: [
+            "WhatsApp messages",
+            "Media",
+            "Phone numbers",
+            "Customer chats",
+            "Direct Messages",
+            "Personal chats",
+            "Client conversations",
+          ],
+        },
+        {
+          label: "Private",
+          tag: "Premium",
+          description: "Keep extracted real-estate group intelligence private to your workspace.",
+          features: [
+            "Workspace-only intelligence",
+            "No cross-network inventory",
+            "No network demand signals",
+            "Private extraction results",
+          ],
+          neverShared: [
+            "WhatsApp messages",
+            "Media",
+            "Phone numbers",
+            "Customer chats",
+            "Direct Messages",
+            "Personal chats",
+            "Client conversations",
+          ],
+        },
+      ],
+    },
+  {
+    num: "07",
+    icon: Bell,
+    title: "Search. Monitor. Discover. Respond.",
+    description:
+      "Your unified market inbox replaces the chaos of 50+ WhatsApp groups with one organised workspace.",
+    detail:
+      "Keep track of listings. Monitor broker activity. Discover off-market deals. Respond to requirements. All from one place — without leaving your existing WhatsApp workflow.",
+  },
+];
+
+function HowItWorksPage() {
+  return (
+    <main className="min-h-screen bg-black text-white">
+      {/* ─── Navigation ─── */}
+      <div className="mx-auto max-w-[1400px] px-4 py-4 sm:px-6 lg:px-8">
+        <header className="flex items-center justify-between gap-4 border-b border-white/10 pb-4">
+          <Link href="/" className="flex items-center gap-4 pl-1">
+            <Image src="/propai-logo.svg" alt="Opsivio" width={48} height={48} className="h-12 w-12" priority />
+            <div>
+              <div className="text-[17px] font-bold tracking-tight text-white leading-none">Opsivio</div>
+              <div className="mt-0.5 text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-400">Broker OS</div>
+            </div>
+          </Link>
+
+          <nav className="flex items-center gap-3 sm:gap-5">
+            <Link href="/how-it-works" className="text-sm text-white transition-colors hover:text-zinc-300">
+              How it works
+            </Link>
+            <Link href="/" className="text-sm text-zinc-400 transition-colors hover:text-white">
+              Docs
+            </Link>
+            <Link href="/auth/login?next=/dashboard" className="text-sm text-zinc-400 transition-colors hover:text-white">
+              Log in
+            </Link>
+            <Link
+              href="/auth/signup?next=/whatsapp%3Ftab%3Dnumbers"
+              className="inline-flex items-center gap-2 rounded-full bg-[#3EE88A] px-4 py-2 text-sm font-semibold text-black transition-transform hover:translate-y-[-1px]"
+            >
+              Get started
+              <ArrowRight className="h-4 w-4" strokeWidth={2} />
+            </Link>
+          </nav>
+        </header>
+      </div>
+
+      {/* ─── Hero ─── */}
+      <section className="mx-auto max-w-[1400px] px-4 sm:px-6 lg:px-8 py-10 lg:py-16">
+        <div className="max-w-3xl">
+          <div className="inline-flex items-center gap-2 rounded-full border border-[#3EE88A]/20 bg-[#3EE88A]/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-[var(--accent-text-on-light)]">
+            Seven steps
+          </div>
+          <h1 className="mt-4 text-3xl font-bold tracking-tight text-white sm:text-4xl lg:text-5xl">
+            How Opsivio works
+          </h1>
+          <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-400 sm:text-lg">
+            From WhatsApp chaos to structured market intelligence in seven steps. No training, no setup, no behaviour change.
+          </p>
+        </div>
+      </section>
+
+      {/* ─── Steps ─── */}
+      <div className="mx-auto max-w-[1400px] px-4 sm:px-6 lg:px-8 pb-16 lg:pb-24">
+        <div className="space-y-12 lg:space-y-20">
+          {steps.map((step, i) => (
+            <section
+              key={step.num}
+              id={`step-${step.num}`}
+              className="scroll-mt-20"
+            >
+              <div className="grid gap-8 lg:grid-cols-2 lg:gap-16">
+                {/* Left column — text */}
+                <div className={i % 2 === 1 ? "lg:order-2" : ""}>
+                  <div className="flex items-center gap-3">
+                    <step.icon className="h-5 w-5 text-[var(--accent-text-on-light)]" strokeWidth={1.7} />
+                    <span className="text-[11px] font-bold uppercase tracking-[0.35em] text-[var(--accent-text-on-light)]">
+                      Step {step.num}
+                    </span>
+                  </div>
+                  <h2 className="mt-4 text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+                    {step.title}
+                  </h2>
+                  <p className="mt-4 text-base leading-7 text-zinc-400">
+                    {step.description}
+                  </p>
+
+                  {/* Examples (Step 2) */}
+                  {step.examples && (
+                    <div className="mt-6 grid grid-cols-2 gap-2">
+                      {step.examples.map((ex) => (
+                        <div
+                          key={ex}
+                          className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2 text-xs text-zinc-400"
+                        >
+                          {ex}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Search queries (Step 4) */}
+                  {step.queries && (
+                    <div className="mt-6 space-y-2">
+                      {step.queries.map((q) => (
+                        <div
+                          key={q}
+                          className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-zinc-900 px-4 py-2 text-sm text-zinc-300"
+                        >
+                          <Search className="h-3.5 w-3.5 text-zinc-500" strokeWidth={1.5} />
+                          {q}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Capabilities list (Step 5) */}
+                  {step.capabilities && (
+                    <ul className="mt-6 space-y-3">
+                      {step.capabilities.map((cap) => (
+                        <li key={cap} className="flex items-start gap-3 text-sm text-zinc-400">
+                          <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-[#3EE88A]" />
+                          {cap}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  {/* Modes (Step 6) */}
+                  {step.modes && (
+                    <div className="mt-6 grid gap-4 sm:grid-cols-2">
+                      {step.modes.map((mode) => (
+                        <div
+                          key={mode.label}
+                          className="rounded-xl border border-white/5 bg-white/[0.02] p-4"
+                        >
+                          <div className="flex items-center gap-2">
+                            <div className="text-sm">
+                              {mode.label === "Private Mode" ? "🔒" : "🌐"}
+                            </div>
+                            <div className="text-sm font-semibold text-white">{mode.label}</div>
+                            <span
+                              className={`text-[9px] font-bold uppercase tracking-wider ${
+                                mode.tag === "Default"
+                                  ? "text-[var(--accent-text-on-light)]"
+                                  : "text-zinc-500"
+                              }`}
+                            >
+                              {mode.tag}
+                            </span>
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-zinc-400">{mode.description}</p>
+                          <ul className="mt-3 space-y-1">
+                            {mode.features.map((f) => (
+                              <li key={f} className="flex items-start gap-2 text-[11px] text-zinc-500">
+                                <span className="mt-0.5 text-[var(--accent-text-on-light)]">✓</span>
+                                {f}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {step.beforeAfter && (
+                    <div className="mt-6 rounded-xl border border-white/10 bg-zinc-900 p-4 text-sm leading-6 text-zinc-400">
+                      Real examples are shown only inside a connected workspace, using messages captured from that workspace.
+                    </div>
+                  )}
+
+                  <p className="mt-4 text-sm leading-6 text-zinc-500">{step.detail}</p>
+                </div>
+
+{/* Right column - product step visual */}
+                <div className="hidden lg:block" style={{ order: i % 2 === 1 ? 1 : 2 }}>
+                  <div className="sticky top-8 rounded-2xl border border-white/5 bg-white/[0.02] p-8 lg:p-12">
+                    <div className="flex items-center justify-center">
+                      <div className="text-center">
+                        <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/5 bg-zinc-900">
+                          <step.icon className="h-8 w-8 text-[var(--accent-text-on-light)]" strokeWidth={1.5} />
+                        </div>
+                        <div className="mt-4 text-5xl font-bold tracking-tight text-white/10">
+                          {step.num}
+                        </div>
+                        <div className="mt-2 text-sm font-medium text-zinc-500">
+                          {i === 0 && "Just scan. No setup."}
+                          {i === 1 && "Broker language, understood."}
+                          {i === 2 && "Chaos → Structure"}
+                          {i === 3 && "Search instead of scroll"}
+                          {i === 4 && "One broker. One profile. Every group."}
+                          {i === 5 && "You control what leaves"}
+                          {i === 6 && "One inbox to rule them all"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Separator */}
+              {i < steps.length - 1 && (
+                <div className="mt-12 lg:mt-20 border-t border-white/5" />
+              )}
+            </section>
+          ))}
+        </div>
+      </div>
+
+      {/* ─── CTA ─── */}
+      <section className="border-t border-white/5">
+        <div className="mx-auto max-w-[1400px] px-4 py-12 sm:px-6 lg:px-8 lg:py-16">
+          <div className="mx-auto max-w-2xl text-center">
+            <h2 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+              Ready to organise your market?
+            </h2>
+            <p className="mt-3 text-base text-zinc-400 sm:text-lg">
+              Connect WhatsApp in under a minute. No credit card required.
+            </p>
+            <div className="mt-6 flex items-center justify-center gap-3">
+              <Link
+                href="/auth/signup?next=/whatsapp%3Ftab%3Dnumbers"
+                className="inline-flex items-center gap-2 rounded-lg bg-[#3EE88A] px-5 py-2.5 text-sm font-semibold text-black transition-transform hover:translate-y-[-1px]"
+              >
+                Get started
+                <ArrowRight className="h-3.5 w-3.5" strokeWidth={2} />
+              </Link>
+              <Link
+                href="/"
+                className="inline-flex items-center gap-2 rounded-lg px-5 py-2.5 text-sm font-semibold text-zinc-400 transition-colors hover:text-white"
+              >
+                Back to homepage
+              </Link>
+            </div>
+            <div className="mt-4 text-[10px] uppercase tracking-[0.24em] text-zinc-600">
+              Plans from ₹599/mo · Works with the groups you are already in
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+export default HowItWorksPage;

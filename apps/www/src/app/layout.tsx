@@ -1,0 +1,63 @@
+import type { Metadata, Viewport } from 'next';
+import './globals.css';
+import './public-theme.css';
+import { getSiteUrl } from '@/lib/site';
+import { JsonLd, buildOrganization, buildWebSite } from '@/lib/seo';
+import ServiceWorkerRegister from '@/components/ServiceWorkerRegister';
+
+export const metadata: Metadata = {
+  metadataBase: new URL(getSiteUrl()),
+  title: 'Live Property Listings from WhatsApp Brokers | Opsivio',
+  description: 'Opsivio demo helps you find fresh homes, flats, offices, and commercial properties shared by real brokers on WhatsApp.',
+  icons: {
+    icon: [
+      { url: '/propai-logo.svg?v=3', type: 'image/svg+xml' },
+      { url: '/favicon.svg?v=3', type: 'image/svg+xml' },
+    ],
+    apple: '/propai-logo.svg?v=3',
+  },
+  openGraph: {
+    title: 'Live Property Listings from WhatsApp Brokers | Opsivio',
+    description: 'Find fresh homes, flats, offices, and commercial properties shared by real brokers on WhatsApp.',
+    type: 'website',
+    images: [{ url: '/opengraph-image', width: 1200, height: 630, alt: 'Opsivio — live property listings from brokers' }],
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'Opsivio — Find Property Through Verified Brokers',
+    description: 'Search verified residential and commercial property listings from WhatsApp broker networks.',
+    images: ['/opengraph-image'],
+  },
+  robots: 'index, follow',
+  manifest: '/manifest.webmanifest',
+  appleWebApp: {
+    capable: true,
+  statusBarStyle: 'default',
+    title: 'Opsivio demo',
+  },
+};
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 5,
+  viewportFit: 'cover',
+  themeColor: '#12211A',
+};
+
+export default function WWWLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en" className="antialiased" data-theme="light">
+      <body className="min-h-screen bg-[var(--bg-base)] text-[var(--text-primary)]">
+        <ServiceWorkerRegister />
+        {children}
+        <JsonLd data={buildOrganization({ url: getSiteUrl() })} />
+        <JsonLd data={buildWebSite(getSiteUrl())} />
+      </body>
+    </html>
+  );
+}

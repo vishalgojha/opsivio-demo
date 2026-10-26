@@ -1,0 +1,312 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { ArrowRight, Search, MapPin, Loader2 } from "lucide-react";
+import type { BuildingSummary, LocalitySummary } from "@/lib/localities";
+import { slugify } from "@/lib/supabase";
+import { useAnalytics } from "@/lib/useAnalytics";
+import { Button } from "@/components/ui/button";
+
+type LocalitySuggestion = { locality: string; slug: string; listingCount: number };
+type BuildingSuggestion = { name: string; slug: string; microMarket: string | null; listingCount: number };
+type GoogleSuggestion = { label: string; secondary: string };
+
+export default function SearchBox({
+  query,
+  asset,
+  localities,
+  buildings,
+  onSubmit,
+}: {
+  query: string;
+  asset: string;
+  localities: LocalitySummary[];
+  buildings: BuildingSummary[];
+  onSubmit?: (next: { q: string; asset: string }) => void;
+}) {
+  const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [value, setValue] = useState(query);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const [justTyped, setJustTyped] = useState(false);
+  const [googleSuggestions, setGoogleSuggestions] = useState<GoogleSuggestion[]>([]);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { track } = useAnalytics();
+
+  const localSuggestions = useMemo(() => {
+    const q = value.trim().toLowerCase();
+    if (!q) return [];
+    const localitySuggestions = localities
+      .filter((l) => l.locality.toLowerCase().includes(q))
+      .sort((a, b) => b.listingCount - a.listingCount)
+      .slice(0, 5)
+      .map((locality): { kind: "locality"; item: LocalitySuggestion } => ({ kind: "locality", item: locality }));
+    const buildingSuggestions = buildings
+      .filter((building) => `${building.name} ${building.microMarket || ""}`.toLowerCase().includes(q))
+      .sort((a, b) => b.listingCount - a.listingCount)
+      .slice(0, 5)
+      .map((building): { kind: "building"; item: BuildingSuggestion } => ({
+        kind: "building",
+        item: { name: building.name, slug: slugify(building.name), microMarket: building.microMarket, listingCount: building.listingCount },
+      }));
+    return [...buildingSuggestions, ...localitySuggestions].slice(0, 8);
+  }, [buildings, localities, value]);
+
+  const placeFallbackQuery = useMemo(() => {
+    const q = value.trim();
+    if (q.length < 3 || localSuggestions.length > 0) return "";
+    if (/(?:bhk|bedroom|rent|sale|buy|budget|lakh|crore|furnished|apartment|flat|villa|office|shop|property)/i.test(q)) {
+      const match = q.match(/\b(?:in|near|at|around)\s+(.+?)(?=\s+(?:under|below|budget|for|with|between|upto|up\s+to|₹|\d+\s*(?:lakh|lac|cr|crore))\b|$)/i);
+      return match?.[1]?.trim() || "";
+    }
+    return q;
+  }, [localSuggestions.length, value]);
+
+  useEffect(() => {
+    if (!placeFallbackQuery) {
+      setGoogleSuggestions([]);
+      setGoogleLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setGoogleLoading(true);
+      try {
+        const response = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(placeFallbackQuery)}`, { signal: controller.signal });
+        const payload = response.ok ? await response.json() : { suggestions: [] };
+        setGoogleSuggestions(Array.isArray(payload.suggestions) ? payload.suggestions : []);
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") setGoogleSuggestions([]);
+      } finally {
+        if (!controller.signal.aborted) setGoogleLoading(false);
+      }
+    }, 250);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [placeFallbackQuery]);
+
+  const suggestions = useMemo(() => localSuggestions.length ? localSuggestions : googleSuggestions.map((item) => ({ kind: "google" as const, item })), [googleSuggestions, localSuggestions]);
+
+  // Keep the dropdown open while the user is actively typing a partial match,
+  // but let an explicit submit close it.
+  useEffect(() => {
+    if (justTyped) {
+      setOpen(suggestions.length > 0 || googleLoading);
+      setJustTyped(false);
+    }
+  }, [justTyped, suggestions.length]);
+
+  // Close on outside click.
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  function submitSearch(override?: string) {
+    const q = (override ?? value).trim();
+    setOpen(false);
+    // When used inline (e.g. homepage), let the parent handle the search so
+    // results render in place instead of navigating to /search.
+    if (onSubmit) {
+      onSubmit({ q, asset });
+      return;
+    }
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (asset) params.set("asset", asset);
+    const qs = params.toString();
+    track("search", { query: q, asset });
+    startTransition(() => {
+      router.push(qs ? `/search?${qs}` : "/search");
+    });
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    // Arrow/escape navigation only matters while the dropdown is open.
+    if (open) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActive((i) => Math.min(i + 1, suggestions.length - 1));
+        return;
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActive((i) => Math.max(i - 1, 0));
+        return;
+      } else if (e.key === "Escape") {
+        setOpen(false);
+        return;
+      }
+    }
+
+    // Enter always submits the search (highlighted suggestion jumps to its
+    // locality page; otherwise run the natural-language search). This keeps
+    // the button + Enter keyboard-accessible regardless of dropdown state.
+    if (e.key === "Enter") {
+      if (open && active >= 0 && suggestions[active]) {
+        e.preventDefault();
+        selectSuggestion(suggestions[active]);
+      } else {
+        e.preventDefault();
+        submitSearch();
+      }
+    }
+  }
+
+  function selectSuggestion(suggestion: (typeof suggestions)[number]) {
+    setOpen(false);
+    setActive(-1);
+    if (suggestion.kind === "locality") {
+      router.push(`/localities/${suggestion.item.slug}`);
+    } else if (suggestion.kind === "building") {
+      router.push(`/buildings/${suggestion.item.slug}`);
+    } else {
+      setValue(suggestion.item.label);
+      inputRef.current?.focus();
+    }
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3 shadow-[0_10px_28px_rgba(46,42,34,0.08)] sm:p-4 lg:p-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <label htmlFor="natural-search" className="block text-sm font-medium text-[var(--text-primary)]">
+            Search in plain English
+          </label>
+          <div className="flex items-center gap-1 rounded-full border border-[var(--border-subtle)] bg-[var(--bg-base)] p-1">
+            {[
+              { value: "", label: "All" },
+              { value: "residential", label: "Residential" },
+              { value: "commercial", label: "Commercial" },
+            ].map((opt) => {
+              const activeOpt = asset === opt.value;
+              return (
+                <label
+                  key={opt.value}
+                  className={`cursor-pointer select-none rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+                    activeOpt ? "bg-[var(--accent-primary)] text-[#FAF7F0]" : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="asset"
+                    value={opt.value}
+                    defaultChecked={activeOpt}
+                    className="sr-only"
+                    onChange={() => {
+                      if (onSubmit) {
+                        onSubmit({ q: value.trim(), asset: opt.value });
+                        return;
+                      }
+                      const params = new URLSearchParams();
+                      if (value.trim()) params.set("q", value.trim());
+                      if (opt.value) params.set("asset", opt.value);
+                      const qs = params.toString();
+                      startTransition(() => {
+                        router.push(qs ? `/search?${qs}` : "/search");
+                      });
+                    }}
+                  />
+                  {opt.label}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+        <div className="relative">
+          <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-[var(--text-secondary)]" aria-hidden="true" />
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitSearch();
+            }}
+          >
+            <input
+              id="natural-search"
+              name="q"
+              ref={inputRef}
+              type="search"
+              value={value}
+              autoComplete="off"
+              placeholder="e.g. residential apartment in Bandra West budget 2 to 3 lakh"
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-base)] py-4 pl-12 pr-24 text-[15px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)] focus:border-[var(--accent-primary)] focus:ring-1 focus:ring-[var(--accent-primary)] sm:py-5 sm:text-[16px] lg:text-[18px]"
+              onChange={(e) => {
+                setValue(e.target.value);
+                setActive(-1);
+                setJustTyped(true);
+              }}
+              onFocus={() => {
+                if (suggestions.length) setOpen(true);
+              }}
+              onBlur={() => setOpen(false)}
+              onKeyDown={onKeyDown}
+            />
+            <Button
+              type="submit"
+              disabled={isPending}
+              className="absolute right-2 top-1/2 min-h-0 -translate-y-1/2 px-3 py-2.5 text-xs sm:right-3 sm:px-4 sm:text-sm"
+            >
+              {isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  Searching...
+                </>
+              ) : (
+                <>
+                  Search
+                  <ArrowRight className="h-4 w-4" aria-hidden="true" />
+                </>
+              )}
+            </Button>
+          </form>
+        </div>
+        <p className="mt-3 text-xs leading-5 text-[var(--text-secondary)] sm:text-sm">
+              Try a locality, building, broker, property type, or a full request like “residential apartment in Bandra West budget 2 to 3 lakh”.
+        </p>
+      </div>
+
+      {open && (suggestions.length > 0 || googleLoading) && (
+        <ul className="absolute z-20 mt-2 w-full overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] shadow-[0_16px_36px_rgba(46,42,34,0.14)]">
+          {googleLoading && suggestions.length === 0 && <li className="px-4 py-3 text-sm text-[var(--text-secondary)]">Looking for this place…</li>}
+          {suggestions.map((s, i) => (
+            <li key={s.kind === "google" ? s.item.label : s.item.slug}>
+              <button
+                type="button"
+                className={`flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors ${
+                    i === active ? "bg-[var(--accent-soft)] text-[var(--text-primary)]" : "text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)]"
+                }`}
+                onMouseEnter={() => setActive(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  selectSuggestion(s);
+                }}
+              >
+                <span className="flex items-center gap-2">
+                  <MapPin className="h-4 w-4 text-[var(--accent-forest)]" aria-hidden="true" />
+                  <span>
+                    <span className="block">{s.kind === "locality" ? s.item.locality : s.kind === "building" ? s.item.name : s.item.label}</span>
+                    {s.kind === "building" && s.item.microMarket && <span className="block text-xs text-[var(--text-secondary)]">{s.item.microMarket}</span>}
+                    {s.kind === "google" && s.item.secondary && <span className="block text-xs text-[var(--text-secondary)]">{s.item.secondary}</span>}
+                  </span>
+                </span>
+                <span className="text-xs text-[var(--text-secondary)]">
+                  {s.kind === "google" ? "Google" : `${s.item.listingCount.toLocaleString()} listings`}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,58 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/home/node/.openclaw/workspace",
+      "model": {
+        "primary": "sarvam/sarvam-105b-conversations",
+        "fallbacks": []
+      },
+      "models": {
+        "sarvam/sarvam-105b-conversations": {}
+      },
+      "maxConcurrent": 1
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "sarvam": {
+        "baseUrl": "https://api.sarvam.ai/v1",
+        "apiKey": "${SARVAM_API_KEY}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "sarvam-105b-conversations",
+            "name": "Sarvam 105B Conversations",
+            "reasoning": false,
+            "input": ["text"],
+            "compat": {
+              "requiresStringContent": true
+            },
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 32768,
+            "maxTokens": 2048
+          }
+        ]
+      }
+    }
+  },
+  "plugins": {
+    "allow": ["codex", "diagnostics-otel"]
+  }
+}

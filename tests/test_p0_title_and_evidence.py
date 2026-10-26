@@ -1,0 +1,490 @@
+"""P0 regressions for source-grounded titles and evidence display priority."""
+
+import pytest
+
+from pathlib import Path
+
+from extraction import _ai_extraction_to_parsed, _ai_extraction_to_typed, _source_explicit_location, _source_rent_price_value, _title_evidence_mismatch
+from storage.supabase import (
+    _apply_market_source_projection,
+    _extraction_source_slice,
+    _preferred_market_source_text,
+    _slice_contradicts_typed_row,
+    _source_evidence_for_typed_row,
+)
+
+
+def _item(title: str, building: str | None = None) -> dict:
+    return {
+        "listing_type": "rent",
+        "transaction_type": "rent",
+        "property_category": "commercial",
+        "title": title,
+        "building_name": building,
+        "locality": {"raw_mention": "Andheri West", "resolved_locality": "Andheri West"},
+        "price": {"amount": 180000, "unit": "total", "raw_price_text": "1.80 lac"},
+        "commercial_use_type": "office",
+    }
+
+
+def test_prompt_contains_no_real_building_example_name():
+    source = Path(__file__).parents[1] / "ai_extraction.py"
+    forbidden = "Naman" + " Midtown"
+    assert forbidden not in source.read_text()
+
+
+def test_unrelated_title_is_flagged_without_silent_rewrite():
+    source = "Office for rent in Andheri West\nBuilding - Morya Blue Moon\nRent - 1.80 lac"
+    contaminated = "Naman" + " Midtown — Commercial Office for Rent"
+    item = _item(contaminated)
+
+    parsed = _ai_extraction_to_parsed(item, source, "", "", slice_text=source)
+
+    assert parsed["building_name"] == "Morya Blue Moon"
+    assert "title_evidence_mismatch" in parsed["validation_flags"]
+    assert parsed["needs_review"] is True
+    assert item["title"] == contaminated
+
+
+def test_source_supported_title_is_not_flagged():
+    building = "Naman" + " Midtown"
+    source = f"{building}, Lower Parel\nCommercial office for rent\nRent - 6 lac"
+    assert not _title_evidence_mismatch(
+        f"{building} — Commercial Office for Rent", source, building
+    )
+
+
+def test_explicit_terrace_is_preserved_when_provider_misses_typed_value():
+    source = "3 BHK for sale in Bandra West\nTerrace attached\n₹5 Cr"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "sale",
+            "property_category": "residential",
+            "title": "3 BHK for sale in Bandra West",
+            "bhk": 3,
+            "locality": {"raw_mention": "Bandra West", "resolved_locality": "Bandra West"},
+            "price": {"amount": 5, "unit": "cr", "raw_price_text": "₹5 Cr"},
+        },
+        source,
+    )
+
+    assert table == "residential_sale_listings"
+    assert row["terrace_area_raw_text"] == "Terrace attached"
+    assert row["unstructured_facts"]["terrace"] == "Terrace attached"
+
+
+def test_evidence_prefers_full_raw_message_over_short_slice():
+    raw = "Office for rent in Andheri West\nBuilding - Morya Blue Moon\nRent - 1.80 lac"
+    assert _preferred_market_source_text(raw, "normalized fallback", "Office for rent in Andheri West") == raw
+
+
+def test_evidence_falls_back_to_normalized_then_slice():
+    assert _preferred_market_source_text("", "normalized message", "header") == "normalized message"
+    assert _preferred_market_source_text("", "", "header") == "header"
+
+
+def test_generic_ai_title_is_replaced_with_source_grounded_title():
+    source = "3 BHK for sale in Bandra West, 1,200 sqft, 2 Cr"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "sale",
+            "property_category": "residential",
+            "title": "Property for sale",
+            "bhk": 3,
+            "carpet_area_sqft": 1200,
+            "locality": {"raw_mention": "Bandra West", "resolved_locality": "Bandra West"},
+            "price": {"amount": 2, "unit": "cr", "raw_price_text": "2 Cr"},
+        },
+        source,
+    )
+
+    assert table == "residential_sale_listings"
+    assert row["summary_title"] != "Property for sale"
+    assert "3 BHK" in row["summary_title"]
+    assert "Bandra West" in row["summary_title"]
+
+
+def test_shop_is_not_relabelled_as_studio_from_suitability_copy():
+    source = (
+        "Shop 320 sqft carpet\n14 ft ceiling height\nAttached Washroom\n"
+        "Prime Location\nBandra West\nRent: 1.80 Lakhs\n"
+        "Good For Jewellers / Designers / Salon / Spa / Nail Art Studio"
+    )
+    parsed = _ai_extraction_to_parsed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "commercial",
+            "title": "Studio with 320 sqft for rent at Bandra West",
+            "commercial_use_type": "studio",
+            "carpet_area_sqft": 320,
+            "locality": {"raw_mention": "Bandra West", "resolved_locality": "Bandra West"},
+            "price": {"amount": 1.8, "unit": "lakh", "raw_price_text": "1.80 Lakhs"},
+        },
+        source,
+        "",
+        "",
+        slice_text=source,
+    )
+
+    assert parsed["summary_title"].startswith("320 sqft Shop") or "Shop" in parsed["summary_title"]
+    assert "Studio with" not in parsed["summary_title"]
+
+
+def test_business_name_does_not_relabel_bhk_inventory():
+    source = (
+        "*6 ORVA – BANDRA WEST*\n* 2 BHK + 2 BHK JODI = 4 BHK*\n"
+        "Near Tawa Restaurant\nExclusive Fully Furnished\n"
+        "Rent: ₹4,00,000/- Slightly Negotiable"
+    )
+    parsed = _ai_extraction_to_parsed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "residential",
+            "title": "Restaurant for rent at ORVA, Bandra West",
+            "property_type": "restaurant",
+            "bhk": 4,
+            "locality": {"raw_mention": "Bandra West", "resolved_locality": "Bandra West"},
+            "building_name": "ORVA",
+            "price": {"amount": 400000, "unit": "total", "raw_price_text": "₹4,00,000"},
+        },
+        source,
+        "",
+        "",
+        slice_text=source,
+    )
+
+    assert "BHK" in parsed["summary_title"]
+    assert "Restaurant for rent" not in parsed["summary_title"]
+
+
+def test_residential_bhk_title_does_not_become_a_suitability_business():
+    source = (
+        "Offering two brand new residential apartments for sale near Khar Gymkhana\n"
+        "3 bed with 3 baths, 2 parkings, developer finished, building has a gym\n"
+        "Priced at ₹9.52 cr"
+    )
+    parsed = _ai_extraction_to_parsed(
+        {
+            "listing_type": "sale",
+            "transaction_type": "sale",
+            "property_category": "residential",
+            "title": "Builder finish Gym for sale at Khar West",
+            "property_type": "gym",
+            "bhk": 3,
+            "furnishing_status": "builder_finish",
+            "locality": {"raw_mention": "Khar West", "resolved_locality": "Khar West"},
+            "price": {"amount": 9.52, "unit": "cr", "raw_price_text": "₹9.52 cr"},
+        },
+        source,
+        "",
+        "",
+        slice_text=source,
+    )
+
+    assert "3 BHK" in parsed["summary_title"]
+    assert "Gym for sale" not in parsed["summary_title"]
+
+
+def test_bhk_does_not_override_commercial_asset_type():
+    source = "Shop 320 sqft carpet\nGood for a 2 BHK office conversion\nRent: ₹1.8 Lakhs"
+    parsed = _ai_extraction_to_parsed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "commercial",
+            "title": "Shop with 320 sqft for rent",
+            "property_type": "shop",
+            "locality": {"raw_mention": "Bandra West", "resolved_locality": "Bandra West"},
+            "price": {"amount": 180000, "unit": "total", "raw_price_text": "₹1.8 Lakhs"},
+        },
+        source,
+        "",
+        "",
+        slice_text=source,
+    )
+
+    assert "Shop" in parsed["summary_title"]
+    assert "BHK" not in parsed["summary_title"]
+
+
+def test_provider_absence_markers_become_nulls_before_typed_persistence():
+    parsed = _ai_extraction_to_parsed(
+        {
+            **_item("3 BHK for rent in Bandra West"),
+            "has_lift": "Unknown",
+            "parking_type": "Not identified",
+            "furnishing_status": "Not specified",
+        },
+        "3 BHK for rent in Bandra West",
+        "",
+        "",
+    )
+
+    assert parsed["has_lift"] is None
+    assert parsed["parking_type"] is None
+    assert parsed["furnishing"] is None
+
+
+def test_multi_unit_bhk_keeps_count_and_source_bhk():
+    source = "4 2BHK Fully Furnished Flat Available on Rent for 10 Lakh"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "residential",
+            "title": "4 BHK Fully Furnished Flat Available on Rent",
+            "bhk": 4,
+            "furnishing_status": "Fully Furnished",
+            "price": {"amount": 10, "unit": "lakh", "raw_price_text": "10 Lakh"},
+        },
+        source,
+    )
+
+    assert table == "residential_rent_listings"
+    assert row["listing_count"] == 4
+    assert row["bhk"] == 2
+    assert "4" in row["summary_title"] and "2 BHK" in row["summary_title"]
+
+
+def test_single_bhk_does_not_inherit_model_unit_count():
+    source = "Single occupancy in 5 BHK at Kalpataru Magnus for 4.3 Lakh"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "residential",
+            "title": "5 BHK at Kalpataru Magnus",
+            "bhk": 5,
+            "listing_count": 5,
+            "price": {"amount": 4.3, "unit": "lakh", "raw_price_text": "4.3 Lakh"},
+        },
+        source,
+    )
+
+    assert table == "residential_rent_listings"
+    assert row["bhk"] == 5
+    assert row.get("listing_count") is None
+    assert "5 ×" not in row["summary_title"]
+
+
+def test_heading_only_slice_recovers_full_building_block_from_raw_message():
+    raw = {
+        "message": "*FOR RENT*\n*Supreme Evana*\nNew Building @ 28th Road Bandra\n3 BHK, 1100 sqft\nRent: 3.25 Lacs",
+    }
+    evidence = _source_evidence_for_typed_row(
+        {"building_name": "Supreme Evana", "bhk": 3},
+        raw,
+        "*FOR RENT* *Supreme Evana*",
+    )
+
+    assert "Supreme Evana" in evidence
+    assert "3 BHK" in evidence
+    assert "3.25 Lacs" in evidence
+
+
+def test_full_broadcast_fallback_is_reduced_to_the_matching_listing_block():
+    raw_message = (
+        "1. *19 NORTH 2BHK* PRELEASE New Bldg ₹4.75CR\n"
+        "Area 1100 sqft, Bandra West\n\n"
+        "2. *SIMRAN PLAZA*\n"
+        "4TH ROAD KHAR W\n"
+        "AREA 1036' PRICE 5CR\n"
+        "2 CAR PARKS FURNISH\n"
+        "OC IN PROGRESS\n"
+        "oooooooooooooooooooooooooooooooo\n"
+        "Office space to rent at Main Road, Bandra West\n"
+        "admeasuring carpet area of 1800 sft\n"
+        "Expected rent is ₹4 Lakhs pm negotiable\n"
+        "Suitable for office Clinic etc\n"
+        "No Car Parking\n"
+    )
+
+    evidence = _source_evidence_for_typed_row(
+        {
+            "building_name": "SIMRAN PLAZA",
+            "bhk": None,
+        },
+        {"message": raw_message},
+        raw_message,
+    )
+
+    assert "SIMRAN PLAZA" in evidence
+    assert "2 CAR PARKS FURNISH" in evidence
+    assert "19 NORTH" not in evidence
+    assert "Office space to rent" not in evidence
+
+
+def test_extraction_trace_does_not_show_adjacent_offer_from_historical_slice():
+    source = (
+        "*2bhk* - Bandra (w) bazar road corner or boran road\n"
+        "465 Carpet area on paper\n"
+        "*2.05 cr negotiable*\n"
+        "Higher floor with lift , 2 wheelers parking\n"
+        "*15 years old building , Maintenance 1100 monthly , registered society*\n\n"
+        "*Commercial*\n"
+        "*Direct shop For 1/1*\n"
+        "*Around 250 crpt area*\n"
+        "*75k rent slightly Negotiable*\n"
+    )
+
+    excerpt = _extraction_source_slice(
+        {
+            "bhk": 2,
+            "price": 20500000,
+            "summary_title": "2 BHK for Sale in Bandra West — ₹2.05 Cr",
+        },
+        {},
+        source,
+    )
+
+    assert "465 Carpet area" in excerpt
+    assert "Commercial" not in excerpt
+    assert "75k rent" not in excerpt
+
+
+def test_labelled_rent_does_not_take_deposit_amount():
+    source = "1 BHK rent deposit 100000 rent 40000 final"
+
+    assert _source_rent_price_value(source) == 40000
+
+
+def test_underscored_whatsapp_rent_keeps_lakh_unit():
+    source = "_Skyper Tower_\n_Pali Naka Bandra_\n_Rent: 4.50Lacs_"
+
+    assert _source_rent_price_value(source) == 450000
+
+
+def test_unlabelled_structured_locality_line_is_source_grounded():
+    source = "_Skyper Tower_\n_Pali Naka Bandra_\n_Type: Semi Furnished_"
+
+    assert _source_explicit_location(source) == "Pali Naka Bandra"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("3 BHK at Lower Parel, 2.5 Cr", "Lower Parel"),
+        ("Office near BKC | 5000 sq ft", "BKC"),
+        ("14th Road, Bandra W | 2 BHK", "Bandra West"),
+        ("2 BHK in Khar W", "Khar West"),
+        ("𝗕𝗞𝗖\nOffice for rent", "BKC"),
+        ("Kalanagar, Bandra East", "Bandra East"),
+    ],
+)
+def test_audit_locality_phrasings_are_source_grounded(source, expected):
+    assert _source_explicit_location(source) == expected
+
+
+def test_unlabelled_building_dash_locality_is_grounded_without_regex_boundary():
+    source = "*3 BHK*\nGEETANJALI - BANDRA EAST\nHigher floor - 1000 sqft\nQuote - 3.80 Cr"
+    assert _source_explicit_location(source) == "BANDRA EAST"
+
+
+def test_missing_price_and_bhk_are_not_invented():
+    source = "3+3 jodi in Seasons"
+    parsed = _ai_extraction_to_parsed(
+        {
+            "listing_type": "sale",
+            "transaction_type": "sale",
+            "property_category": "residential",
+            "title": "3+3 jodi in Seasons",
+            "bhk": 3,
+            "price": {"amount": 25000000, "unit": "abs"},
+        },
+        source,
+        "",
+        "",
+        slice_text=source,
+    )
+
+    assert parsed["bhk"] is None
+    # The plausibility guard preserves the model output for reviewer visibility
+    # while flagging it; it must not silently erase the extracted value.
+    assert parsed["price"] == 25000000.0
+    assert parsed["needs_review"] is True
+    assert "price_source_missing" not in parsed["validation_flags"]
+
+
+def test_commercial_rent_psf_calculates_from_carpet_area():
+    source = "Space for Rent in Corporate Avenue, Andheri East. Carpet area: 6207sqft. Rate Per Sqft. on Carpet: 300/-"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "rent",
+            "transaction_type": "rent",
+            "property_category": "commercial",
+            "title": "Space for Rent in Corporate Avenue",
+            "carpet_area_sqft": 6207,
+            "price": {"amount": 300, "unit": "per_sqft", "raw_price_text": "300 per sqft"},
+            "commercial_use_type": "office",
+        },
+        source,
+    )
+
+    assert table == "commercial_rent_listings"
+    assert row["rent_per_sqft"] == 300
+    assert row["monthly_rent"] == 1862100
+    assert row["price_math"]["area_sqft"] == 6207
+
+
+def test_sibling_slice_with_wrong_area_is_not_shown_as_listing_specific_evidence():
+    raw_message = (
+        "*AVAILABLE SHOP FOR RENT*\n*AREA:*\n"
+        "*Ground floor: 1400 sqft carpet*\n*1st floor 500 sqft carpet*\n\n"
+        "*Location: Relief Road off Linking Road , Santacruz West,Juhu*\n"
+        "*Rent: 8.5Lac*"
+    )
+    legacy: dict = {}
+    _apply_market_source_projection(
+        legacy,
+        {"carpet_area_sqft": 500, "monthly_rent": 850000},
+        {"message": raw_message},
+        "Ground floor: 1400 sqft carpet",
+    )
+
+    assert legacy["source_slice_text"] == ""
+    assert "1st floor 500 sqft carpet" in legacy["source_message"]
+
+
+def test_matching_slice_is_kept_as_listing_specific_evidence():
+    legacy: dict = {}
+    _apply_market_source_projection(
+        legacy,
+        {"carpet_area_sqft": 500, "monthly_rent": 850000},
+        {"message": "1st floor 500 sqft carpet\nRent: 8.5Lac"},
+        "1st floor 500 sqft carpet",
+    )
+
+    assert "500 sqft" in legacy["source_slice_text"]
+
+
+def test_area_conflict_detection_ignores_rows_without_area_anchors():
+    assert _slice_contradicts_typed_row(
+        {"carpet_area_sqft": 500, "monthly_rent": 850000},
+        "Ground floor: 1400 sqft carpet",
+    )
+    assert not _slice_contradicts_typed_row(
+        {"carpet_area_sqft": None, "monthly_rent": 850000},
+        "AVAILABLE SHOP FOR RENT",
+    )
+
+
+def test_commercial_sale_psf_calculates_from_carpet_area():
+    source = "Commercial unit for sale. Carpet area: 6207 sqft. Rate per sqft: 300"
+    table, row = _ai_extraction_to_typed(
+        {
+            "listing_type": "sale",
+            "transaction_type": "sale",
+            "property_category": "commercial",
+            "title": "Commercial unit for sale",
+            "carpet_area_sqft": 6207,
+            "price": {"amount": 300, "unit": "per_sqft", "raw_price_text": "300 per sqft"},
+            "commercial_use_type": "office",
+        },
+        source,
+    )
+
+    assert table == "commercial_sale_listings"
+    assert row["price_per_sqft"] == 300
+    assert row["total_asking_price"] == 1862100

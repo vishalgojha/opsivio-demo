@@ -1,0 +1,23 @@
+"use client";
+
+import dynamic from "next/dynamic";
+import type { BuildingOnMap } from "@/lib/localities";
+
+const LocalityMap = dynamic(() => import("./LocalityMap"), {
+  ssr: false,
+  loading: () => (
+    <div className="w-full h-[280px] lg:h-[320px] rounded-xl border border-white/10 bg-zinc-900/50 animate-pulse" />
+  ),
+});
+
+export default function LocalityMapLoader({
+  locality,
+  buildings,
+  apiKey,
+}: {
+  locality: string;
+  buildings: BuildingOnMap[];
+  apiKey: string | null;
+}) {
+  return <LocalityMap locality={locality} buildings={buildings} apiKey={apiKey} />;
+}

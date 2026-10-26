@@ -1,0 +1,324 @@
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    environment:
+      LAB_HOST: 0.0.0.0
+      LAB_PORT: 8000
+      STATUS_FILE: /data/status.json
+      INGESTOR_INTERNAL_URL: http://ingestor:3001
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      PROPAI_INTERNAL_TOKEN: ${PROPAI_INTERNAL_TOKEN:-}
+      OPENCLAW_OPS_TOKEN: ${OPENCLAW_OPS_TOKEN:-}
+      COOLIFY_API_URL: ${COOLIFY_API_URL:-}
+      COOLIFY_API_TOKEN: ${COOLIFY_API_TOKEN:-}
+      COOLIFY_ALLOWED_PROJECT_UUID: ${COOLIFY_ALLOWED_PROJECT_UUID:-}
+      COOLIFY_ALLOWED_ENVIRONMENT_UUID: ${COOLIFY_ALLOWED_ENVIRONMENT_UUID:-}
+      PROPAI_EMAIL_INGEST_TOKEN: ${PROPAI_EMAIL_INGEST_TOKEN:-}
+      PROPAI_EMAIL_INGEST_TENANT_ID: ${PROPAI_EMAIL_INGEST_TENANT_ID:-}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      PROPAI_TOKEN_ENCRYPTION_KEY: ${PROPAI_TOKEN_ENCRYPTION_KEY:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NVIDIA_API_KEY_2: ${NVIDIA_API_KEY_2:-}
+      NVIDIA_API_KEY_3: ${NVIDIA_API_KEY_3:-}
+      NVIDIA_API_KEY_4: ${NVIDIA_API_KEY_4:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_API_KEY_2: ${GROQ_API_KEY_2:-}
+      GROQ_API_KEY_3: ${GROQ_API_KEY_3:-}
+      GROQ_API_KEY_4: ${GROQ_API_KEY_4:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      SARVAM_MODEL: ${SARVAM_MODEL:-}
+      SARVAM_BASE_URL: ${SARVAM_BASE_URL:-https://api.sarvam.ai/v1}
+      DOUBLEWORD_API_URL: ${DOUBLEWORD_API_URL:-https://api.doubleword.ai/v1}
+      DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY:-}
+      DOUBLEWORD_MODEL: ${DOUBLEWORD_MODEL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MANAGEMENT_KEY: ${OPENROUTER_MANAGEMENT_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://openrouter.ai/api/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-voyageai/voyage-4-lite}
+      EMBEDDING_DIMENSIONS: "1024"
+      GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      GOOGLE_DRIVE_CLIENT_ID: ${GOOGLE_DRIVE_CLIENT_ID:-}
+      GOOGLE_DRIVE_CLIENT_SECRET: ${GOOGLE_DRIVE_CLIENT_SECRET:-}
+      GOOGLE_DRIVE_REDIRECT_URI: ${GOOGLE_DRIVE_REDIRECT_URI:-https://app.propai.live/api/google-drive/callback}
+      PROPAI_TOKEN_ENCRYPTION_KEY: ${PROPAI_TOKEN_ENCRYPTION_KEY:-}
+      FRONTEND_URL: https://app.propai.live
+      COMPANION_WEBHOOK_SECRET: ${COMPANION_WEBHOOK_SECRET:-}
+      AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage"
+      AGENT_BROWSER_EXECUTABLE_PATH: /usr/bin/chromium
+      OPENROUTER_OPS_MODEL: ${OPENROUTER_OPS_MODEL:-openrouter/free}
+      LANGGRAPH_REDIS_URL: ${LANGGRAPH_REDIS_URL:-}
+      LANGGRAPH_REDIS_REQUIRED: ${LANGGRAPH_REDIS_REQUIRED:-true}
+      SOCIAL_FLOW_AGENT_ENABLED: ${SOCIAL_FLOW_AGENT_ENABLED:-false}
+      SOCIAL_FLOW_SDK_URL: ${SOCIAL_FLOW_SDK_URL:-}
+      SOCIAL_FLOW_SDK_API_KEY: ${SOCIAL_FLOW_SDK_API_KEY:-}
+      META_ADS_MCP_ENABLED: ${META_ADS_MCP_ENABLED:-false}
+      META_ADS_MCP_URL: ${META_ADS_MCP_URL:-https://mcp.facebook.com/ads}
+      META_ADS_MCP_PROTOCOL_VERSION: ${META_ADS_MCP_PROTOCOL_VERSION:-2025-06-18}
+      META_APP_ID: ${META_APP_ID:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      META_REDIRECT_URI: ${META_REDIRECT_URI:-https://app.propai.live/api/social-flow/meta/callback}
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v21.0}
+      META_ADS_SCOPES: ${META_ADS_SCOPES:-ads_read,ads_management,business_management,pages_show_list,pages_read_engagement}
+    volumes:
+      - propai-data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  google-drive-sync:
+    build:
+      context: ../..
+      dockerfile: services/google-drive-sync/Dockerfile
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      PROPAI_TOKEN_ENCRYPTION_KEY: ${PROPAI_TOKEN_ENCRYPTION_KEY:-}
+      GOOGLE_DRIVE_CLIENT_ID: ${GOOGLE_DRIVE_CLIENT_ID}
+      GOOGLE_DRIVE_CLIENT_SECRET: ${GOOGLE_DRIVE_CLIENT_SECRET}
+      GOOGLE_DRIVE_REDIRECT_URI: ${GOOGLE_DRIVE_REDIRECT_URI:-https://app.propai.live/api/google-drive/callback}
+      GOOGLE_DRIVE_SYNC_POLL_SECONDS: ${GOOGLE_DRIVE_SYNC_POLL_SECONDS:-30}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ../..
+      dockerfile: frontend/Dockerfile
+      args:
+        LAB_API_BASE_URL: http://api:8000
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        SUPABASE_URL: ${SUPABASE_URL}
+        SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+        DOUBLEWORD_API_URL: ${DOUBLEWORD_API_URL}
+        DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
+        DOUBLEWORD_MODEL: ${DOUBLEWORD_MODEL}
+    environment:
+      LAB_API_BASE_URL: http://api:8000
+      NODE_ENV: production
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      DOUBLEWORD_API_URL: ${DOUBLEWORD_API_URL}
+      DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
+      DOUBLEWORD_MODEL: ${DOUBLEWORD_MODEL}
+    depends_on:
+      - api
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+  ingestor:
+    build:
+      context: ../..
+      dockerfile: services/whatsmeow-ingestor/Dockerfile
+    environment:
+      PROPAI_WEBHOOK_URL: http://api:8000/webhook
+      PROPAI_API_URL: http://api:8000
+      PROPAI_INSTANCE_NAME: propai-whatsmeow
+      PROPAI_DISABLE_HISTORY_SYNC: ${PROPAI_DISABLE_HISTORY_SYNC:-true}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      PROPAI_INTERNAL_TOKEN: ${PROPAI_INTERNAL_TOKEN:-}
+      STATUS_FILE: /data/status_default.json
+      DATABASE_URL: postgres://postgres:${SUPABASE_DB_PASSWORD}@db.${SUPABASE_REF}.supabase.co:5432/postgres?sslmode=require
+    volumes:
+      - propai-data:/data
+    depends_on:
+      - api
+    expose:
+      - "3001"
+    restart: unless-stopped
+
+  extraction-worker:
+    build:
+      context: ../..
+      # Use the worker-specific image so Coolify/buildpack deployments do not
+      # need to honor a service-level command override to start extraction.
+      dockerfile: Dockerfile.worker
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_API_KEY_2: ${GROQ_API_KEY_2:-}
+      GROQ_API_KEY_3: ${GROQ_API_KEY_3:-}
+      GROQ_API_KEY_4: ${GROQ_API_KEY_4:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      EXTRACTION_SARVAM_API_KEY: ${EXTRACTION_SARVAM_API_KEY:-}
+      EXTRACTION_SARVAM_MODEL: ${EXTRACTION_SARVAM_MODEL:-}
+      EXTRACTION_SARVAM_BASE_URL: ${EXTRACTION_SARVAM_BASE_URL:-https://api.sarvam.ai/v1}
+      EXTRACTION_SARVAM_OPEN_SOURCE_API_KEY: ${EXTRACTION_SARVAM_OPEN_SOURCE_API_KEY:-}
+      EXTRACTION_SARVAM_OPEN_SOURCE_MODEL: ${EXTRACTION_SARVAM_OPEN_SOURCE_MODEL:-gemma4}
+      EXTRACTION_DOUBLEWORD_API_KEY: ${EXTRACTION_DOUBLEWORD_API_KEY:-}
+      EXTRACTION_DOUBLEWORD_MODEL: ${EXTRACTION_DOUBLEWORD_MODEL:-}
+      EXTRACTION_DOUBLEWORD_BASE_URL: ${EXTRACTION_DOUBLEWORD_BASE_URL:-https://api.doubleword.ai/v1}
+      EXTRACTION_OPENROUTER_API_KEY: ${EXTRACTION_OPENROUTER_API_KEY:-}
+      # OpenRouter must be explicitly enabled for extraction. The global
+      # OPENROUTER_API_KEY is reserved for chat and is never used here.
+      EXTRACTION_OPENROUTER_ENABLED: ${EXTRACTION_OPENROUTER_ENABLED:-false}
+      EXTRACTION_OPENROUTER_MODEL: ${EXTRACTION_OPENROUTER_MODEL:-openrouter/free}
+      EXTRACTION_OPENROUTER_BASE_URL: ${EXTRACTION_OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      EXTRACTION_OPENROUTER_FREE_ENABLED: ${EXTRACTION_OPENROUTER_FREE_ENABLED:-false}
+      EXTRACTION_OPENROUTER_SECONDARY_API_KEY: ${EXTRACTION_OPENROUTER_SECONDARY_API_KEY:-}
+      EXTRACTION_OPENROUTER_SECONDARY_MODEL: ${EXTRACTION_OPENROUTER_SECONDARY_MODEL:-}
+      EXTRACTION_OPENROUTER_SECONDARY_BASE_URL: ${EXTRACTION_OPENROUTER_SECONDARY_BASE_URL:-https://openrouter.ai/api/v1}
+      # Deprecated transition aliases; remove after Coolify is migrated.
+      EXTRACTION_OPENROUTER_DEEPSEEK_API_KEY: ${EXTRACTION_OPENROUTER_DEEPSEEK_API_KEY:-}
+      EXTRACTION_OPENROUTER_DEEPSEEK_MODEL: ${EXTRACTION_OPENROUTER_DEEPSEEK_MODEL:-deepseek/deepseek-v4-flash-0731}
+      EXTRACTION_OPENROUTER_DEEPSEEK_BASE_URL: ${EXTRACTION_OPENROUTER_DEEPSEEK_BASE_URL:-https://openrouter.ai/api/v1}
+      EXTRACTION_PROVIDER_TIMEOUT_SECONDS: ${EXTRACTION_PROVIDER_TIMEOUT_SECONDS:-180}
+      FRONTEND_URL: https://app.propai.live
+      EXTRACTION_WORKER_BATCH_SIZE: ${EXTRACTION_WORKER_BATCH_SIZE:-50}
+      EXTRACTION_WORKER_POLL_SECONDS: 5
+      EXTRACTION_WORKER_CONCURRENCY: ${EXTRACTION_WORKER_CONCURRENCY:-24}
+      # Drain historical rows continuously while reserving equal capacity for
+      # fresh WhatsApp traffic. Both lanes use atomic claims, so a second
+      # worker replica can be added later without duplicate extraction.
+      EXTRACTION_WORKER_LIVE_ONLY: ${EXTRACTION_WORKER_LIVE_ONLY:-false}
+      EXTRACTION_WORKER_FAST_LANE_SLOTS: ${EXTRACTION_WORKER_FAST_LANE_SLOTS:-8}
+      EXTRACTION_WORKER_BACKLOG_LANE_SLOTS: ${EXTRACTION_WORKER_BACKLOG_LANE_SLOTS:-16}
+      EXTRACTION_WORKER_SERIALIZE_GROUPS: ${EXTRACTION_WORKER_SERIALIZE_GROUPS:-false}
+      EXTRACTION_WORKER_RECONCILE_PENDING_ON_CYCLE: ${EXTRACTION_WORKER_RECONCILE_PENDING_ON_CYCLE:-false}
+      EXTRACTION_WORKER_LIVE_CUTOFF_AT: ${EXTRACTION_WORKER_LIVE_CUTOFF_AT:-}
+      # Emergency one-time backfill only. Keep false normally; when enabled,
+      # set EXTRACTION_WORKER_DRAIN_TENANT_ID to the intended workspace.
+      EXTRACTION_WORKER_DRAIN_SUPPRESSED: ${EXTRACTION_WORKER_DRAIN_SUPPRESSED:-false}
+      EXTRACTION_WORKER_DRAIN_TENANT_ID: ${EXTRACTION_WORKER_DRAIN_TENANT_ID:-}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  extraction-repair-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.repair-worker
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      EXTRACTION_REPAIR_WORKER_BATCH_SIZE: ${EXTRACTION_REPAIR_WORKER_BATCH_SIZE:-2}
+      EXTRACTION_REPAIR_WORKER_POLL_SECONDS: ${EXTRACTION_REPAIR_WORKER_POLL_SECONDS:-5}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  tenant-boundary-repair-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.tenant-boundary-worker
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      TENANT_BOUNDARY_REPAIR_WORKER_BATCH_SIZE: ${TENANT_BOUNDARY_REPAIR_WORKER_BATCH_SIZE:-25}
+      TENANT_BOUNDARY_REPAIR_POLL_SECONDS: ${TENANT_BOUNDARY_REPAIR_POLL_SECONDS:-15}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  enrichment-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    command: ["python", "worker.py"]
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NVIDIA_API_KEY_2: ${NVIDIA_API_KEY_2:-}
+      NVIDIA_API_KEY_3: ${NVIDIA_API_KEY_3:-}
+      NVIDIA_API_KEY_4: ${NVIDIA_API_KEY_4:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_API_KEY_2: ${GROQ_API_KEY_2:-}
+      GROQ_API_KEY_3: ${GROQ_API_KEY_3:-}
+      GROQ_API_KEY_4: ${GROQ_API_KEY_4:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  building-enrichment-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    command: ["python", "building_enrichment_worker.py"]
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NVIDIA_API_KEY_2: ${NVIDIA_API_KEY_2:-}
+      NVIDIA_API_KEY_3: ${NVIDIA_API_KEY_3:-}
+      NVIDIA_API_KEY_4: ${NVIDIA_API_KEY_4:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_API_KEY_2: ${GROQ_API_KEY_2:-}
+      GROQ_API_KEY_3: ${GROQ_API_KEY_3:-}
+      GROQ_API_KEY_4: ${GROQ_API_KEY_4:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      BUILDING_ENRICHMENT_WORKER_BATCH_SIZE: ${BUILDING_ENRICHMENT_WORKER_BATCH_SIZE:-100}
+      BUILDING_ENRICHMENT_WORKER_CONCURRENCY: ${BUILDING_ENRICHMENT_WORKER_CONCURRENCY:-10}
+      BUILDING_ENRICHMENT_WORKER_POLL_SECONDS: ${BUILDING_ENRICHMENT_WORKER_POLL_SECONDS:-5}
+      BUILDING_ENRICHMENT_CONFIDENCE_THRESHOLD: 0.7
+      BUILDING_ENRICHMENT_MAX_RETRIES: ${BUILDING_ENRICHMENT_MAX_RETRIES:-2}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  semantic-embedding-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    command: ["python", "semantic_embedding_worker.py"]
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://openrouter.ai/api/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-voyageai/voyage-4-lite}
+      EMBEDDING_DIMENSIONS: "1024"
+      SEMANTIC_WORKER_BATCH_SIZE: ${SEMANTIC_WORKER_BATCH_SIZE:-16}
+      SEMANTIC_WORKER_POLL_SECONDS: ${SEMANTIC_WORKER_POLL_SECONDS:-5}
+      SEMANTIC_WORKER_MAX_ATTEMPTS: ${SEMANTIC_WORKER_MAX_ATTEMPTS:-5}
+      SEMANTIC_WORKER_ENABLED: ${SEMANTIC_WORKER_ENABLED:-false}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  matching-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.matcher
+    # The image has an immutable worker CMD. Keep this explicit for compose
+    # readers, while the dedicated image prevents an API/Uvicorn fallback.
+    command: ["python3", "-m", "matching.worker"]
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      REQUIREMENT_MATCH_WORKER_REQUIREMENTS: ${REQUIREMENT_MATCH_WORKER_REQUIREMENTS:-50}
+      REQUIREMENT_MATCH_WORKER_POLL_SECONDS: ${REQUIREMENT_MATCH_WORKER_POLL_SECONDS:-300}
+      MATCH_TENANT_ID: ${MATCH_TENANT_ID:-}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  propai-data:

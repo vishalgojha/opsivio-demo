@@ -1,0 +1,45 @@
+"use client";
+
+import * as React from "react";
+import { ArrowUp, Mic, Square } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+
+type ConversationBarProps = {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onToggleVoice: () => void;
+  voiceActive: boolean;
+  disabled?: boolean;
+};
+
+/** Opsivio's ConversationBar: ElevenLabs-style voice/text composer backed by
+ * the workspace's existing authenticated conversation session. */
+export function ConversationBar({ value, onChange, onSubmit, onToggleVoice, voiceActive, disabled = false }: ConversationBarProps) {
+  return (
+    <form onSubmit={onSubmit} className="border-t border-[#b8c9bb] px-4 py-3">
+      <Card className="m-0 gap-0 border-[#8fae97] bg-[#f8f7f2] p-0 shadow-none focus-within:border-[#588157]">
+        <textarea
+          rows={3}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="Ask Copilot anything…"
+          aria-label="Message Opsivio workspace agent"
+          className="propai-copilot-textarea min-h-[5.5rem] w-full resize-none bg-transparent px-3 pt-3 text-sm leading-relaxed outline-none"
+          disabled={disabled}
+        />
+        <Separator className="bg-[#d0d9d0]" />
+        <div className="flex items-center justify-between gap-2 p-2">
+          <span className="propai-copilot-composer-hint px-1 text-[10px]">Voice or text · Shift+Enter for a new line</span>
+          <div className="flex items-center gap-1">
+            <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="sm" onClick={onToggleVoice} aria-label={voiceActive ? "Stop listening" : "Talk to the agent"} className={voiceActive ? "bg-rose-400 text-[#2b0b0d] hover:bg-rose-300" : "text-emerald-300 hover:bg-[#19372a]"}>{voiceActive ? <Square className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}</Button></TooltipTrigger><TooltipContent>{voiceActive ? "Stop listening" : "Talk to the agent"}</TooltipContent></Tooltip>
+            <Tooltip><TooltipTrigger asChild><span><Button type="submit" size="icon" disabled={disabled || !value.trim()} aria-label="Send message to Opsivio" className="h-8 w-8 bg-[#8bcb68] text-[#16252b] hover:brightness-105"><ArrowUp className="h-4 w-4" /></Button></span></TooltipTrigger><TooltipContent>Send message</TooltipContent></Tooltip>
+          </div>
+        </div>
+      </Card>
+    </form>
+  );
+}

@@ -1,0 +1,292 @@
+"""Unit tests for the WhatsApp self-chat helpers.
+
+Covers:
+- _is_casual_self_chat() routing for greetings/identity vs. data queries.
+- _format_self_chat_response() post-processor: paragraphs → bullets, JSON
+  fences stripped, length cap, de-duplication.
+- _build_self_chat_system_prompt() contains the bullet-only rules and never
+  inherits the workspace JSON contract.
+- _ndjson_line() returns valid newline-terminated UTF-8 JSON.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from routers import self_chat as sc_mod
+
+
+def test_is_casual_self_chat_routes_greetings():
+    assert sc_mod._is_casual_self_chat("hi") is True
+    assert sc_mod._is_casual_self_chat("Hello!") is True
+    assert sc_mod._is_casual_self_chat("good morning") is True
+    assert sc_mod._is_casual_self_chat("thanks") is True
+    assert sc_mod._is_casual_self_chat("ok") is True
+
+
+def test_broker_demand_question_is_an_explicit_search():
+    assert sc_mod._is_explicit_self_chat_search("Any buyers looking in Bandra West?") is True
+    assert sc_mod._is_explicit_self_chat_search("Any rental requirements in BKC?") is True
+
+
+def test_fast_self_chat_demand_uses_live_requirements_search(monkeypatch):
+    import asyncio
+    import lab.ai_chat_engine as chat_engine
+    import routers.ai_chat as ai_chat
+
+    async def inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(sc_mod.asyncio, "to_thread", inline_to_thread)
+    monkeypatch.setattr(
+        chat_engine,
+        "parse_market_search_request",
+        lambda *_args, **_kwargs: {"intent": "RENT", "bhk": 2, "micro_markets": ["BKC"]},
+    )
+    calls = []
+
+    async def requirement_search(query, tenant_id, user_id):
+        calls.append((query, tenant_id, user_id))
+        return {"content": "Found 1 requirement.", "blocks": [], "sources": ["requirements_unified"]}
+
+    monkeypatch.setattr(ai_chat, "_current_requirement_search", requirement_search)
+    result = asyncio.run(sc_mod._fast_self_chat_search(
+        "Any tenants looking for 2 BHK in BKC?",
+        "tenant-1",
+        demand_search=True,
+    ))
+
+    assert calls[0][0]["micro_markets"] == ["BKC"]
+    assert calls[0][1:] == ("tenant-1", None)
+    assert result["content"] == "Found 1 requirement."
+    assert sc_mod._is_casual_self_chat("Who are you?") is True
+    assert sc_mod._is_casual_self_chat("what can you do") is True
+
+
+def test_is_casual_self_chat_routes_data_queries():
+    assert sc_mod._is_casual_self_chat("show me 3bhk in bandra") is False
+    assert sc_mod._is_casual_self_chat("rent in andheri under 1L") is False
+    assert sc_mod._is_casual_self_chat("any brokers active today?") is False
+    assert sc_mod._is_casual_self_chat("latest listings in dindoshi") is False
+
+
+def test_self_chat_audio_is_detected_before_empty_text_is_dropped():
+    assert sc_mod._self_chat_audio_received([{"kind": "audio"}]) is True
+    assert sc_mod._self_chat_audio_received([{"kind": "image"}]) is False
+
+
+def test_short_search_follow_up_keeps_durable_context():
+    assert sc_mod._is_self_chat_follow_up("Sure. Show me.") is True
+    assert sc_mod._is_self_chat_follow_up("Why?") is True
+    assert sc_mod._is_self_chat_follow_up("Don't you know Bandra West from Bandra East?") is True
+    assert sc_mod._is_self_chat_follow_up("Looking for a 3 BHK in Bandra") is False
+    assert sc_mod._is_self_chat_follow_up("And for the PropAI database?") is True
+    assert sc_mod._is_self_chat_follow_up("posted by?") is True
+    assert sc_mod._is_self_chat_follow_up("what is the evidence bro?") is True
+    assert sc_mod._is_self_chat_follow_up("from my WhatsApp groups") is True
+    assert sc_mod._is_self_chat_follow_up("from the PropAI database") is True
+    assert sc_mod._is_explicit_self_chat_search("And for the PropAI database?") is True
+
+
+def test_format_self_chat_response_splits_paragraphs_to_bullets():
+    text = (
+        "I checked the market. There are 3 active 2 BHK listings in Bandra West. "
+        "The cheapest is at 95K. Brokers include Rahul and Suresh."
+    )
+    out = sc_mod._format_self_chat_response(text)
+    lines = out.split("\n")
+    assert all(line.startswith("• ") for line in lines), out
+    assert 2 <= len(lines) <= 8, out
+    # First bullet must contain the answer (cheapest is at 95K).
+    assert "95K" in out or "95" in out, out
+
+
+def test_format_self_chat_response_keeps_casual_text_natural():
+    out = sc_mod._format_self_chat_response("Hey there! How can I help today?", force_bullets=False)
+    assert not out.startswith("• "), out
+    assert "Hey there" in out
+
+
+def test_format_self_chat_response_strips_json_fences():
+    text = "```json\n{\"content\": \"hi there\"}\n```"
+    out = sc_mod._format_self_chat_response(text)
+    assert "```" not in out
+    assert "json" not in out.lower()
+    assert out.startswith("• "), out
+
+
+def test_format_self_chat_response_handles_raw_json_object():
+    text = '{"content": "• Already bulleted\\n• like this"}'
+    out = sc_mod._format_self_chat_response(text)
+    assert out.startswith("• "), out
+    assert "Already bulleted" in out, out
+
+
+def test_format_self_chat_response_preserves_requested_result_set():
+    text = "\n".join(f"line {i}: hello world this is bullet number {i}" for i in range(15))
+    out = sc_mod._format_self_chat_response(text)
+    assert len(out.split("\n")) == 15, out
+
+
+def test_format_self_chat_response_dedupes_near_identical_lines():
+    text = "Same line.\nSame line.\nDifferent line."
+    out = sc_mod._format_self_chat_response(text)
+    lines = out.split("\n")
+    assert len(lines) == 2, out
+    assert "Same line" in lines[0]
+    assert "Different line" in lines[1]
+
+
+def test_format_self_chat_response_handles_empty_and_whitespace():
+    assert sc_mod._format_self_chat_response("") == ""
+    assert sc_mod._format_self_chat_response("   \n\n  ") == ""
+
+
+def test_bhk_display_normalizes_numeric_values():
+    assert sc_mod._format_bhk_label(3.0) == "3 BHK"
+    assert sc_mod._format_bhk_label("3.0") == "3 BHK"
+    assert sc_mod._format_bhk_label("2.5") == "2.5 BHK"
+    assert sc_mod._format_bhk_label("3 BHK") == "3 BHK"
+
+
+def test_build_self_chat_system_prompt_includes_bullet_rules():
+    prompt = sc_mod._build_self_chat_system_prompt({"overview": "200 listings"})
+    # Bullet rules
+    assert "• " in prompt
+    assert "bullets" in prompt.lower()
+    # The model gets presentation guidance, not a hard result-count rule.
+    assert "Choose the amount of detail" in prompt
+    # Anti-JSON rules
+    assert "JSON" in prompt or "json" in prompt
+    # No workspace contract bleed-through
+    assert "listing_cards" not in prompt, "workspace contract leaked into self-chat prompt"
+    assert "FINAL RESPONSE CONTRACT" not in prompt
+    # Overview line included
+    assert "200 listings" in prompt
+    assert "tenant-captured WhatsApp evidence" in prompt
+    assert "connected groups" in prompt
+    assert "self-chat is support, not an ingestion source" in prompt
+    assert "street-smart" in prompt
+    assert "Mirror the user's language" in prompt
+    assert "commercial_mismatch" in prompt
+    assert "continue that same search" in prompt
+    assert "commercial_mismatch" in prompt
+
+
+def test_build_self_chat_system_prompt_handles_empty_sources():
+    prompt = sc_mod._build_self_chat_system_prompt({})
+    assert "PropAI" in prompt
+    assert "• " in prompt
+    # No overview line if sources are empty.
+    assert "DATA SNAPSHOT" not in prompt
+
+
+def test_provider_safe_history_masks_old_contacts_but_preserves_current_request():
+    messages = [
+        {"role": "system", "content": "Use tools."},
+        {"role": "user", "content": "Find this broker 9819402733"},
+        {"role": "assistant", "content": "Broker: Arshad / 9819402733"},
+        {"role": "user", "content": "posted by? give me the broker number"},
+    ]
+
+    safe = sc_mod._provider_safe_self_chat_messages(messages)
+
+    assert "9819402733" not in safe[1]["content"]
+    assert "9819402733" not in safe[2]["content"]
+    assert safe[-1]["content"] == messages[-1]["content"]
+    assert "PROVIDER-SAFE RETRY" in safe[0]["content"]
+
+
+def test_shared_prompt_uses_explicit_india_timezone(monkeypatch):
+    import ai_chat_engine
+    from datetime import timezone
+
+    real_datetime = ai_chat_engine.datetime.datetime
+    class _FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is not None
+            return real_datetime(2026, 9, 11, 11, 54, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(ai_chat_engine.datetime, "datetime", _FixedDateTime)
+    prompt = ai_chat_engine.build_system_prompt({"overview": ""})
+    assert "05:24 PM IST" in prompt
+
+
+def test_ndjson_line_emits_valid_utf8_with_newline():
+    payload = {"event": "chunk", "delta": "• hello \u00e9"}
+    out = sc_mod._ndjson_line(payload)
+    assert out.endswith(b"\n")
+    text = out.decode("utf-8").rstrip("\n")
+    # JSON is valid and round-trips back to the same payload.
+    import json as _json
+    parsed = _json.loads(text)
+    assert parsed == payload
+    # And the bullet survived as the actual unicode char, not an escape.
+    assert "\u2022" in text
+
+
+def test_stream_self_chat_enabled_default_is_off():
+    # Default: env var unset → disabled.
+    assert sc_mod._stream_self_chat_enabled() is False
+
+
+def test_pasted_listing_content_filter_fallback_does_not_claim_search():
+    reply = sc_mod._pasted_listing_fallback(
+        "Kalpataru Magnus 3 BHK with balcony, carpet 1197 sq ft, fully furnished, rent 2.20 L"
+    )
+    assert "copied from your WhatsApp groups" in reply
+    assert "found myself" in reply
+    assert "summarise" in reply
+
+
+def test_pasted_listing_content_filter_fallback_ignores_short_chat():
+    assert sc_mod._pasted_listing_fallback("sure") == ""
+
+
+def test_content_filter_does_not_use_fake_context_acknowledgement():
+    assert not hasattr(sc_mod, "_content_filter_conversation_fallback")
+
+
+def test_openclaw_self_chat_config_uses_dedicated_model(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_API_URL", "http://openclaw:18789/v1")
+    monkeypatch.setenv("OPENCLAW_API_KEY", "gateway-token")
+    monkeypatch.setenv("OPENCLAW_AGENT_MODEL", "openclaw/default")
+    monkeypatch.setenv("OPENCLAW_SELF_CHAT_MODEL", "openclaw/self-chat")
+    assert sc_mod._openclaw_self_chat_config() == (
+        "http://openclaw:18789/v1",
+        "gateway-token",
+        "openclaw/self-chat",
+    )
+
+
+def test_openclaw_self_chat_config_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_SELF_CHAT_ENABLED", "false")
+    assert sc_mod._openclaw_self_chat_config() == ("", "", "")
+
+
+def test_self_chat_ndjson_streaming_uses_agent_for_casual(monkeypatch):
+    # Casual text must use the same model/tool agent path as searches; the
+    # model, not a regex branch, decides whether a tool is needed.
+    import asyncio
+
+    async def _fake_agent(*args, **kwargs):
+        return {"content": "Hello bhai, I am ready."}
+
+    monkeypatch.setattr(sc_mod, "_run_self_chat_agent", _fake_agent)
+
+    async def _collect():
+        out = []
+        async for line in sc_mod._self_chat_ndjson("hi", "broker-1", casual=True):
+            out.append(line)
+        return out
+
+    result = asyncio.run(_collect())
+    assert len(result) == 2
+    joined = b"".join(result).decode("utf-8")
+    assert '"event": "chunk"' in joined
+    assert "Hello bhai" in joined

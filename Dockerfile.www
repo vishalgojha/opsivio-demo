@@ -1,0 +1,51 @@
+FROM node:22-bookworm-slim AS deps
+
+WORKDIR /app
+COPY apps/www/package.json ./
+# Cache bust: 2026-07-19-peerfix
+ARG CACHE_BUST_DEPS=20260719-peerfix
+RUN npm install --legacy-peer-deps
+
+FROM node:22-bookworm-slim AS builder
+
+WORKDIR /app
+ARG CACHE_BUST=20260719-peerfix
+# Google Maps is a browser-facing key and must be available while Next builds
+# the client bundle as well as when the standalone server renders map pages.
+ARG NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ARG GOOGLE_MAPS_API_KEY
+ENV NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=$NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ENV GOOGLE_MAPS_API_KEY=$GOOGLE_MAPS_API_KEY
+COPY --from=deps /app/node_modules ./node_modules
+
+COPY apps/www/package.json ./
+COPY apps/www/next.config.js ./
+COPY apps/www/tailwind.config.js ./
+COPY apps/www/postcss.config.js ./
+COPY apps/www/tsconfig.json ./
+COPY apps/www/public ./public
+COPY apps/www/src ./src
+
+RUN npm run build
+
+FROM node:22-bookworm-slim AS runner
+
+WORKDIR /app
+ARG CACHE_BUST_COPY=20260716-1
+ARG NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ARG GOOGLE_MAPS_API_KEY
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=$NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ENV GOOGLE_MAPS_API_KEY=$GOOGLE_MAPS_API_KEY
+
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next ./.next
+
+EXPOSE 3000
+
+CMD ["npm", "run", "start"]

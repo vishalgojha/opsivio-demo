@@ -1,0 +1,483 @@
+"""Source-grounded guards for fields that are commonly cross-wired by AI.
+
+This module deliberately contains no database or provider code.  It is used at
+both the AI normalisation boundary and the typed-row boundary so WhatsApp,
+self-chat, WABA and MCP intake all get the same protection.
+"""
+
+from __future__ import annotations
+
+import re
+from config import get_region_config
+
+
+_SIMPLE_PSF_RE = re.compile(
+    r"\b(?P<label>price\s+sale|sale\s+price|sale|quote|rent|rental|rate)\b"
+    r"[^0-9\n]{0,80}(?P<amount>\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?P<multiplier>k|thousand|lakh|lac|cr)?\s*(?:rs\.?\s*)?"
+    r"(?:psf|per\s*/?\s*sq\.?\s*ft|per\s+sqft|per\s+square\s+feet)\b",
+    re.IGNORECASE,
+)
+
+_CONFIDENCE_LABELS = frozenset({"high", "medium", "low"})
+
+_BROKER_GROUNDING_FIELDS = (
+    "broker_name",
+    "broker_company",
+    "broker_rera_number",
+)
+
+
+def _grounding_tokens(value: object) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        if len(token) >= 2
+    }
+
+
+def apply_broker_field_grounding(item: dict, source_text: object) -> dict:
+    """Fail closed for broker identity facts absent from the source slice.
+
+    Sender phone/JID and broker-directory linkage are provenance metadata, not
+    message-body facts. Textual broker identity fields, however, must appear
+    in the item-scoped source evidence before they can enter a typed row.
+    Unsupported values are retained only in the AI payload supplied by the
+    caller for audit, removed from the typed candidate, and marked for review.
+    A row is blocked only when it has neither a source-backed broker name nor
+    a source/transport broker identity to preserve attribution.
+    """
+    corrected = dict(item or {})
+    source_tokens = _grounding_tokens(source_text)
+    flags = list(corrected.get("validation_flags") or [])
+    transport_identity = bool(corrected.pop("_broker_name_from_transport", False))
+    blocked = False
+    has_broker_phone = bool(str(corrected.get("broker_phone") or "").strip())
+    grounding_issue = False
+    for field in _BROKER_GROUNDING_FIELDS:
+        value = corrected.get(field)
+        if value in (None, "", [], {}):
+            continue
+        # The connected WhatsApp sender is transport provenance, not a claim
+        # inferred from the listing body. It is allowed to identify the
+        # broker even when the sender's display name is absent from the item
+        # slice; textual broker fields remain source-bound below.
+        if field == "broker_name" and transport_identity:
+            continue
+        value_tokens = _grounding_tokens(value)
+        if value_tokens and value_tokens.isdisjoint(source_tokens):
+            corrected[field] = None
+            flags.append(f"{field}_not_in_source_slice")
+            grounding_issue = True
+            # A transport-identified sender or source-backed broker phone is
+            # enough to keep the listing attributable. An unsupported name is
+            # removed, but must not discard an otherwise valid listing. The
+            # optional company/RERA fields are similarly quarantined without
+            # blocking persistence.
+            if field == "broker_name" and not transport_identity and not has_broker_phone:
+                blocked = True
+    if grounding_issue:
+        corrected["needs_review"] = True
+        # Quarantining an optional broker field must not erase confidence in
+        # otherwise source-grounded property facts. Only a blocked row gets a
+        # zero score; a sender phone or transport identity keeps attribution.
+        if blocked or (
+            corrected.get("extraction_confidence_score") is None
+            and corrected.get("confidence") is None
+        ):
+            corrected["extraction_confidence"] = "low"
+            corrected["extraction_confidence_score"] = 0.0
+            corrected["confidence"] = 0.0
+    if blocked:
+        corrected["needs_review"] = True
+        corrected["write_blocked"] = True
+        corrected["extraction_confidence"] = "low"
+        corrected["extraction_confidence_score"] = 0.0
+        corrected["confidence"] = 0.0
+    corrected["validation_flags"] = list(dict.fromkeys(flags))
+    return corrected
+
+
+def price_total_needs_quarantine(
+    transaction_type: object,
+    amount: object,
+    asset_type: object = None,
+    region: str | None = None,
+) -> bool:
+    """Reject non-property-scale totals at the typed persistence boundary.
+
+    This applies only to a total sale price or monthly rent; PSF rates can be
+    smaller and are validated separately.
+    """
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    tx = str(transaction_type or "").strip().casefold()
+    asset = str(asset_type or "").strip().casefold()
+    floors = get_region_config(region).get("price_floors", {})
+    if tx == "rent":
+        return value < float(floors.get("rent_min", 1_000))
+    if tx == "sale":
+        minimum = floors.get("commercial_sale_min" if asset == "commercial" else "sale_min", 100_000)
+        return value < float(minimum)
+    return False
+
+
+def _confidence_score(value: object) -> float | None:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if score != score:  # NaN
+        return None
+    return max(0.0, min(1.0, score))
+
+
+def canonicalize_extraction_confidence(item: dict, *, force_review: bool = False) -> dict:
+    """Make the numeric score the source of truth for confidence.
+
+    Older AI payloads can contain ``high`` alongside a zero score.  That is
+    contradictory and unsafe: downstream consumers must never promote such a
+    row based on the label alone.  A missing score is backfilled from the
+    label for compatibility, but an explicitly supplied zero remains zero.
+    """
+    corrected = dict(item or {})
+    nested_label = str(corrected.get("extraction_confidence") or "").strip().lower()
+    score_present = corrected.get("extraction_confidence_score") is not None
+    score = _confidence_score(corrected.get("extraction_confidence_score"))
+    if score is None and not score_present:
+        score = {
+            "high": 0.9,
+            "medium": 0.7,
+            "low": 0.4,
+        }.get(nested_label, _confidence_score(corrected.get("confidence")) or 0.0)
+    score = score if score is not None else 0.0
+    model_confidence = score
+    pipeline_review = bool(force_review or corrected.get("needs_review") is True)
+    review_reasons = list(dict.fromkeys(corrected.get("validation_flags") or []))
+    # Review is a publication-safety signal, not a claim that the model had
+    # low semantic confidence. Preserve both values so a 105B model's
+    # judgment remains auditable while the final score is conservatively
+    # discounted for downstream ranking/publication.
+    score = min(model_confidence, 0.6) if pipeline_review else model_confidence
+    label = "high" if score >= 0.85 else ("medium" if score >= 0.6 else "low")
+    corrected["model_confidence"] = model_confidence
+    corrected["pipeline_review"] = pipeline_review
+    corrected["pipeline_review_reasons"] = review_reasons
+    corrected["extraction_confidence_score"] = score
+    corrected["extraction_confidence"] = label
+    corrected["confidence"] = score
+    return corrected
+
+
+def extract_simple_psf_rate(source_text: object) -> dict | None:
+    """Extract one unambiguous labelled ``<number> psf`` quote.
+
+    This intentionally handles only a plain broker rate line.  If a source
+    contains multiple different PSF quotes, semantic selection belongs to the
+    extraction pipeline and this guard declines to guess.
+    """
+    matches = []
+    for match in _SIMPLE_PSF_RE.finditer(str(source_text or "")):
+        try:
+            amount = float(match.group("amount").replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        multiplier = (match.group("multiplier") or "").lower()
+        amount *= {"k": 1_000, "thousand": 1_000, "lakh": 100_000, "lac": 100_000}.get(multiplier, 1)
+        matches.append({"amount": amount, "raw_text": match.group(0).strip()})
+    if not matches:
+        return None
+    amounts = {entry["amount"] for entry in matches}
+    if len(amounts) != 1:
+        return None
+    return matches[0]
+
+
+def apply_price_sanity_guard(item: dict, source_text: object) -> dict:
+    """Use one unambiguous source PSF quote to repair an AI price mismatch."""
+    corrected = dict(item or {})
+    price = corrected.get("price")
+    if not isinstance(price, dict):
+        return canonicalize_extraction_confidence(corrected)
+    source_quote = extract_simple_psf_rate(source_text)
+    if source_quote is None:
+        return canonicalize_extraction_confidence(corrected)
+    try:
+        ai_amount = float(price.get("amount"))
+    except (TypeError, ValueError):
+        ai_amount = None
+    source_amount = source_quote["amount"]
+    mismatch = (
+        ai_amount is not None
+        and ai_amount > 0
+        and source_amount > 0
+        and max(ai_amount, source_amount) / min(ai_amount, source_amount) > 2
+    )
+    if mismatch:
+        corrected_price = dict(price)
+        corrected_price.update({
+            "amount": source_amount,
+            "unit": "per_sqft",
+            "raw_price_text": source_quote["raw_text"],
+        })
+        corrected["price"] = corrected_price
+        corrected["needs_review"] = True
+        corrected["validation_flags"] = list(dict.fromkeys(
+            list(corrected.get("validation_flags") or [])
+            + ["price_psf_ai_mismatch_review"]
+        ))
+    return canonicalize_extraction_confidence(corrected, force_review=mismatch)
+
+
+_PRICE_ONLY_RE = re.compile(
+    r"^\s*(?:₹|rs\.?|inr)?\s*\d+(?:[,.]\d+)?\s*"
+    r"(?:k|thousand|l|lac|lacs|lakh|lakhs|cr|crore|crores)\b"
+    r"(?:\s*(?:/\s*(?:month|monthy|mo)|per\s*month))?\s*"
+    r"(?:negotiable)?\s*$",
+    re.IGNORECASE,
+)
+_CONFIG_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*(?:bhk|rk)\s*$", re.IGNORECASE)
+_CONFIGURATION_LABEL_RE = re.compile(r"^\s*(?:config|configuration)(?:\s+type)?\s*$", re.IGNORECASE)
+_NUMBER_ONLY_RE = re.compile(r"^\s*[\d,.]+\s*(?:sq\.?\s*ft|sqft|sft)?\s*$", re.IGNORECASE)
+_PHONE_ONLY_RE = re.compile(r"^\s*(?:\+?91[-\s]?)?[6-9]\d{9}\s*$")
+_PHONE_IN_TEXT_RE = re.compile(r"(?<!\d)(?:\+?91[-\s]?)?[6-9]\d{9}(?!\d)")
+_LOCALITY_ONLY_RE = re.compile(
+    r"^\s*(?:near\s+)?(?:bandra|khar|santacruz|andheri|ndheri|juhu|powai|worli|"
+    r"lower\s+parel|pali\s+hill|peddar\s+road|mahim|malabar\s+hill|"
+    r"chembur|thane|mulund|goregaon|malad|vikhroli|ghatkopar|bkc|"
+    r"navi\s+mumbai|matunga|dadar|vile\s+parle)(?:\s+(?:east|west|"
+    r"naka|road|hill|east\s+west))?\s*$",
+    re.IGNORECASE,
+)
+_LOCALITY_RANGE_RE = re.compile(
+    r"^\s*(?P<left>[^,]{2,50}?)\s+to\s+(?P<right>[^,]{2,50}?)\s*$",
+    re.IGNORECASE,
+)
+
+_LOCALITY_ALIASES = {
+    "ndheri west": "Andheri West",
+    "ndheri east": "Andheri East",
+    # Keep the display spelling aligned with locality_reference.canonical_locality.
+    "bkc": "Bandra Kurla Complex",
+    "bandra kurla complex": "Bandra Kurla Complex",
+}
+
+
+def canonical_locality_alias(value: object) -> str:
+    """Return a conservative display locality for known source typos.
+
+    This is used for search/enrichment context only; the original WhatsApp
+    spelling remains in the stored evidence.
+    """
+    text = re.sub(r"\s+", " ", clean_source_line(value))
+    return _LOCALITY_ALIASES.get(text.casefold(), text)
+
+_NON_BUILDING_RE = re.compile(
+    r"\b(?:fully\s+furnished|semi[-\s]?furnished|unfurnished|bare\s+shell|"
+    r"\d+(?:\.\d+)?\s*(?:bhk|rk)|purchase|"
+    r"higher\s+floor|middle\s+floor|lower\s+floor|ground\s+floor|"
+    r"\d+(?:st|nd|rd|th)?\s+floor|car\s+parks?|parkings?|rent|sale|lease|"
+    r"balcon(?:y|ies)|terrace|cross\s+ventilation|pool\s+view|sea\s+view|"
+    r"\d+(?:\.\d+)?\s+(?:bathrooms?|washrooms?|toilets?)|"
+    r"price|budget|deposit|swimming\s+pool|negotiable|available|on\s+request|"
+    r"(?:direct\s+)?(?:outright\s+)?opportunit(?:y|ies)|direct\s+inventor(?:y|ies)|"
+    r"for\s+more\s+details|contact|call|inspection|photos?|options?|"
+    r"ownership|thanks?|regards?|pl(?:z|ease)|urgent|requirement|"
+    r"(?:only\s+)?(?:vegetarian|non[- ]?vegetarian|veg|non[- ]?veg)\s+client|"
+    r"(?:family|bachelor|corporate|company)\s+(?:client|tenant)|"
+    r"client\s+(?:business\s+)?profile|allow\s+\d+\s*hrs?|set\s+up\s+visits?|"
+    r"ideal\s+for|(?:with\s+)?(?:a\s+)?(?:backside|rear)\s+exit)\b",
+    re.IGNORECASE,
+)
+_INVALID_BUILDING_LABEL_RE = re.compile(
+    r"^\s*swimming\s+pool\b",
+    re.IGNORECASE,
+)
+_GENERIC_BUILDING_LABEL_RE = re.compile(
+    r"^(?:(?:[a-z][a-z .'/&-]{1,45})\s*[-–—]\s*)?"
+    r"(?:premium|confidential|unnamed|unknown|new)\s+"
+    r"(?:tower|building|project|society|property)$",
+    re.IGNORECASE,
+)
+_LOCATION_CONTEXT_BUILDING_RE = re.compile(
+    r"^\s*(?:in|near|off|at)\s+.+",
+    re.IGNORECASE,
+)
+_LOCATION_LABEL_BUILDING_RE = re.compile(
+    r"^\s*(?:location|loc\.?|address|area)\s*[:=-]",
+    re.IGNORECASE,
+)
+
+
+def clean_source_line(value: object) -> str:
+    """Remove WhatsApp decoration without changing the evidence text."""
+    return re.sub(r"[*_`~]", "", str(value or "")).strip(" \t-–—:•")
+
+
+def building_name_problem(value: object, *, locality: str | None = None) -> str | None:
+    """Return a stable validation code when ``value`` is not a building name."""
+    text = clean_source_line(value)
+    if not text:
+        return None
+    compact = re.sub(r"\s+", " ", text).strip()
+    lowered = compact.casefold()
+    # Brokers often space out section markers for emphasis ("R E N T" or
+    # "S A L E"). They are transaction labels, never building identities.
+    if re.fullmatch(r"(?:r\s*e\s*n\s*t|s\s*a\s*l\s*e|l\s*&\s*l)", compact, re.IGNORECASE):
+        return "building_name_is_listing_text"
+    locality_range = _LOCALITY_RANGE_RE.fullmatch(compact)
+    if locality_range and _LOCALITY_ONLY_RE.fullmatch(locality_range.group("left").strip()) and _LOCALITY_ONLY_RE.fullmatch(locality_range.group("right").strip()):
+        return "building_name_is_locality_range"
+    # Broker preference labels such as "Bandra Preferred" and corridor tags
+    # such as "Bandra / Khar Preferred" are locality metadata, not buildings.
+    locality_tag = re.sub(r"\s+(?:preferred|options?|localities?)$", "", compact, flags=re.IGNORECASE).strip()
+    locality_parts = re.split(r"\s*(?:/|\bto\b|[-–—])\s*", locality_tag, flags=re.IGNORECASE)
+    if len(locality_parts) > 1 and all(_LOCALITY_ONLY_RE.fullmatch(part.strip()) for part in locality_parts):
+        return "building_name_is_locality_range"
+    if locality_tag != compact and _LOCALITY_ONLY_RE.fullmatch(locality_tag):
+        return "building_name_is_locality"
+    if _PRICE_ONLY_RE.fullmatch(compact):
+        return "building_name_is_price"
+    if _CONFIG_ONLY_RE.fullmatch(compact):
+        return "building_name_is_configuration"
+    if _CONFIGURATION_LABEL_RE.fullmatch(compact):
+        return "building_name_is_configuration"
+    if lowered == "villa":
+        return "building_name_is_listing_text"
+    if _NUMBER_ONLY_RE.fullmatch(compact):
+        return "building_name_is_number"
+    if _PHONE_ONLY_RE.fullmatch(compact):
+        return "building_name_is_phone"
+    embedded_phone = _PHONE_IN_TEXT_RE.search(compact)
+    if embedded_phone:
+        # Remove the contact before re-validating the remainder so punctuation
+        # and whitespace do not hide the fact that this is broker/contact text.
+        remainder = clean_source_line(_PHONE_IN_TEXT_RE.sub(" ", compact))
+        if len(remainder) < 3:
+            return "building_name_contains_phone"
+        if remainder != compact and building_name_problem(remainder, locality=locality):
+            return "building_name_contains_phone"
+        # A text-like remainder ("Sailee", "Office", etc.) is still not
+        # evidence of a physical building. Quarantine the original value and
+        # let source-slice repair look for a real building name.
+        return "building_name_contains_phone"
+    if locality and lowered == clean_source_line(locality).casefold():
+        return "building_name_is_locality"
+    if _LOCALITY_ONLY_RE.fullmatch(compact):
+        return "building_name_is_locality"
+    # Contextual phrases such as "In By Lane's of Bandra" describe where a
+    # property is, not the name of a society/tower/building. Keep this as a
+    # validation guard so the model can still extract the phrase as location
+    # context without promoting it to building identity.
+    if _LOCATION_CONTEXT_BUILDING_RE.fullmatch(compact):
+        return "building_name_is_location_context"
+    if _LOCATION_LABEL_BUILDING_RE.search(compact):
+        return "building_name_is_location_context"
+    if _INVALID_BUILDING_LABEL_RE.search(compact):
+        return "building_name_is_listing_text"
+    if _NON_BUILDING_RE.search(compact):
+        return "building_name_is_listing_text"
+    if _GENERIC_BUILDING_LABEL_RE.fullmatch(compact):
+        return "building_name_is_generic_descriptor"
+    if len(compact) < 3 or len(compact) > 100:
+        return "building_name_bad_length"
+    return None
+
+
+def _candidate_lines(source_text: str) -> list[str]:
+    return [clean_source_line(line) for line in str(source_text or "").splitlines()]
+
+
+def _meaningful_tokens(value: object) -> set[str]:
+    stop = {
+        "the", "and", "at", "in", "for", "near", "road", "west", "east",
+        "tower", "building", "heights", "residency", "residential",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        if len(token) >= 3 and token not in stop
+    }
+
+
+def infer_building_from_slice(
+    source_text: str,
+    *,
+    locality: str | None = None,
+    bhk: object = None,
+) -> str | None:
+    """Find a conservative building line in the current listing slice.
+
+    This is intentionally allowed to return ``None``.  It must never promote a
+    price, floor, furnishing, locality, broker footer, or configuration into a
+    building merely to fill a blank field.
+    """
+    lines = _candidate_lines(source_text)
+    bhk_re = re.compile(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk)\b", re.IGNORECASE)
+    start = 0
+    for index, line in enumerate(lines):
+        if bhk_re.search(line) or (bhk is not None and str(bhk).strip() and str(bhk).casefold() in line.casefold()):
+            start = index + 1
+            break
+    locality_value = clean_source_line(locality).casefold() if locality else None
+    for line in lines[start:start + 6]:
+        if not line or len(line) > 90:
+            continue
+        if locality_value and line.casefold() == locality_value:
+            continue
+        if building_name_problem(line, locality=locality):
+            continue
+        if re.search(r"\b(?:sq\.?\s*ft|sqft|carpet|area|rent|sale|lease|deposit|floor|"
+                     r"parking|possession|inspection|details|contact|call)\b", line, re.IGNORECASE):
+            continue
+        if not re.search(r"[A-Za-z]", line):
+            continue
+        return line.strip(" .,;:")
+    return None
+
+
+def repair_building_assignment(
+    item: dict,
+    source_text: str,
+    *,
+    ai_item: dict | None = None,
+) -> dict:
+    """Repair or quarantine a building value against its own source slice."""
+    locality = item.get("micro_market") or item.get("location_raw")
+    current = (
+        item.get("building_name")
+        or item.get("building_name_raw_candidate")
+        or (ai_item or {}).get("building_name_raw_candidate")
+    )
+    problem = building_name_problem(current, locality=locality)
+    if not problem and current:
+        # A valid-looking name copied from a sibling block is still unsafe.
+        # Require at least one meaningful token in this item's source slice;
+        # aliases can then be resolved downstream without allowing a totally
+        # unrelated building to leak across blocks.
+        if _meaningful_tokens(current).isdisjoint(_meaningful_tokens(source_text)):
+            problem = "building_name_not_in_source_slice"
+    if not problem:
+        return item
+
+    replacement = infer_building_from_slice(
+        source_text,
+        locality=locality,
+        bhk=item.get("bhk"),
+    )
+    item["building_name"] = replacement
+    flags = list(item.get("validation_flags") or [])
+    flags.append(problem)
+    flags.append("building_name_source_repaired" if replacement else "building_name_unresolved")
+    item["validation_flags"] = list(dict.fromkeys(flags))
+    item["needs_review"] = True
+
+    if isinstance(ai_item, dict):
+        ai_item["building_name"] = replacement
+        ai_flags = list(ai_item.get("validation_flags") or [])
+        ai_item["validation_flags"] = list(dict.fromkeys(ai_flags + flags))
+        ai_item["needs_review"] = True
+    return item

@@ -1,0 +1,64 @@
+# Install the CLI in a Node stage rather than asking apt to install the very
+# large Debian nodejs/npm package graph alongside Chromium. Coolify builders
+# can otherwise kill the combined dpkg/font-cache peak before the API image is
+# assembled.
+FROM node:22-bookworm-slim AS agent-browser
+
+RUN npm install --global agent-browser
+
+# Pin the OS line. The floating `python:3.11-slim` tag moved to Debian 13,
+# whose Chromium dependency graph is substantially heavier and caused fresh
+# Coolify builds to be killed while regenerating the font cache. Debian 12
+# remains the known-good image line for this service.
+FROM python:3.11-slim-bookworm AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage" \
+    AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+
+WORKDIR /app
+
+# Reuse the Node runtime and globally installed CLI without adding Debian's
+# nodejs/npm packages (and their extra apt dependency graph) to this image.
+COPY --from=agent-browser /usr/local /usr/local
+
+# Agent Browser is configured to launch Debian's /usr/bin/chromium. Do not run
+# `agent-browser install`: that downloads a second private Chrome bundle into
+# every API and worker image without changing the configured runtime browser.
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates chromium \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Keep source-revision mistakes from becoming opaque runtime import errors.
+# `building_quality.py` is imported by storage/supabase.py and must be part of
+# the API build context (it was missing from an earlier Coolify build).
+RUN test -f /app/building_quality.py \
+    || (echo "BUILD FAILED: building_quality.py is missing from the API source revision" && exit 1)
+
+# Smoke-test: compile only API Python files so syntax errors crash the build,
+# not the production container.
+RUN python3 -m compileall -q routers/ storage/ agents/ knowledge/ \
+    && python3 -m py_compile app.py \
+    && python3 -m py_compile extraction.py \
+    && python3 -m py_compile building_enrichment_worker.py \
+    && python3 -m py_compile semantic_embeddings.py \
+    && python3 -m py_compile semantic_embedding_worker.py \
+    && python3 -m py_compile matching/requirement_listing_matcher.py matching/service.py matching/worker.py \
+    && python3 -m py_compile ai_extraction.py \
+    && python3 -m py_compile location.py \
+    && python3 -m py_compile llm.py \
+    && python3 -c "from routers import ai_chat, infra, search, workspace; print('router imports OK')" \
+    || (echo "BUILD FAILED: syntax or import error" && exit 1)
+
+RUN mkdir -p /data
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--timeout-keep-alive", "5"]

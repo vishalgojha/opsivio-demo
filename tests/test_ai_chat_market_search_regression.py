@@ -1,0 +1,191 @@
+import asyncio
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def test_inventory_query_uses_grounded_database_search_before_llm(monkeypatch):
+    import routers.ai_chat as ai_chat
+    import agent_tools
+
+    calls = []
+    monkeypatch.setattr(ai_chat, "storage", SimpleNamespace(db=None, client=object()))
+    
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(ai_chat, "_resolve_active_organization_id", lambda user, tenant_id: tenant_id)
+    monkeypatch.setattr(ai_chat, "_workspace_provider_candidates", lambda tenant_id, model: [{"api_key": "k", "model": "m", "base_url": "https://example.invalid/v1"}])
+    monkeypatch.setattr(ai_chat.asyncio, "to_thread", _to_thread)
+    monkeypatch.setattr(ai_chat, "_wrap_chat_response", lambda response, is_inbox=False: response)
+    monkeypatch.setattr(ai_chat.chat_engine, "load_data", lambda: {"overview": {"total_listings": 1}, "unique_listings": {"items": []}, "buildings": {}, "brokers": {}})
+    monkeypatch.setattr(ai_chat.chat_engine, "load_live_data", lambda db: {})
+    monkeypatch.setattr(
+        ai_chat.chat_engine,
+        "parse_market_search_request",
+        lambda *args, **kwargs: {"intent": "RENT", "bhk": 3, "micro_markets": ["Borivali West"]},
+    )
+    monkeypatch.setattr(ai_chat, "_run_with_provider_failover", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM fallback should not run")))
+    monkeypatch.setattr(
+        agent_tools,
+        "execute_tool",
+        lambda tool_name, tool_args, client, tenant_id, **kwargs: calls.append(
+            (tool_name, tool_args, tenant_id)
+        ) or {
+            "status": "ok",
+            "results": [{
+                "listing_id": 1,
+                "building_name": "Orbit Heights",
+                "micro_market": "Borivali West",
+                "bhk": "3",
+                "price": 95000,
+                "carpet_area_sqft": 1200,
+                "broker_name": "Ravi",
+            }],
+        },
+    )
+
+    req = SimpleNamespace(
+        session_id=None,
+        source="groups",
+        broker_phone="",
+        model="",
+        api_key="",
+        messages=[{"role": "user", "content": "any 3 bhk for rent in Borivali West"}],
+    )
+
+    response = asyncio.run(ai_chat.ai_chat(req, user={"id": "u1"}, tenant_id="org-1"))
+
+    assert calls, "search_listings was not called"
+    assert calls[0][0] == "search_listings"
+    assert calls[0][1]["bhk"] == 3
+    assert calls[0][1]["listing_type"] == "rent"
+    assert calls[0][1]["locality"] == "Borivali West"
+    assert calls[0][2] == "org-1"
+    assert response["source_mode"] == "parsed"
+    assert ai_chat._is_analytics_or_ops_query("how many listings in Bandra West") is True
+    assert ai_chat._is_analytics_or_ops_query("any 3 bhk for rent in Borivali West") is False
+    assert response["trace"]["route"] == "deterministic_live_listing_search"
+    assert response["content"].startswith("Found 1 active match")
+    assert "WhatsApp group" not in response["content"]
+
+
+def test_conceptual_sale_rent_question_is_conversational():
+    import routers.ai_chat as ai_chat
+
+    assert ai_chat._is_conversational_explanation(
+        "Do you know the difference between sale and rent?"
+    ) is True
+    assert ai_chat._is_conversational_explanation(
+        "show me 3 bhk for rent in Bandra West"
+    ) is False
+
+
+def test_building_only_question_is_a_live_search():
+    from ai_chat_engine import parse_market_search_request
+
+    parsed = parse_market_search_request("where is Kalpatru Magnus?", allow_llm=False)
+
+    assert parsed["building_name"] == "Kalpatru Magnus"
+    assert "bhk" not in parsed
+    assert "micro_markets" not in parsed
+
+
+def test_looking_for_sale_property_searches_listings_not_requirements():
+    from ai_chat_engine import parse_market_search_request
+
+    parsed = parse_market_search_request(
+        "looking for a 3 bhk for sale in Bandra West budget upto 5 cr",
+        allow_llm=False,
+    )
+
+    assert parsed["intent"] == "SELL"
+    assert parsed.get("search_scope") != "requirements"
+    assert parsed["bhk"] == "3"
+    assert parsed["micro_markets"] == ["Bandra West"]
+
+
+def test_inventory_availability_is_search_followup():
+    import routers.ai_chat as ai_chat
+
+    assert ai_chat._is_search_followup("what inventory is available?") is True
+    assert ai_chat._is_search_followup("more") is True
+    assert ai_chat._is_search_followup("what is the difference between sale and rent?") is False
+
+
+def test_listing_search_queries_each_requested_locality(monkeypatch):
+    import routers.ai_chat as ai_chat
+    import agent_tools
+
+    calls = []
+    monkeypatch.setattr(ai_chat, "storage", SimpleNamespace(client=object()))
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(ai_chat.asyncio, "to_thread", _to_thread)
+
+    def execute(tool_name, tool_args, client, tenant_id, **kwargs):
+        calls.append(tool_args["locality"])
+        return {
+            "status": "ok",
+            "results": [{
+                "listing_id": 100 + len(calls),
+                "building_name": f"Building {len(calls)}",
+                "micro_market": tool_args["locality"],
+                "bhk": "3",
+                "price": 95000,
+                "carpet_area_sqft": 1200,
+                "broker_name": "Ravi",
+            }],
+        }
+
+    monkeypatch.setattr(agent_tools, "execute_tool", execute)
+    query = {"intent": "RENT", "bhk": "3", "micro_markets": ["Bandra East", "BKC"]}
+    response = asyncio.run(ai_chat._current_listing_search(query, "org-1", "u1"))
+
+    assert calls == ["Bandra East", "BKC"]
+    assert response["trace"]["route"] == "deterministic_market_search"
+    assert response["content"].startswith("Found 2 active matches")
+
+
+def test_requirement_search_uses_tenant_scoped_demand_tool(monkeypatch):
+    import routers.ai_chat as ai_chat
+    import agent_tools
+
+    calls = []
+    monkeypatch.setattr(ai_chat, "storage", SimpleNamespace(client=object()))
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(ai_chat.asyncio, "to_thread", _to_thread)
+
+    def execute(tool_name, tool_args, client, tenant_id, **kwargs):
+        calls.append((tool_name, tool_args, tenant_id))
+        return {
+            "status": "ok",
+            "matched": 1,
+            "has_more": False,
+            "results": [{"requirement_id": 8, "broker_name": "A Broker", "micro_market": "Bandra East"}],
+        }
+
+    monkeypatch.setattr(agent_tools, "execute_tool", execute)
+    response = asyncio.run(ai_chat._current_requirement_search(
+        {"intent": "RENT", "bhk": 2, "micro_markets": ["Bandra East"]},
+        "org-1",
+        "u1",
+    ))
+
+    assert calls[0][0] == "search_requirements"
+    assert calls[0][1]["listing_type"] == "rent"
+    assert calls[0][1]["bhk"] == 2
+    assert calls[0][1]["localities"] == ["Bandra East"]
+    assert calls[0][2] == "org-1"
+    assert response["trace"]["route"] == "deterministic_live_requirement_search"
+    assert response["blocks"][0]["items"][0]["broker_name"] == "A Broker"

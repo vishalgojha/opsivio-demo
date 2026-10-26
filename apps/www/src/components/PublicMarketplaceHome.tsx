@@ -1,0 +1,124 @@
+import Link from "next/link";
+import { ArrowRight, ArrowUpRight, Check, ChevronDown, Clock3, MapPin, MessageSquare, Search, Send, ShieldCheck, type LucideIcon } from "lucide-react";
+import HomeSearch from "@/components/HomeSearch";
+import LatestListingsGrid from "@/components/LatestListingsGrid";
+import LiveListingTicker from "@/components/LiveListingTicker";
+import SiteFooter from "@/components/SiteFooter";
+import SiteHeader from "@/components/SiteHeader";
+import { NoPhotosFaqJsonLd } from "@/components/NoPhotosFaq";
+import { ShortlistProvider } from "@/components/ShortlistProvider";
+import ShortlistBar from "@/components/ShortlistBar";
+import CountUp from "@/components/CountUp";
+import RefreshMarketSnapshot from "@/components/RefreshMarketSnapshot";
+import { Card, CardContent } from "@/components/ui/card";
+import type { PublicDataOverview } from "@/lib/public-data";
+import type { BuildingSummary } from "@/lib/localities";
+import { cleanPublicText, cleanStoredListingTitle, toListingCardViewModel } from "@/lib/listing-card";
+
+function text(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
+
+const processSteps: Array<{ number: string; Icon: LucideIcon; title: string; body: string }> = [
+  { number: "01", Icon: Search, title: "Browse live listings", body: "Explore homes and commercial spaces from active broker conversations, not stale portal uploads." },
+  { number: "02", Icon: ShieldCheck, title: "Send an enquiry", body: "Share your brief in one tap. Your enquiry lands with the broker who shared the listing." },
+  { number: "03", Icon: MessageSquare, title: "Continue on WhatsApp", body: "Ask for current photos, OC details, carpet area, Jodi options, or the next viewing directly." },
+];
+
+export default function PublicMarketplaceHome({ overview, heroImageUrl, buildings }: { overview: PublicDataOverview; heroImageUrl: string | null; buildings: BuildingSummary[] }) {
+  // Keep enough server-fetched rows for the public grid's incremental loader;
+  // the pulse still narrows this same snapshot to three rows below.
+  const listings = overview.recentListings.slice(0, 60);
+  const pulseListings = listings.filter((row, index, all) => {
+    const identity = `${text(row.building_name) || text(row.summary_title) || row.id}|${text(row.property_type)}|${text(row.intent)}`.toLowerCase();
+    return all.findIndex((candidate) => `${text(candidate.building_name) || text(candidate.summary_title) || candidate.id}|${text(candidate.property_type)}|${text(candidate.intent)}`.toLowerCase() === identity) === index;
+  }).slice(0, 3);
+  const firstLocality = text(overview.topLocalities[0]?.locality);
+  const suggestions = [
+    firstLocality ? `Residential property in ${firstLocality}` : "Residential property near me",
+    "Office space for sale",
+    "Fully furnished rental",
+  ];
+  const stats = [
+    [overview.counts.activeListings, "Fresh listings", "seen in the last 7 days"],
+    [overview.counts.localities, "Localities covered", "distinct live markets"],
+    [overview.counts.brokers, "Broker network", "distinct brokers with listings"],
+    [overview.counts.listings, "Listings tracked", "source-grounded inventory"],
+  ] as const;
+
+  return <div className="www-shell min-h-screen">
+    <SiteHeader />
+    <NoPhotosFaqJsonLd />
+    <main id="main-content">
+      <ShortlistProvider>
+        <section className="mp-hero" id="search">
+          <div className="mp-container mp-hero-grid">
+            <div className="mp-hero-copy">
+              <p className="mp-eyebrow"><span /> Live listings from local broker networks</p>
+              <div className="mp-heading-row"><h1>Find the right <em>property</em> before it disappears.</h1><Link href="/localities" className="mp-market-picker" aria-label="Browse connected markets"><span>Connected city</span><strong>Mumbai</strong><ChevronDown aria-hidden="true" /></Link></div>
+              <p className="mp-hero-support">Search the conversations where homes and commercial spaces move first. See what is fresh, then go straight to the broker who shared it.</p>
+              <div className="mp-search-wrap"><HomeSearch localities={overview.topLocalities} buildings={buildings} /></div>
+              <p className="mp-search-note">Try a locality, building, broker, residential or commercial space, budget, or a full request.</p>
+              <div className="mp-suggestions" aria-label="Suggested searches">{suggestions.map((suggestion) => <Link key={suggestion} href={`/search?q=${encodeURIComponent(suggestion)}`}>{suggestion}<ArrowRight aria-hidden="true" /></Link>)}</div>
+            </div>
+            <Card className="mp-pulse">
+              <CardContent>
+                <div className={heroImageUrl ? "mp-pulse-visual has-source-photo" : "mp-pulse-visual"}>{heroImageUrl && <img src={heroImageUrl} alt="Current property from the live broker network" />}<div className="mp-pulse-orbit mp-pulse-orbit-one" /><div className="mp-pulse-orbit mp-pulse-orbit-two" /><div className="mp-pulse-bars"><i /><i /><i /><i /><i /></div><span>NETWORK PULSE</span></div>
+                <div className="mp-pulse-head"><div><p className="mp-label">Live network</p><h2>Fresh from brokers near you</h2></div><span className="mp-live"><span /> Live</span></div>
+                <div className="mp-rule" />
+                {pulseListings.map((row) => {
+                  const card = toListingCardViewModel({
+                    id: row.id,
+                    title: row.summary_title ?? null,
+                    bhk: row.bhk,
+                    price: row.price,
+                    price_unit: row.price_unit,
+                    price_raw_text: row.price_raw_text ?? null,
+                    price_model: null,
+                    price_per_sqft: null,
+                    area_sqft: row.area_sqft ?? null,
+                    furnishing: row.furnishing,
+                    intent: row.intent ?? null,
+                    asset_type: null,
+                    property_type: row.property_type ?? null,
+                    micro_market: row.micro_market,
+                    locality_raw: null,
+                    locality_resolved: null,
+                    building_name: row.building_name,
+                    landmark_name: row.landmark_name,
+                    location_label: row.location_label,
+                    floor_description: row.floor_description ?? null,
+                    view: null,
+                    broker_name: row.broker_name,
+                    broker_phone: row.broker_phone ?? null,
+                    last_seen: row.last_seen,
+                    first_seen: row.first_seen ?? null,
+                    times_seen: null,
+                  }, false);
+                  const href = card.href || `/listings/listing/${row.id}`;
+                  const cleanTitle = cleanStoredListingTitle(row.summary_title) || cleanPublicText(row.building_name) || "Fresh property";
+                  const title = cleanTitle.replace(/\b\d+(?:\.\d+)?\s*BHK\b\s*/gi, "Residential property ").replace(/\s{2,}/g, " ").trim();
+                  return <Link key={row.id} href={href} className="mp-pulse-row"><span>{text(row.micro_market) || "Live market"}</span><strong>{title}</strong><ArrowRight aria-hidden="true" /></Link>;
+                })}
+                {!listings.length && <p className="mp-empty">Live inventory will appear as broker conversations are indexed.</p>}
+                <Link href="/market/listings" className="mp-text-link">Explore live inventory <ArrowRight aria-hidden="true" /></Link>
+              </CardContent>
+            </Card>
+          </div>
+          <div className="mp-hero-footnote"><span className="mp-footnote-dot" /> Fresh briefs are added from active broker conversations throughout the day.</div>
+        </section>
+
+        <section className="mp-stats" aria-label="Live market snapshot"><div className="mp-container"><div className="flex items-center justify-between gap-4"><p className="mp-label">Market snapshot</p><RefreshMarketSnapshot /></div>{overview.countsAvailable ? <div className="mp-stat-grid">{stats.map(([value, label, note]) => <Card key={label}><CardContent><strong><CountUp end={value} duration={1400} locale="en-IN" /></strong><span>{label}</span><small>{note}</small></CardContent></Card>)}</div> : <Card className="mp-data-state"><CardContent><strong>Live market data is temporarily unavailable.</strong><span>Listings and counts will appear here when the source connection responds.</span><Link href="/search">Browse the live search <ArrowRight aria-hidden="true" /></Link></CardContent></Card>}</div></section>
+
+        <section className="mp-section" id="listings"><div className="mp-container"><div className="mp-section-head"><div><p className="mp-label">Fresh inventory</p><h2>Fresh from brokers near you</h2><p>Live residential and commercial listings sourced from active broker conversations.</p><small className="mt-2 block text-xs text-[var(--text-secondary)]">The grid starts with the freshest 60 records; use Load more or search for a broader market view.</small></div><Link href="/market/listings" className="mp-text-link">View all listings <ArrowRight aria-hidden="true" /></Link></div><LiveListingTicker />{listings.length > 0 ? <LatestListingsGrid initialListings={listings.map(({ broker_phone: _phone, source_text: _source, ...row }) => row)} /> : <Card className="mp-empty-card"><CardContent>No live listings are available in this market view yet.</CardContent></Card>}</div></section>
+
+        {overview.topLocalities.length > 0 && <section className="mp-section mp-localities" id="localities"><div className="mp-container"><div className="mp-section-head"><div><p className="mp-label">Places worth knowing</p><h2>Browse by locality</h2><p>Start with a neighbourhood, then narrow by budget, asset type, and the details that matter.</p></div><Link href="/localities" className="mp-text-link">All localities <ArrowRight aria-hidden="true" /></Link></div><div className="mp-locality-layout"><Card className={heroImageUrl ? "mp-locality-feature has-source-photo" : "mp-locality-feature"}>{heroImageUrl && <img src={heroImageUrl} alt="A current property from the live market" />}<CardContent><p className="mp-label">Live market guide</p><h3>Good properties are local.</h3><p>Follow the streets you already know, or let the broker network show you a nearby pocket worth a look.</p><Link href={`/localities/${overview.topLocalities[0].slug}`} className="mp-text-link">Explore {overview.topLocalities[0].locality} <ArrowUpRight aria-hidden="true" /></Link></CardContent></Card><div className="mp-locality-grid">{overview.topLocalities.slice(0, 8).map((loc) => <Link key={loc.slug} href={`/localities/${loc.slug}`}><div><h3>{loc.locality}</h3><p><MapPin aria-hidden="true" /> {loc.listingCount} live listings</p></div><ArrowRight aria-hidden="true" /></Link>)}</div></div></div></section>}
+
+        <section className="mp-section mp-process" id="how-it-works"><div className="mp-container"><div className="mp-section-head"><div><p className="mp-label">A shorter route to the right person</p><h2>How it works</h2><p>No account to create, no portal maze to navigate.</p></div></div><div className="mp-process-grid">{processSteps.map(({ number, Icon, title, body }) => <Card key={number}><CardContent><b>{number}</b><Icon aria-hidden="true" /><h3>{title}</h3><p>{body}</p></CardContent></Card>)}</div></div></section>
+
+        <section className="mp-trust"><div className="mp-container mp-trust-grid"><div><p className="mp-label">Why Opsivio?</p><h2>Real inventory needs a real trail.</h2><p>Property search gets better when you can see where the listing came from, how fresh it is, and who to speak to next.</p><Link href="/about" className="mp-text-link">Read how Opsivio works <ArrowRight aria-hidden="true" /></Link></div><div className="mp-trust-list"><div><MessageSquare aria-hidden="true" /><span><b>Real broker conversations</b><small>Inventory comes from local WhatsApp broker networks, not anonymous uploads.</small></span></div><div><Clock3 aria-hidden="true" /><span><b>Freshness tracking</b><small>Listings update regularly and stale inventory is hidden after 30 days.</small></span></div><div><ShieldCheck aria-hidden="true" /><span><b>Direct WhatsApp connection</b><small>Move from a useful property brief to a verified broker without the lead-form detour.</small></span></div><div><Check aria-hidden="true" /><span><b>No fake inventory</b><small>No stock photography, invented availability, or fake reviews to create false confidence.</small></span></div></div></div></section>
+        <section className="mp-final-cta"><div className="mp-container mp-final-card"><div><p className="mp-label">Your next move</p><h2>Looking for something specific?</h2><p>Tell us the city, locality, budget, property type, or the small detail that makes a place feel right.</p></div><div className="mp-final-actions"><Link href="#search" className="mp-primary-cta">Search again <ArrowUpRight aria-hidden="true" /></Link><Link href="/contact" className="mp-secondary-cta public-whatsapp-action"><Send aria-hidden="true" /> Send a WhatsApp enquiry</Link></div></div></section>
+        <ShortlistBar />
+      </ShortlistProvider>
+    </main>
+    <SiteFooter />
+  </div>;
+}

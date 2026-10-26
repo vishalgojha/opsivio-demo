@@ -1,0 +1,402 @@
+import { getServerSupabase } from "./supabase";
+import { getAllBuildings, getAllLocalities, type BuildingSummary, type LocalitySummary } from "./localities";
+import { dedupeRecentListings, normalizeBhkFromEvidence } from "./listing-card";
+import { isPublicListingEligible } from "./public-eligibility";
+
+export type PublicCountKey =
+  | "localities"
+  | "buildings"
+  | "listings"
+  | "activeListings"
+  | "brokers"
+  | "raw_messages"
+  | "messagesAnalysed";
+
+export type PublicListingSummary = {
+  id: number;
+  card_type?: string | null;
+  bhk: string | null;
+  price: number | null;
+  price_unit: string | null;
+  furnishing: string | null;
+  location_label: string | null;
+  building_name: string | null;
+  summary_title?: string | null;
+  landmark_name: string | null;
+  micro_market: string | null;
+  broker_name: string | null;
+  broker_phone?: string | null;
+  intent?: string | null;
+  area_sqft?: number | null;
+  floor_description?: string | null;
+  property_type?: string | null;
+  observation_count: number | null;
+  last_seen: string | null;
+  first_seen?: string | null;
+  bathroom_count?: number | null;
+  car_parking_count?: number | null;
+  parking_type?: string | null;
+  has_lift?: boolean | null;
+  has_power_backup?: boolean | null;
+  deal_tags?: string[] | null;
+  price_raw_text?: string | null;
+  source_text?: string | null;
+  source_notes?: string | null;
+  photo_count?: number;
+  photo_url?: string | null;
+  opportunity_key?: string | null;
+  developer?: string | null;
+  orientation?: string | null;
+  view?: string | null;
+  price_qualifier?: string | null;
+  transaction_nature?: string | null;
+};
+
+export type PublicListingPhoto = {
+  id: number;
+  url: string;
+  caption: string | null;
+};
+
+export async function getPublicListingPhotos(listingId: number): Promise<PublicListingPhoto[]> {
+  const db = getServerSupabase();
+  if (!db || !Number.isFinite(listingId)) return [];
+  const { data, error } = await db
+    .from("listing_photos")
+    .select("id, storage_path, mime_type, caption")
+    .eq("listing_id", listingId)
+    .order("created_at", { ascending: false })
+    .limit(20);
+  if (error) {
+    console.error("public listing photos query error:", error.message);
+    return [];
+  }
+  const photos: PublicListingPhoto[] = [];
+  for (const row of data ?? []) {
+    const path = String(row.storage_path || "").trim();
+    if (!path) continue;
+    const signed = await db.storage.from("whatsapp-media").createSignedUrl(path, 3600);
+    if (signed.error || !signed.data?.signedUrl) continue;
+    photos.push({ id: Number(row.id), url: signed.data.signedUrl, caption: row.caption || null });
+  }
+  return photos;
+}
+
+function priceFromRawText(value: unknown): number | null {
+  const match = String(value ?? "").match(/(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)\s*(cr(?:ore)?|lakh|lac|l|k|thousand)?\b/i);
+  if (!match) return null;
+  const amount = Number(match[1].replace(/,/g, ""));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = (match[2] || "").toLowerCase();
+  const multiplier = unit.startsWith("cr") ? 1_00_00_000
+    : unit === "l" || unit.startsWith("lac") || unit === "lakh" ? 1_00_000
+      : unit === "k" || unit.startsWith("thousand") ? 1_000 : 1;
+  return amount * multiplier;
+}
+
+export type PublicBrokerSummary = {
+  display_name: string;
+  listing_count: number | null;
+  market_count: number | null;
+};
+
+export type PublicDataOverview = {
+  counts: Record<PublicCountKey, number>;
+  /** False when the live count query could not be read. */
+  countsAvailable: boolean;
+  activity: PublicActivityPoint[];
+  topLocalities: LocalitySummary[];
+  topBuildings: BuildingSummary[];
+  recentListings: PublicListingSummary[];
+};
+
+export type PublicActivityPoint = {
+  date: string;
+  messages: number;
+  parsedRecords: number;
+  listings: number;
+};
+
+function priceLabel(
+  value: number | null,
+  unit: string | null,
+  intent: string | null = null,
+  rawText: string | null = null,
+): string {
+  if (value == null || value <= 0) return "Price on request";
+  const isRent = /^(rent|rental|lease)$/i.test(String(intent || ""));
+  const redundantLakh = rawText?.match(/(?<!\d)(\d{1,3}(?:,\d{2,3})+)\s*(?:lakh|lac)s?\b/i);
+  if (redundantLakh) {
+    const groupedAmount = Number(redundantLakh[1].replace(/,/g, ""));
+    if (Number.isFinite(groupedAmount) && groupedAmount >= 100_000 && value > groupedAmount * 1000) {
+      const lakh = groupedAmount / 100_000;
+      return `₹${lakh % 1 === 0 ? lakh : lakh.toFixed(2)} Lakh${isRent ? "/month" : ""}`;
+    }
+  }
+  // Tiny absolute values are parser/database corruption, not Mumbai market
+  // prices. Never expose them as believable public inventory numbers.
+  if (isRent ? value < 1_000 : value < 1_00_000) return "Price on request";
+  if (rawText && isRent) {
+    const match = rawText.match(/(?:rent|lease|monthly|price|asking)\s*[:=-]?[^\d₹]{0,20}(?:₹|rs\.?|inr\s*)?\s*(\d[\d,]*(?:\.\d+)?)\s*(cr|crore|lakh|lac|l|k|thousand)?/i);
+    if (match) {
+      const amount = Number(match[1].replace(/,/g, ""));
+      const rawUnit = (match[2] || "").toLowerCase();
+      const absolute = rawUnit === "cr" || rawUnit === "crore"
+        ? amount * 1_00_00_000
+        : rawUnit === "lakh" || rawUnit === "lac" || rawUnit === "l"
+          ? amount * 1_00_000
+          : rawUnit === "k" && match[1].includes(".") && amount < 5
+            ? amount * 1_00_000
+            : rawUnit === "k" || rawUnit === "thousand" ? amount * 1_000 : amount;
+      if (Number.isFinite(absolute) && absolute >= 1_000) {
+        const lakh = absolute / 1_00_000;
+        return absolute >= 1_00_00_000
+          ? `₹${(absolute / 1_00_00_000).toFixed(2)} Cr`
+          : absolute >= 1_00_000
+            ? `₹${lakh % 1 === 0 ? lakh : lakh.toFixed(2)} Lakh`
+            : `₹${Math.round(absolute).toLocaleString("en-IN")}`;
+      }
+    }
+  }
+  // The public listings view normalizes prices to absolute rupees and uses
+  // `price_unit = abs`. Older rows may retain `cr`/`lac`, but the numeric value
+  // is still absolute. Format the amount by scale so the homepage never leaks
+  // grouped rupee values such as ₹4,30,000 instead of ₹4.30 Lakh.
+  if (value >= 1_00_00_000) {
+    const cr = value / 1_00_00_000;
+    return `₹${cr % 1 === 0 ? cr : cr.toFixed(2)} Cr`;
+  }
+  if (value >= 1_00_000) {
+    const lakh = value / 1_00_000;
+    return `₹${lakh % 1 === 0 ? lakh : lakh.toFixed(2)} Lakh`;
+  }
+  return `₹${Math.round(value).toLocaleString("en-IN")}`;
+}
+
+export function formatPublicPrice(
+  value: number | null,
+  unit: string | null,
+  intent: string | null = null,
+  rawText: string | null = null,
+): string {
+  return priceLabel(value, unit, intent, rawText);
+}
+
+function buildActivityTimeline(rows: Array<{ created_at: string | null }>, days = 14): PublicActivityPoint[] {
+  const points = new Map<string, PublicActivityPoint>();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - i);
+    const key = date.toISOString().slice(0, 10);
+    points.set(key, { date: key, messages: 0, parsedRecords: 0, listings: 0 });
+  }
+
+  for (const row of rows) {
+    if (!row.created_at) continue;
+    const key = row.created_at.slice(0, 10);
+    const entry = points.get(key);
+    if (entry) entry.messages += 1;
+  }
+
+  return Array.from(points.values());
+}
+
+export async function getPublicDataOverview(options?: {
+  localities?: LocalitySummary[];
+  buildings?: BuildingSummary[];
+  skipBuildingScan?: boolean;
+  skipCounts?: boolean;
+  skipLocalities?: boolean;
+  skipActivity?: boolean;
+}): Promise<PublicDataOverview> {
+  const db = getServerSupabase();
+
+  // One explicit RPC owns the headline metric definitions. If it is absent,
+  // fail closed rather than falling back to the older, differently-defined
+  // 30-day/total-broker aggregate and presenting misleading numbers.
+  const countsPromise = db && !options?.skipCounts ? db.rpc("get_public_market_metrics").then((res) => {
+    if (res.error) {
+      console.error("get_public_market_metrics error:", res.error.message);
+      return null;
+    }
+    const row = res.data?.[0];
+    return row ? { ...row, listings_active_30d: row.listings_fresh_7d, raw_messages: 0 } : null;
+  }) : Promise.resolve(null);
+
+  const [localities, buildings, countsRow] = await Promise.all([
+    options?.localities ?? (options?.skipLocalities ? Promise.resolve([]) : getAllLocalities()),
+    options?.buildings ?? (options?.skipBuildingScan ? Promise.resolve([]) : getAllBuildings(200)),
+    countsPromise,
+  ]);
+
+  const listings = Number(countsRow?.listings_total ?? 0);
+  const activeListings = Number(countsRow?.listings_active_30d ?? 0);
+  const brokers = Number(countsRow?.brokers ?? 0);
+  const rawMessages = Number(countsRow?.raw_messages ?? 0);
+  const buildingCount = Number(countsRow?.buildings ?? countsRow?.buildings_total ?? buildings.length);
+
+  const topBuildings = [...buildings]
+    .sort((a, b) => b.listingCount - a.listingCount || a.name.localeCompare(b.name))
+    .slice(0, 8);
+
+  const recentListings: PublicListingSummary[] = [];
+  const activity: PublicActivityPoint[] = [];
+  const days = 14;
+
+  if (db) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - (days - 1));
+    const cutoffIso = cutoff.toISOString();
+    // `listings_unified` is a wide UNION view. Query the four typed tables
+    // directly so a slow compatibility view cannot blank the homepage.
+    const recentSpecs = [
+      { cardType: "residential_sale", asset: "residential", intent: "sale", hasBhk: true },
+      { cardType: "residential_rent", asset: "residential", intent: "rent", hasBhk: true },
+      { cardType: "commercial_sale", asset: "commercial", intent: "sale", hasBhk: false },
+      { cardType: "commercial_rent", asset: "commercial", intent: "rent", hasBhk: false },
+    ] as const;
+    const RECENT_PER_TABLE = 100;
+    const recentRows = (await Promise.all(recentSpecs.map(async (spec) => {
+      // Keep this base projection compatible while the optional amenity
+      // projection migration rolls through production. Missing optional
+      // columns must never blank the entire live inventory feed.
+      const selection = `id, bhk, price, price_unit, price_model, price_raw_text, price_per_sqft, price_qualifier, area_sqft, furnishing, intent, asset_type, property_type, micro_market, locality_resolved, locality_raw, broker_name, summary_title, landmark_name, location_label, floor_description, developer, orientation, view, transaction_nature, opportunity_key, created_at, updated_at, first_seen, last_seen, observation_count, deal_tags`;
+      const { data, error } = await db
+        .from("listings_unified_public")
+        .select(selection)
+        .eq("card_type", spec.cardType)
+        .gte("last_seen", cutoffIso)
+        .order("last_seen", { ascending: false, nullsFirst: false })
+        .limit(RECENT_PER_TABLE);
+      if (error) {
+        console.error(`homepage ${spec.cardType} projection error:`, error.message);
+        return [];
+      }
+      return (data ?? []).filter((row: any) => isPublicListingEligible({ ...row, asset_type: spec.asset, property_type: spec.asset })).map((row: any) => ({
+        ...row,
+        bhk: spec.hasBhk ? normalizeBhkFromEvidence(row.bhk ?? null, null) : null,
+        card_type: spec.cardType,
+        asset_type: row.asset_type ?? spec.asset,
+        intent: row.intent ?? spec.intent,
+        property_type: row.property_type ?? spec.asset,
+        price: row.price ?? priceFromRawText(row.price_raw_text),
+        price_unit: row.price_unit ?? "abs",
+        furnishing: row.furnishing ?? null,
+        area_sqft: row.area_sqft ?? null,
+        location_label: row.location_label || row.micro_market || row.locality_resolved || row.locality_raw || null,
+        last_seen: row.last_seen ?? row.updated_at ?? row.created_at ?? null,
+        first_seen: row.first_seen ?? row.created_at ?? null,
+        observation_count: row.observation_count ?? null,
+        bathroom_count: row.bathroom_count ?? null,
+        car_parking_count: row.car_parking_count ?? null,
+        parking_type: row.parking_type ?? null,
+        has_lift: row.has_lift ?? null,
+        has_power_backup: row.has_power_backup ?? null,
+        deal_tags: Array.isArray(row.deal_tags) ? row.deal_tags : [],
+        price_raw_text: row.price_raw_text ?? null,
+        source_text: null,
+        opportunity_key: row.opportunity_key ?? null,
+      }));
+    }))).flat().sort((a, b) => String(b.last_seen || "").localeCompare(String(a.last_seen || ""))).slice(0, 200);
+
+    const [rawRowsRes, parsedRowsRes, listingRowsRes] = options?.skipActivity
+      ? [{ data: [], error: null }, { data: [], error: null }, { data: [], error: null }]
+      : await Promise.all([
+          db.from("raw_messages").select("created_at").gte("created_at", cutoffIso),
+          db.from("parsed_output_unified").select("created_at").gte("created_at", cutoffIso),
+          db.from("listings_unified_public").select("created_at").gte("created_at", cutoffIso),
+        ]);
+
+    {
+      const latestByOpportunity = new Map<string, typeof recentRows[number]>();
+      const withoutExactReposts = recentRows.filter((row) => {
+        const key = typeof row.opportunity_key === "string" ? row.opportunity_key.trim() : "";
+        if (!key) return true;
+        const previous = latestByOpportunity.get(key);
+        if (!previous || String(row.last_seen || "") > String(previous.last_seen || "")) {
+          latestByOpportunity.set(key, row);
+          return true;
+        }
+        return false;
+      });
+      const rows = dedupeRecentListings(withoutExactReposts.map((row) => ({
+        ...row,
+        price_raw_text: row.price_raw_text ?? null,
+        price_model: null,
+        area_sqft: row.area_sqft ?? null,
+        asset_type: null,
+        property_type: row.property_type ?? null,
+        locality_raw: null,
+        locality_resolved: null,
+        floor_description: row.floor_description ?? null,
+        broker_phone: null,
+        last_seen: row.last_seen ?? null,
+        landmark_name: row.landmark_name ?? null,
+        intent: row.intent ?? null,
+      })));
+      const photoCounts = new Map<number, number>();
+      const photoPaths = new Map<number, string>();
+      const listingIds = rows.map((row) => Number(row.id)).filter(Number.isFinite);
+      if (listingIds.length > 0) {
+        const photos = await db.from("listing_photos").select("listing_id, storage_path").in("listing_id", listingIds).order("created_at", { ascending: false });
+        if (!photos.error) {
+          for (const photo of photos.data ?? []) {
+            const id = Number(photo.listing_id);
+            photoCounts.set(id, (photoCounts.get(id) ?? 0) + 1);
+            const path = String(photo.storage_path || "").trim();
+            if (path && !photoPaths.has(id)) photoPaths.set(id, path);
+          }
+        }
+      }
+      const photoUrls = new Map<number, string>();
+      await Promise.all(Array.from(photoPaths.entries()).map(async ([id, path]) => {
+        const signed = await db.storage.from("whatsapp-media").createSignedUrl(path, 3600);
+        if (!signed.error && signed.data?.signedUrl) photoUrls.set(id, signed.data.signedUrl);
+      }));
+      for (const row of rows) {
+        recentListings.push({ ...row, photo_count: photoCounts.get(Number(row.id)) ?? 0, photo_url: photoUrls.get(Number(row.id)) ?? null } as PublicListingSummary);
+      }
+    }
+    const rawRows = rawRowsRes.error ? [] : (rawRowsRes.data ?? []);
+    const parsedRows = parsedRowsRes.error ? [] : (parsedRowsRes.data ?? []);
+    const listingRows = listingRowsRes.error ? [] : (listingRowsRes.data ?? []);
+
+    const base = buildActivityTimeline(rawRows, days);
+    const byDate = new Map(base.map((point) => [point.date, point]));
+    for (const row of parsedRows) {
+      if (!row.created_at) continue;
+      const key = row.created_at.slice(0, 10);
+      const point = byDate.get(key);
+      if (point) point.parsedRecords += 1;
+    }
+    for (const row of listingRows) {
+      if (!row.created_at) continue;
+      const key = row.created_at.slice(0, 10);
+      const point = byDate.get(key);
+      if (point) point.listings += 1;
+    }
+    activity.push(...base);
+  }
+
+  return {
+    counts: {
+    // Use the exact public projection count for the headline. `localities` is
+    // intentionally curated for navigation and is not the market total.
+    localities: Number(countsRow?.localities ?? localities.length),
+      buildings: buildingCount,
+      listings,
+      activeListings,
+      brokers,
+      raw_messages: rawMessages,
+      messagesAnalysed: rawMessages,
+    },
+    countsAvailable: countsRow !== null,
+    activity,
+    topLocalities: localities.slice(0, 8),
+    topBuildings,
+    recentListings,
+  };
+}

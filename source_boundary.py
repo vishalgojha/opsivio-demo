@@ -1,0 +1,129 @@
+"""One narrow, typed boundary between source evidence and AI output."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+
+
+@dataclass(frozen=True)
+class SourceBoundaryResult:
+    explicit_route: str | None
+    rent_explicit: bool
+    sale_explicit: bool
+    reasons: tuple[str, ...] = ()
+
+
+_RENT_RE = re.compile(r"\b(?:rent|rental|monthly\s+rent|per\s+month|for\s+rent|on\s+rent|for\s+lease|on\s+lease|lease)\b", re.I)
+_SALE_RE = re.compile(r"\b(?:sale|selling|for\s+sale|on\s+sale|asking\s+price|outright|outrate)\b", re.I)
+_REQUIREMENT_RE = re.compile(
+    r"(?im)^\s*[\W_]*(?:very\s+|urgent\s+|immediate\s+)?"
+    r"(?:(?:outright|property|rental|residential|commercial)\s+)*"
+    r"(?:(?:buyer|tenant|client)\s+)?"
+    r"(?:requirements?|required|require|wanted|want|need(?:s|ed)?)\b"
+)
+_UNIT_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:bhk|rk|bedroom)s?\b", re.I)
+
+
+def classify_source_boundary(source_text: str) -> SourceBoundaryResult:
+    """Report explicit source signals; never decide against AI output."""
+    source = str(source_text or "")
+    rent = bool(_RENT_RE.search(source))
+    sale = bool(_SALE_RE.search(source))
+    requirement = bool(_REQUIREMENT_RE.search(source))
+    inventory_unit = bool(_UNIT_RE.search(source))
+    explicit_route = None
+    reasons: list[str] = []
+    # An explicit demand heading is authoritative even when the demand names
+    # a unit such as 4BHK.  The old inventory-unit guard misrouted
+    # ``OUTRIGHT REQUIREMENT`` blocks as sale because ``outright`` is also a
+    # sale signal.
+    if requirement:
+        explicit_route = "requirement"
+    elif rent and not sale and inventory_unit:
+        explicit_route = "rent"
+    elif sale and not rent and inventory_unit:
+        explicit_route = "sale"
+    if rent and sale:
+        reasons.append("mixed_rent_sale_source_signals")
+    if explicit_route:
+        reasons.append(f"explicit_source_route:{explicit_route}")
+    return SourceBoundaryResult(explicit_route, rent, sale, tuple(reasons))
+
+
+def apply_source_boundary(item: dict, source_text: str) -> dict:
+    """Attach evidence and flag conflicts without silently rewriting fields."""
+    checked = dict(item or {})
+    result = classify_source_boundary(source_text)
+    model_route = str(checked.get("routing_listing_type") or checked.get("listing_type") or "").strip().lower()
+    flags = list(checked.get("validation_flags") or [])
+    if result.explicit_route:
+        if model_route and model_route != result.explicit_route:
+            flags.append("source_route_conflict_review")
+            checked["needs_review"] = True
+            checked["source_boundary_conflict"] = {
+                "field": "listing_type", "model_value": model_route,
+                "source_value": result.explicit_route, "reasons": list(result.reasons),
+            }
+        # A source match is evidence, not an implicit mutation.  The shared
+        # source-authority evaluator decides whether this candidate may fill a
+        # missing route; callers that do not invoke it must leave the AI route
+        # missing rather than creating a second authority.
+    if result.reasons:
+        checked["source_boundary"] = {
+            "explicit_route": result.explicit_route,
+            "rent_explicit": result.rent_explicit,
+            "sale_explicit": result.sale_explicit,
+            "reasons": list(result.reasons),
+        }
+    if result.rent_explicit and result.sale_explicit:
+        checked["needs_review"] = True
+        flags.append("mixed_rent_sale_source_signals")
+    checked["validation_flags"] = list(dict.fromkeys(flags))
+    return checked
+
+
+_SOURCE_SCOPED_FIELDS = ("bhk", "building_name")
+
+
+def enforce_source_boundary(item: dict, source_text: str) -> dict:
+    """Make source-scoped value drops explicit and reviewable.
+
+    A model value that is absent from its item slice is not safe to persist as
+    an ordinary fact.  Preserve the drop in the audit payload and validation
+    flags instead of making the resulting null indistinguishable from a model
+    omission.
+    """
+    checked = apply_source_boundary(item, source_text)
+    source_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", str(source_text or "").casefold())
+        if len(token) >= 2
+    }
+    flags = list(checked.get("validation_flags") or [])
+    drops = list(checked.get("source_boundary_drops") or [])
+    for field in _SOURCE_SCOPED_FIELDS:
+        value = checked.get(field)
+        value_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+            if len(token) >= 2
+        }
+        if value in (None, "", [], {}) or not value_tokens:
+            continue
+        if field == "bhk":
+            value_match = re.search(r"\d+(?:\.\d+)?", str(value))
+            source_match = _UNIT_RE.search(str(source_text or ""))
+            value_is_grounded = bool(
+                value_match
+                and source_match
+                and float(value_match.group(0)) == float(re.search(r"\d+(?:\.\d+)?", source_match.group(0)).group(0))
+            )
+        else:
+            value_is_grounded = not value_tokens.isdisjoint(source_tokens)
+        if not value_is_grounded:
+            drops.append({"field": field, "value": value, "reason": "not_in_source_slice"})
+            checked[field] = None
+            flags.append(f"{field}_dropped_not_in_source_slice")
+            checked["needs_review"] = True
+    if drops:
+        checked["source_boundary_drops"] = drops
+    checked["validation_flags"] = list(dict.fromkeys(flags))
+    return checked

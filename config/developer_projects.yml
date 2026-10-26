@@ -1,0 +1,36 @@
+projects:
+  - key: kalpataru-radiance-mumbai
+    name: Kalpataru Radiance
+    developer: Kalpataru Group
+    locality: Goregaon West
+    city: Mumbai
+    sources:
+      - url: https://www.kalpataru.com/mumbai/kalpataru-radiance
+        type: developer
+        priority: 1
+    recrawl_days: 7
+    enabled: true
+
+  - key: kalpataru-immensa-pune
+    name: Kalpataru Immensa
+    developer: Kalpataru Group
+    locality: Kolshet Road, Thane West
+    city: Thane
+    sources:
+      - url: https://www.kalpataru.com/thane/immensa-kalpataru-parkcity
+        type: developer
+        priority: 1
+    recrawl_days: 7
+    enabled: true
+
+  - key: kalpataru-magnus-mumbai
+    name: Kalpataru Magnus
+    developer: Kalpataru Group
+    locality: Off BKC, Bandra East
+    city: Mumbai
+    sources:
+      - url: https://www.kalpataru.com/mumbai/kalpataru-magnus
+        type: developer
+        priority: 1
+    recrawl_days: 7
+    enabled: true

@@ -1,0 +1,207 @@
+"""LangGraph runner for broker workspace and WhatsApp self-chat."""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import json
+import time
+from typing import Any, Callable, Literal, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from services.propai_agent_runtime import AgentRuntimeError
+
+
+# A single request may need a search followed by a clarification or a second
+# read (for example, building lookup followed by inventory). Keep the loop
+# bounded for cost and safety, but do not make the agent a one-tool chatbot.
+MAX_TOOL_ROUNDS = 12
+
+
+async def _run_blocking(
+    executor: Any | None,
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run a blocking provider/tool call off the event loop.
+
+    Interactive callers (WhatsApp self-chat) pass a dedicated executor so their
+    model and tool calls cannot sit behind dashboard/extraction work in the
+    event loop's shared default thread pool.
+    """
+    if executor is not None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            executor, functools.partial(fn, *args, **kwargs)
+        )
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+def _gateway_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Send only gateway-safe string content on every graph round.
+
+    Tool turns append messages after the initial provider preparation step, so
+    normalizing only the initial history is insufficient for legacy rows or
+    provider adapters that return structured content.
+    """
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        item = dict(message)
+        content = item.get("content")
+        if not isinstance(content, str):
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(part.get("text") or part.get("content") or "")
+                    if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            elif content is None:
+                content = ""
+            else:
+                content = str(content)
+            item["content"] = content
+        normalized.append(item)
+    return normalized
+
+
+class WorkspaceState(TypedDict, total=False):
+    messages: list[dict[str, Any]]
+    steps: int
+    final: dict[str, Any]
+    error: str
+
+
+def _build_graph(*, client: Any, model: str, tools: list[dict[str, Any]], execute_tool: Any, max_tool_rounds: int, require_tool: bool, tenant_id: str | None, disable_reasoning: bool = False, max_tokens: int | None = 8192, executor: Any | None = None, timing: list[dict[str, Any]] | None = None):
+    async def model_node(state: WorkspaceState) -> dict[str, Any]:
+        gateway_messages = _gateway_messages(state["messages"])
+        must_call_tool = require_tool and not any(
+            message.get("role") == "tool" for message in state["messages"]
+        )
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": gateway_messages,
+        }
+        if max_tokens is not None:
+            create_kwargs["max_tokens"] = max_tokens
+        # Sarvam rejects a live reasoning_effort option. Other providers keep
+        # the existing reasoning hint; provider capability belongs here at the
+        # request boundary rather than in each caller.
+        if not disable_reasoning:
+            create_kwargs["extra_body"] = {"reasoning_effort": "medium"}
+        if tools:
+            create_kwargs["tools"] = tools
+            create_kwargs["tool_choice"] = "required" if must_call_tool else "auto"
+        started = time.perf_counter()
+        response = await _run_blocking(
+            executor,
+            client.chat.completions.create,
+            **create_kwargs,
+        )
+        if timing is not None:
+            timing.append(
+                {
+                    "stage": "model",
+                    "seconds": round(time.perf_counter() - started, 3),
+                    "messages": len(create_kwargs.get("messages") or []),
+                }
+            )
+        msg = response.choices[0].message
+        content = str(msg.content or "")
+        assistant: dict[str, Any] = {"role": "assistant", "content": content}
+        calls: list[dict[str, Any]] = []
+        for call in msg.tool_calls or []:
+            arguments = str(call.function.arguments or "{}").strip()
+            try:
+                json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = "{}"
+            calls.append({"id": str(call.id), "type": "function", "function": {"name": str(call.function.name), "arguments": arguments}})
+        if calls:
+            assistant["tool_calls"] = calls
+        updated = [*state["messages"], assistant]
+        next_steps = int(state.get("steps", 0)) + 1
+        if not calls:
+            if not content.strip():
+                raise AgentRuntimeError("workspace provider returned an empty response")
+            if require_tool and not any(message.get("role") == "tool" for message in state["messages"]):
+                return {"messages": updated, "steps": next_steps, "final": {"content": "I couldn’t verify that against the live PropAI listings right now. Please try the search again.", "status_steps": ["Live listing search could not be completed"], "trace": {"route": "grounding_required_but_no_tool_result"}}}
+            return {"messages": updated, "steps": next_steps, "final": {"content": content}}
+        if next_steps >= max_tool_rounds:
+            return {"messages": updated, "steps": next_steps, "error": "workspace agent reached the tool-round limit"}
+        return {"messages": updated, "steps": next_steps}
+
+    async def tool_node(state: WorkspaceState) -> dict[str, Any]:
+        tool_messages: list[dict[str, Any]] = []
+        for call in state["messages"][-1].get("tool_calls") or []:
+            started = time.perf_counter()
+            result = await _run_blocking(executor, execute_tool, call)
+            if timing is not None:
+                timing.append(
+                    {
+                        "stage": "tool",
+                        "name": str((call.get("function") or {}).get("name") or ""),
+                        "seconds": round(time.perf_counter() - started, 3),
+                    }
+                )
+            if isinstance(result, dict) and result.get("status") == "pending_confirmation":
+                return {"final": {"content": result.get("message") or "Confirmation is required before changing workspace data.", "confirmation": result}}
+            tool_messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": json.dumps(result, default=str)[:12000]})
+        return {"messages": [*state["messages"], *tool_messages]}
+
+    def route(state: WorkspaceState) -> Literal["tools", "finish"]:
+        if state.get("final") or state.get("error"):
+            return "finish"
+        return "tools" if state["messages"][-1].get("tool_calls") else "finish"
+
+    builder = StateGraph(WorkspaceState)
+    builder.add_node("model", model_node)
+    builder.add_node("tools", tool_node)
+    builder.add_node("finish", lambda state: {})
+    builder.add_edge(START, "model")
+    builder.add_conditional_edges("model", route, {"tools": "tools", "finish": "finish"})
+    builder.add_conditional_edges("tools", lambda state: "finish" if state.get("final") else "model", {"model": "model", "finish": "finish"})
+    builder.add_edge("finish", END)
+    return builder.compile()
+
+
+async def run_workspace_graph(*, messages: list[dict[str, Any]], sources: dict[str, Any], api_key: str, model: str, base_url: str, tenant_id: str | None, storage_client: Any, user_id: str | None = None, browser_enabled: bool = False, browser_provider: str | None = None, activity_sink: list[dict[str, Any]] | None = None, max_tool_rounds: int = MAX_TOOL_ROUNDS, require_tool: bool = False, prefer_supabase_agent: bool = True, tools_enabled: bool = True, disable_reasoning: bool = False, max_tokens: int | None = 8192, executor: Any | None = None, timing: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    from ai_chat_engine import _add_tool_cache_control, _build_tools, execute_tool, get_client, normalize_workspace_response
+    from services.provider_messages import prepare_messages
+
+    client = get_client(api_key=api_key, base_url=base_url)
+    tools = (
+        _add_tool_cache_control(_build_tools(sources, prefer_supabase_agent=prefer_supabase_agent, browser_enabled=browser_enabled))
+        if tools_enabled else []
+    )
+    cached_messages = prepare_messages(messages, base_url)
+
+    def invoke_tool(call: dict[str, Any]) -> dict[str, Any]:
+        function = call.get("function") or {}
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            arguments = {}
+        result = execute_tool(str(function.get("name") or ""), arguments, sources, tenant_id=tenant_id, storage_client=storage_client, user_id=user_id, browser_enabled=browser_enabled, browser_provider=browser_provider)
+        if activity_sink is not None:
+            activity_sink.append({"tool": function.get("name") or "", "status": result.get("status", "ok") if isinstance(result, dict) else "ok", "summary": f"Ran {str(function.get('name') or '').replace('_', ' ')}"})
+        return result if isinstance(result, dict) else {"status": "ok", "result": result}
+
+    bounded_rounds = max(1, min(int(max_tool_rounds or MAX_TOOL_ROUNDS), 32))
+    graph = _build_graph(client=client, model=model, tools=tools, execute_tool=invoke_tool, max_tool_rounds=bounded_rounds, require_tool=require_tool, tenant_id=tenant_id, disable_reasoning=disable_reasoning, max_tokens=max_tokens, executor=executor, timing=timing)
+    try:
+        result = await graph.ainvoke({"messages": cached_messages, "steps": 0}, {"recursion_limit": bounded_rounds * 2 + 1})
+    except AgentRuntimeError:
+        raise
+    except Exception as exc:
+        raise AgentRuntimeError(f"workspace graph failed: {str(exc)[:300]}") from exc
+    if result.get("error"):
+        raise AgentRuntimeError(str(result["error"]))
+    final = result.get("final") or {}
+    if final.get("trace"):
+        return {"content": final.get("content", ""), "blocks": [], "status_steps": final.get("status_steps") or [], "trace": final["trace"]}
+    confirmation = final.get("confirmation")
+    if confirmation:
+        return {"content": final.get("content", ""), "blocks": [{"type": "confirmation", "title": confirmation.get("title") or "Confirmation required", "body": confirmation.get("message"), "tool": confirmation.get("tool"), "confirmation_token": confirmation.get("confirmation_token")}], "status_steps": ["Prepared workspace change"], "trace": {"route": "langgraph_workspace", "pending_tool": confirmation.get("tool")}}
+    return normalize_workspace_response(final.get("content"), sources)

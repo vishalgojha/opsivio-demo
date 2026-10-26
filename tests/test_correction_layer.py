@@ -1,0 +1,141 @@
+from types import SimpleNamespace
+
+import pytest
+
+import correction_layer as layer
+
+
+def valid_payload(draft, corrected_fields=None, confidence=0.9):
+    payload = dict(draft)
+    payload["corrected_fields"] = corrected_fields or []
+    payload["correction_confidence"] = confidence
+    return payload
+
+
+def test_validation_rejects_schema_drift():
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    payload = valid_payload(draft)
+    payload["invented_field"] = "unsafe"
+
+    with pytest.raises(layer.CorrectionError, match="schema mismatch"):
+        layer._validate_response(payload, draft)
+
+
+def test_validation_rejects_unchanged_corrected_field():
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    draft["building_name"] = "Sea View"
+    payload = valid_payload(draft, ["building_name"])
+
+    with pytest.raises(layer.CorrectionError, match="flagged as corrected but unchanged"):
+        layer._validate_response(payload, draft)
+
+
+@pytest.mark.parametrize("unit", ["Lakh", "Lakhs", "Lac", "Crore", "Cr"])
+def test_validation_preserves_indian_price_unit(unit):
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    payload = valid_payload(draft, ["price_unit"])
+    payload["price_unit"] = unit
+
+    assert layer._validate_response(payload, draft)["price_unit"] == unit
+
+
+def test_write_updates_only_flagged_fields():
+    calls = []
+
+    class Query:
+        def update(self, payload):
+            calls.append(payload)
+            return self
+
+        def eq(self, column, value):
+            calls.append((column, value))
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"id": 7}])
+
+    storage = SimpleNamespace(
+        client=SimpleNamespace(table=lambda _name: Query()),
+        update_parsed_fields=lambda row_id, update: calls.append(update),
+    )
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    payload = valid_payload(draft, ["building_name"])
+    payload["building_name"] = "Sea View"
+    payload["location_raw"] = "Bandra West"
+    payload["_source_grounded_fields"] = ["building_name"]
+
+    layer._write_correction(storage, 7, "hash", payload)
+
+    written = calls[0]
+    assert written["building_name"] == "Sea View"
+    assert "location_raw" not in written
+    assert written["corrected_fields"] == ["building_name"]
+    assert len(calls) == 1
+
+
+def test_correction_does_not_overwrite_existing_model_value():
+    calls = []
+    storage = SimpleNamespace(update_parsed_fields=lambda row_id, update: calls.append(update))
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    draft["building_name"] = "Evershine Jewel"
+    payload = valid_payload(draft, ["building_name"], confidence=0.95)
+    payload["building_name"] = "Flat sharing apt"
+    payload["_source_grounded_fields"] = ["building_name"]
+
+    applied = layer._write_correction(
+        storage,
+        7,
+        "hash",
+        payload,
+        original_model_confidence=0.9,
+        original_values=draft,
+        current_ai_extraction={"building_name": "Evershine Jewel"},
+    )
+
+    assert applied == []
+    assert calls[0].get("building_name") is None
+    assert calls[0]["ai_extraction"]["correction_suggestions"][0]["field"] == "building_name"
+    assert calls[0]["corrected_fields"] == []
+
+
+def test_correction_only_applies_missing_source_grounded_value():
+    calls = []
+    storage = SimpleNamespace(update_parsed_fields=lambda row_id, update: calls.append(update))
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    payload = valid_payload(draft, ["building_name"])
+    payload["building_name"] = "Sea View"
+    payload["_source_grounded_fields"] = []
+
+    applied = layer._write_correction(
+        storage, 7, "hash", payload, original_values=draft,
+    )
+
+    assert applied == []
+    assert calls[0]["corrected_fields"] == []
+    assert "building_name" not in calls[0]
+
+
+def test_correction_payload_is_rechecked_and_flagged_before_write():
+    storage = SimpleNamespace(client=SimpleNamespace())
+    draft = {field: None for field in layer.CORRECTABLE_FIELDS}
+    payload = valid_payload(draft, ["price", "price_unit"])
+    payload["price"] = 2750000
+    payload["price_unit"] = "per_sqft"
+
+    guarded = layer._apply_pipeline_guards(
+        payload,
+        "Rent - ₹275 psf, 10,000 sqft",
+        storage,
+    )
+
+    assert guarded["price"] == 2750000
+    assert guarded["_guard_needs_review"] is True
+    assert "price_psf_ai_mismatch_review" in guarded["_guard_validation_flags"]
+
+
+def test_scheduled_slot_is_two_hour_bucket():
+    from datetime import datetime, timezone
+
+    value = layer._scheduled_slot(datetime(2026, 7, 17, 5, 59, tzinfo=timezone.utc))
+
+    assert value == "2026-07-17T04:00:00+00:00"
