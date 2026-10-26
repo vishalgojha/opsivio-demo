@@ -1,4 +1,6 @@
-const CACHE = "propai-www-v3";
+// Bump this whenever the public app shell changes so browsers retire old
+// deployment chunks after a hostname/service migration.
+const CACHE = "opsivio-www-v4";
 const STATIC_ASSETS = ["/offline.html", "/manifest.webmanifest", "/favicon.svg", "/propai-logo.svg"];
 
 self.addEventListener("install", (event) => {
