@@ -11,7 +11,7 @@ export default function AdminLoginClient({ nextPath }: { nextPath: string }) {
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Open your workspace</h1>
           <p className="mt-2 text-sm text-[#53657d]">Sign in to manage broker data, WhatsApp ingestion, and white-label publishing.</p>
         </div>
-        <BrokerAccessPanel nextPath={nextPath} onClose={() => undefined} />
+        <BrokerAccessPanel nextPath={nextPath} onClose={() => window.history.back()} />
       </div>
     </main>
   );
